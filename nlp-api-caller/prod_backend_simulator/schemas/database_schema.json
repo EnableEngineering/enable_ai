@@ -1,0 +1,130 @@
+{
+  "type": "database",
+  "version": "1.0.0",
+  "database": "ecommerce_db",
+  "database_type": "postgresql",
+  "description": "E-commerce database schema",
+  
+  "tables": {
+    "users": {
+      "description": "User accounts",
+      "columns": {
+        "id": {
+          "type": "integer",
+          "primary_key": true,
+          "auto_increment": true,
+          "nullable": false
+        },
+        "username": {
+          "type": "string",
+          "max_length": 50,
+          "unique": true,
+          "nullable": false,
+          "indexed": true
+        },
+        "email": {
+          "type": "string",
+          "max_length": 255,
+          "unique": true,
+          "nullable": false,
+          "indexed": true
+        },
+        "first_name": {
+          "type": "string",
+          "max_length": 50
+        },
+        "last_name": {
+          "type": "string",
+          "max_length": 50
+        },
+        "status": {
+          "type": "enum",
+          "values": ["active", "inactive", "pending"],
+          "default": "pending"
+        },
+        "created_at": {
+          "type": "timestamp",
+          "default": "CURRENT_TIMESTAMP"
+        }
+      },
+      "relationships": {
+        "orders": {
+          "type": "one_to_many",
+          "target_table": "orders",
+          "foreign_key": "user_id"
+        }
+      }
+    },
+    
+    "products": {
+      "description": "Product catalog",
+      "columns": {
+        "id": {
+          "type": "integer",
+          "primary_key": true,
+          "auto_increment": true
+        },
+        "name": {
+          "type": "string",
+          "max_length": 200,
+          "nullable": false
+        },
+        "sku": {
+          "type": "string",
+          "max_length": 50,
+          "unique": true
+        },
+        "price": {
+          "type": "decimal",
+          "precision": 10,
+          "scale": 2
+        },
+        "category": {
+          "type": "string",
+          "max_length": 100
+        },
+        "stock": {
+          "type": "integer",
+          "default": 0
+        }
+      }
+    },
+    
+    "orders": {
+      "description": "Customer orders",
+      "columns": {
+        "id": {
+          "type": "integer",
+          "primary_key": true,
+          "auto_increment": true
+        },
+        "user_id": {
+          "type": "integer",
+          "foreign_key": {
+            "table": "users",
+            "column": "id"
+          }
+        },
+        "total": {
+          "type": "decimal",
+          "precision": 10,
+          "scale": 2
+        },
+        "status": {
+          "type": "enum",
+          "values": ["pending", "completed", "cancelled"]
+        },
+        "created_at": {
+          "type": "timestamp"
+        }
+      },
+      "relationships": {
+        "user": {
+          "type": "many_to_one",
+          "target_table": "users",
+          "foreign_key": "user_id"
+        }
+      }
+    }
+  }
+}
