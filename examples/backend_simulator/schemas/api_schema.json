@@ -1,0 +1,22 @@
+{
+  "type": "api",
+  "base_url": "http://localhost:8002/api",
+  "resources": {
+    "users": {
+      "endpoints": [
+        {
+          "path": "/users/",
+          "method": "GET",
+          "intent": "read",
+          "parameters": {}
+        },
+        {
+          "path": "/users/{id}/",
+          "method": "GET",
+          "intent": "read",
+          "parameters": {"id": {}}
+        }
+      ]
+    }
+  }
+}

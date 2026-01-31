@@ -1,0 +1,27 @@
+{
+  "data_sources": {
+    "api": {
+      "type": "api",
+      "enabled": true,
+      "base_url": "http://localhost:8002/api",
+      "schema_path": "schemas/api_schema.json"
+    }
+  },
+  "schemas": {
+    "api": "schemas/api_schema.json"
+  },
+  "security_credentials": {
+    "api": {
+      "jwt": {
+        "enabled": true,
+        "token_endpoint": "/token/",
+        "username_field": "email",
+        "password_field": "password",
+        "env": {
+          "username": "API_EMAIL",
+          "password": "API_PASSWORD"
+        }
+      }
+    }
+  }
+}

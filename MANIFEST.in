@@ -1,0 +1,8 @@
+include README.md
+include MCP_README.md
+include LICENSE
+include config.json
+recursive-include schemas *.json
+recursive-include src/enable_ai *.json
+recursive-include examples *.py *.html *.md
+recursive-include tests *.py

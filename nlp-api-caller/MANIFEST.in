@@ -1,7 +1,0 @@
-include README.md
-include MCP_README.md
-include LICENSE
-include config.json
-recursive-include schemas *.json
-recursive-include src/nlp_api_caller *.json
-recursive-include tests *.py

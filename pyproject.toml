@@ -1,0 +1,48 @@
+[build-system]
+requires = ["poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.poetry]
+name = "enable-ai"
+version = "0.3.28"
+description = "AI-powered natural language interface for REST APIs with OpenAPI support and real-time streaming"
+authors = ["Enable Engineering"]
+license = "MIT"
+readme = "README.md"
+homepage = "https://github.com/EnableEngineering/enable_ai"
+repository = "https://github.com/EnableEngineering/enable_ai"
+keywords = ["nlp", "api", "natural-language", "ai", "mcp", "llm", "rest-api", "langgraph"]
+
+[tool.poetry.dependencies]
+python = "^3.8"
+requests = "^2.25.0"
+openai = "^1.0.0"
+langgraph = "^0.2.0"
+python-dotenv = "^0.19.0"
+langgraph-checkpoint = "^1.0.0"
+
+[tool.poetry.extras]
+# MCP server support (requires manual SDK installation)
+mcp = []
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^7.0.0"
+pytest-asyncio = "^0.21.0"
+black = "^23.0.0"
+flake8 = "^6.0.0"
+mypy = "^1.0.0"
+
+# Database and RAG dependencies removed - API-only focus
+# Future: May add back as optional extras
+
+[tool.poetry.scripts]
+# MCP server (optional - requires manual mcp SDK installation)
+# enable-ai-mcp = "enable_ai.mcp_server:main"
+enable-schema = "enable_ai.schema_generator.cli:main"
+
+[build]
+source = "src"
+
+[tool.pyright]
+# Resolve 'enable_ai' from src/ when project root is the workspace (IDE/tests)
+extraPaths = ["src"]
