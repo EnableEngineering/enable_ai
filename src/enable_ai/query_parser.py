@@ -186,6 +186,15 @@ Your task: Understand the user's intent and extract structured information so th
 - When the user is asking for a total or count (how many, number of, total), set question_type="count".
 - When the user wants a small sample of prior results (e.g. "a few", "some"), set a small limit and question_type="list" so they see items, not only a count.
 
+**IMPORTANT: Follow-up questions asking for details**
+- When the user asks "which are those?", "what are they?", "show me the list", "what are their names?", "list them", "show them", "which ones?", or similar questions that ask for details about previous results:
+  1. Call get_query_context() to get the previous resource and filters
+  2. Set question_type="list" or question_type="details" (NOT "count")
+  3. Set display_mode="detailed" or display_mode="full" so the system shows actual item details
+  4. Set merge_with_previous=true
+  5. Do NOT just return a count - the user wants to SEE the actual items
+- These follow-up questions mean: "Show me the actual items you just mentioned" - so ensure the response includes item names, IDs, or other identifying information.
+
 **User Identity / Pronoun Resolution (IMPORTANT)**
 - When the user says "me", "my", "mine", "assigned to me", "my reports", "my orders", etc., they are referring to THEMSELVES.
 - If USER_CONTEXT is provided in the prompt, use the user_id from that context to resolve these pronouns.
@@ -406,6 +415,24 @@ Output: {
     "limit": 1,
     "question_type": "details"
 }
+
+Example 8 - Follow-up asking for details (IMPORTANT - user wants to see the items, not just count):
+Previous conversation: User asked "Show me new service orders assigned to me" → System responded "Found 9 items"
+Query: "which are those?" or "what are they?" or "show me the list"
+Context from get_query_context(): { "previous_resource": "service_orders", "previous_filters": {"technician": {"operator": "equals", "value": 123}, "status__name": {"operator": "equals", "value": "New"}} }
+Output: {
+    "intent": "read",
+    "resource": "service_orders",
+    "entities": {"technician": 123, "status": "New"},
+    "filters": {
+        "technician": {"operator": "equals", "value": 123},
+        "status__name": {"operator": "equals", "value": "New"}
+    },
+    "merge_with_previous": true,
+    "question_type": "list",
+    "display_mode": "detailed"
+}
+NOTE: The user is asking to SEE the actual items - set question_type="list" and display_mode="detailed", NOT question_type="count"!
 
 Return ONLY the JSON object, no explanations or markdown.
 """

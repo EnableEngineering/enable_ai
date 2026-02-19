@@ -1,3 +1,4 @@
+import json
 import time
 import requests
 
@@ -85,7 +86,30 @@ class APIClient:
         self.logger.debug(f"Built URL: {base_url} + {path} → {final_url}")
         return final_url
 
-    def call_api(self, api_request):
+    def _try_alternate_filter_format(self, original_params: dict) -> dict:
+        """
+        When API returns 400, try alternate filter formats.
+        E.g., if status=New fails, try status__name=New
+        Or if status__name fails, try status
+
+        Args:
+            original_params: Original query parameters that failed
+
+        Returns:
+            Dict with alternate parameter names
+        """
+        alternate_params = {}
+        for key, value in original_params.items():
+            if "__" not in key:
+                # Try adding __name suffix
+                alternate_params[f"{key}__name"] = value
+            else:
+                # Try removing suffix (e.g., status__name -> status)
+                base_key = key.split("__")[0]
+                alternate_params[base_key] = value
+        return alternate_params
+
+    def call_api(self, api_request, _retried_alternate=False):
         """
         Make an API call using the APIRequest object.
         
@@ -111,7 +135,19 @@ class APIClient:
         method = api_request.method.upper()
         if method not in ('GET', 'POST', 'PUT', 'PATCH', 'DELETE'):
             return APIError(f"Unsupported HTTP method: {method}")
-        
+
+        # Debug logging: log request details
+        try:
+            params_str = json.dumps(api_request.params, default=str)
+        except (TypeError, ValueError):
+            params_str = str(api_request.params)
+        self.logger.info(
+            "API Request: %s %s | params=%s",
+            method,
+            api_request.endpoint,
+            params_str
+        )
+
         last_error = None
         timeout_seconds = constants.REQUEST_TIMEOUT
         for attempt in range(constants.REQUEST_RETRY_ATTEMPTS):
@@ -127,6 +163,15 @@ class APIClient:
                 else:
                     response = self.session.delete(url, params=api_request.params, timeout=timeout_seconds)
                 
+                # Log response
+                self.logger.info(
+                    "API Response: %s %s | status=%d | size=%d bytes",
+                    method,
+                    api_request.endpoint,
+                    response.status_code,
+                    len(response.content)
+                )
+
                 # Success: return immediately
                 if response.status_code in [200, 201]:
                     try:
@@ -150,6 +195,23 @@ class APIClient:
                         error_message = error_data.get('detail', str(error_data))
                     except ValueError:
                         error_message = response.text
+
+                    # Try alternate filter format if not already retried
+                    if not _retried_alternate and api_request.params and method == 'GET':
+                        alternate_params = self._try_alternate_filter_format(api_request.params)
+                        self.logger.warning(
+                            "400 error, trying alternate filter format: %s -> %s",
+                            api_request.params,
+                            alternate_params
+                        )
+                        alternate_request = APIRequest(
+                            endpoint=api_request.endpoint,
+                            params=alternate_params,
+                            method=api_request.method,
+                            authentication_required=api_request.authentication_required
+                        )
+                        return self.call_api(alternate_request, _retried_alternate=True)
+
                     return APIError(f"Bad request: {error_message}")
                 
                 # Retryable status: 429, 502, 503, 504

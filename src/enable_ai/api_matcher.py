@@ -316,8 +316,71 @@ class APIMatcher:
             return out
         params = endpoint_data.get('parameters', {})
         query_list = params.get('query', []) if isinstance(params, dict) else []
-        return {p.get('name'): p for p in query_list if isinstance(p, dict) and p.get('name')} or {}
+
+        result = {}
+        for p in query_list:
+            if isinstance(p, dict) and p.get('name'):
+                result[p['name']] = p
+            elif isinstance(p, str):
+                # Handle string params like "status__name"
+                result[p] = {"name": p, "type": "string"}
+        return result
     
+    def _validate_filter_values(self, filters: dict, resource: str, resource_hints: dict) -> dict:
+        """
+        Validate filter values against schema-defined allowed values.
+        Apply synonyms if needed.
+
+        Args:
+            filters: Dict of field -> filter_val (may be {"operator": ..., "value": ...} or raw value)
+            resource: Current resource name
+            resource_hints: Schema resource hints with allowed values and synonyms
+
+        Returns:
+            Dict with validated/transformed filters and any warnings
+        """
+        validated = {}
+        warnings = []
+        hints = resource_hints.get(resource, {})
+
+        for field, filter_val in filters.items():
+            value = filter_val.get("value") if isinstance(filter_val, dict) else filter_val
+            operator = filter_val.get("operator", "equals") if isinstance(filter_val, dict) else "equals"
+            field_hints = hints.get(field, {}) if isinstance(hints, dict) else {}
+
+            if isinstance(field_hints, dict) and field_hints:
+                allowed_values = field_hints.get("values", [])
+                synonyms = field_hints.get("synonyms", {})
+
+                # Check synonyms first (case-insensitive)
+                if isinstance(synonyms, dict):
+                    value_lower = str(value).lower()
+                    for syn_key, syn_val in synonyms.items():
+                        if value_lower == str(syn_key).lower():
+                            self.logger.debug(f"Applied synonym: {value} -> {syn_val}")
+                            value = syn_val
+                            break
+
+                # Validate against allowed values (case-insensitive check for strings)
+                if allowed_values:
+                    value_matches = False
+                    for av in allowed_values:
+                        if isinstance(av, str) and isinstance(value, str):
+                            if av.lower() == value.lower():
+                                value_matches = True
+                                value = av  # Use canonical case
+                                break
+                        elif av == value:
+                            value_matches = True
+                            break
+
+                    if not value_matches:
+                        warnings.append(f"Value '{value}' for {field} not in allowed values: {allowed_values}")
+
+            validated[field] = {"operator": operator, "value": value}
+
+        return {"filters": validated, "warnings": warnings}
+
     def _validate_required_fields(self, endpoint_data, entities, intent):
         """
         Validate if all required fields are present for the matched endpoint.

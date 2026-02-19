@@ -1,14 +1,14 @@
 """
-Response Formatter - Intelligent formatting of API responses
+Response Formatter - Intelligent LLM-driven formatting of API responses
 
-Provides context-aware formatting including:
-- Concise text summaries (data-bound, generic wording)
-- Markdown tables for structured data
-- Chart-ready JSON for visualizations
-- Grouping and categorization
+The LLM decides the best response format and generates natural, helpful responses.
+Supports:
+- Natural text responses (conversational, informative)
+- Markdown tables (for lists/comparisons)
+- Chart-ready JSON (for visualizations)
+- Detailed breakdowns (for complex data)
 
-Summarization is designed to be generic and accurate: it uses only the provided
-data and query, includes exact counts, and avoids domain-specific or invented content.
+The LLM has full control over the response - no code-based overrides.
 """
 
 from typing import Dict, Any, List, Optional, Union, Literal
@@ -23,21 +23,21 @@ FormatType = Literal["auto", "concise", "detailed", "table", "chart", "grouped"]
 
 class ResponseFormatter:
     """
-    Response formatter: chooses presentation format and produces summaries.
-    Summaries are data-bound (no invented facts) and use generic wording
-    unless the query or data clearly indicates a specific type.
+    LLM-driven response formatter.
+
+    The LLM receives the user's query and API data, then decides:
+    1. What format is best (text, table, chart, etc.)
+    2. What information to include
+    3. How to present it naturally
+
+    No code-based heuristics override the LLM's decisions.
     """
-    
+
     def __init__(self, model: str = "gpt-4o", config: Optional[Dict[str, Any]] = None):
         """
         Args:
             model: OpenAI model name.
             config: Optional configuration dict to customize formatting behavior.
-                    Supported keys (all optional, with sensible defaults):
-                        - valid_formats: list[str]
-                        - group_fields: list[str]
-                        - name_fields: list[str]
-                        - chart_group_fields: list[str]
         """
         self.client = get_openai_client()
         self.model = model
@@ -89,20 +89,22 @@ class ResponseFormatter:
         context: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """
-        Format API response intelligently based on data structure and query context.
+        Format API response using intelligent LLM-driven formatting.
+
+        The LLM decides the best format and generates a natural, helpful response.
+        No code-based heuristics override the LLM's decisions.
 
         Args:
             data: The API response data
             query: Original user query
-            format_type: Desired format ("auto" lets LLM decide)
-            context: Optional context about the data (e.g., field names, data types)
-                     Can include schema with formatting_hints for resource-specific formatting
+            format_type: Hint for format ("auto" lets LLM fully decide)
+            context: Optional context about the data
 
         Returns:
             Dict with:
                 - format: chosen format type
-                - summary: concise text summary
-                - formatted: formatted output (markdown, JSON, etc.)
+                - summary: the main response text (what the user sees)
+                - formatted: formatted output (may include table/chart if LLM chose)
                 - raw_data: original data
         """
         logger.info(
@@ -120,9 +122,7 @@ class ResponseFormatter:
                 "raw_data": data
             }
 
-        # Normalize data for formatting:
-        # - If this is a paginated dict with "results", work on results list
-        # - Otherwise, work on data as-is
+        # Normalize data for formatting
         format_data = data
         if isinstance(data, dict) and "results" in data and isinstance(data["results"], list):
             format_data = data["results"]
@@ -130,30 +130,181 @@ class ResponseFormatter:
                 "Detected paginated response; normalizing format_data to results list (len=%d)",
                 len(format_data),
             )
-        
+
         # For simple/small data, just provide text
         if self._is_simple_data(format_data):
             return self._format_simple(format_data, query)
-        
-        # Analyze data structure (optionally using context/schema hints)
-        data_analysis = self._analyze_data_structure(format_data, context)
-        
-        # Let heuristics/LLM decide format if auto
-        if format_type == "auto":
-            format_type = self._determine_format(format_data, query, data_analysis, context)
-        
-        # Format based on chosen type
-        if format_type == "table":
-            return self._format_as_table(format_data, query, data_analysis)
-        elif format_type == "chart":
-            return self._format_for_chart(format_data, query, data_analysis)
-        elif format_type == "grouped":
-            return self._format_grouped(format_data, query, data_analysis)
-        elif format_type == "detailed":
-            return self._format_detailed(format_data, query, data_analysis)
-        else:  # concise
-            return self._format_concise(format_data, query, data_analysis)
+
+        # Use intelligent LLM-driven formatting for all complex data
+        return self._generate_intelligent_response(format_data, query, context)
+
+    def _generate_intelligent_response(
+        self,
+        data: Any,
+        query: str,
+        context: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        """
+        Generate an intelligent response using a single LLM call.
+
+        The LLM decides:
+        1. What format is best (text, table, chart, bullets, etc.)
+        2. What information to include based on what the user asked
+        3. How to present it naturally and helpfully
+
+        Args:
+            data: The data to format
+            query: User's original query
+            context: Optional context (resource name, schema, etc.)
+
+        Returns:
+            Dict with format, summary, formatted, and raw_data
+        """
+        # Prepare data sample for LLM (limit size for token efficiency)
+        if isinstance(data, list):
+            data_count = len(data)
+            # Show more items for smaller lists, fewer for larger
+            sample_size = min(data_count, 10)
+            data_sample = data[:sample_size]
+            data_preview = json.dumps(data_sample, indent=2, default=str)[:3000]
+            remaining = data_count - sample_size
+        else:
+            data_count = 1
+            data_preview = json.dumps(data, indent=2, default=str)[:3000]
+            remaining = 0
+
+        # Build the prompt
+        prompt = f"""You are a helpful AI assistant. The user asked a question and I retrieved data from an API.
+Generate a natural, helpful response that answers the user's question.
+
+USER'S QUESTION: "{query}"
+
+DATA RETRIEVED ({data_count} item{"s" if data_count != 1 else ""} total):
+{data_preview}
+{"[... and " + str(remaining) + " more items not shown]" if remaining > 0 else ""}
+
+INSTRUCTIONS:
+1. **Understand what the user wants**: Are they asking for a count? A list? Details? Specific information?
+
+2. **Choose the best response format**:
+   - **Text response**: For counts, summaries, single items, or when natural language is clearest
+   - **Bullet list**: For 2-7 items where the user wants to see them
+   - **Markdown table**: For 5+ items with multiple fields worth comparing
+   - **Detailed breakdown**: For complex single items or when user asks for details
+
+3. **Be specific and helpful**:
+   - Include actual names, IDs, or identifiers from the data - don't just say "Found X items"
+   - If showing a list, show the actual items (names, key details)
+   - If it's a count question, give the count AND mention what they are
+   - If there are many items, show the first few with key details
+
+4. **Response format**:
+   Return a JSON object with exactly these fields:
+   {{
+     "format": "text" | "table" | "bullets" | "detailed",
+     "response": "Your complete response to show the user"
+   }}
+
+EXAMPLES:
+
+User: "Show me the service orders assigned to me"
+Data: [{{order_number: "SO-001", status: "New", customer: "ABC Corp"}}, ...]
+Response: {{"format": "bullets", "response": "You have 9 service orders assigned to you:\\n\\n• **SO-001** - ABC Corp (New)\\n• **SO-002** - XYZ Inc (In Progress)\\n• **SO-003** - Tech Solutions (New)\\n..."}}
+
+User: "How many items are low stock?"
+Data: [{{"name": "Widget A"}}, {{"name": "Widget B"}}]
+Response: {{"format": "text", "response": "There are 2 items with low stock: Widget A and Widget B."}}
+
+User: "Which are those?" (follow-up to previous results)
+Data: [list of items from previous query]
+Response: {{"format": "bullets", "response": "Here are the items:\\n\\n• Item 1 - details\\n• Item 2 - details\\n..."}}
+
+Now generate your response for the user's question. Return ONLY the JSON object, no markdown code blocks.
+"""
+
+        try:
+            content = self.client.chat_completion(
+                messages=[{"role": "user", "content": prompt}],
+                model=self.model,
+                temperature=DETERMINISTIC_TEMP,
+                max_tokens=constants.MAX_TOKENS_DETAILED,
+            )
+
+            # Parse the LLM response
+            response_text = (content or "").strip()
+
+            # Handle potential markdown code blocks
+            if response_text.startswith("```"):
+                # Extract JSON from code block
+                lines = response_text.split("\n")
+                json_lines = []
+                in_block = False
+                for line in lines:
+                    if line.startswith("```"):
+                        in_block = not in_block
+                        continue
+                    if in_block or not line.startswith("```"):
+                        json_lines.append(line)
+                response_text = "\n".join(json_lines).strip()
+
+            try:
+                parsed = json.loads(response_text)
+                chosen_format = parsed.get("format", "text")
+                response = parsed.get("response", response_text)
+            except json.JSONDecodeError:
+                # LLM didn't return valid JSON, use the text as-is
+                logger.warning("LLM returned non-JSON response, using as text")
+                chosen_format = "text"
+                response = response_text
+
+            logger.info(f"LLM chose format: {chosen_format}")
+
+            return {
+                "format": chosen_format,
+                "summary": response,
+                "formatted": response,
+                "raw_data": data
+            }
+
+        except Exception as e:
+            logger.error("Error in intelligent response generation: %s", e)
+            # Fallback to basic formatting
+            return self._fallback_format(data, query)
     
+    def _fallback_format(self, data: Any, query: str) -> Dict[str, Any]:
+        """
+        Fallback formatting when LLM fails.
+        Generates a basic but useful response.
+        """
+        if isinstance(data, list):
+            count = len(data)
+            # Try to extract names/identifiers
+            items_preview = []
+            name_fields = self._get_name_fields()
+            for item in data[:5]:
+                if isinstance(item, dict):
+                    for nf in name_fields:
+                        if nf in item and item[nf]:
+                            items_preview.append(str(item[nf]))
+                            break
+
+            if items_preview:
+                if count <= 5:
+                    response = f"Found {count} items: {', '.join(items_preview)}"
+                else:
+                    response = f"Found {count} items including: {', '.join(items_preview)}, and {count - 5} more"
+            else:
+                response = f"Found {count} items"
+        else:
+            response = f"Retrieved data: {json.dumps(data, indent=2, default=str)[:500]}"
+
+        return {
+            "format": "text",
+            "summary": response,
+            "formatted": response,
+            "raw_data": data
+        }
+
     def _is_simple_data(self, data: Any) -> bool:
         """
         Return True only for trivial data that does not need AI formatting.
@@ -455,15 +606,15 @@ Provide a concise, accurate summary that answers what the user asked and reflect
         """Format data as markdown table."""
         if not isinstance(data, list) or not data:
             return self._format_concise(data, query, analysis)
-        
+
         # Get fields from first item
         first_item = data[0]
         if not isinstance(first_item, dict):
             return self._format_concise(data, query, analysis)
-        
+
         # Select most relevant fields (max 6)
         fields = self._select_important_fields(first_item, query)[: constants.TABLE_FIELDS_MAX]
-        
+
         # If we have a display_field hint, ensure it is the first column
         display_field = analysis.get("display_field")
         if display_field and display_field in first_item:
@@ -472,26 +623,29 @@ Provide a concise, accurate summary that answers what the user asked and reflect
             else:
                 fields = [display_field] + fields
                 fields = fields[: constants.TABLE_FIELDS_MAX]
-        
+
         # Build markdown table
         table_lines = []
         # Header
         table_lines.append("| " + " | ".join(fields) + " |")
         table_lines.append("| " + " | ".join(["---"] * len(fields)) + " |")
-        
+
         # Rows (max 20 for readability)
         for item in data[: constants.TABLE_ROW_SAMPLE]:
             if not isinstance(item, dict):
                 continue
             row_values = [str(item.get(field, ""))[: constants.TABLE_FIELD_PREVIEW] for field in fields]
             table_lines.append("| " + " | ".join(row_values) + " |")
-        
+
         if len(data) > constants.TABLE_ROW_SAMPLE:
             table_lines.append(f"\n*...and {len(data) - constants.TABLE_ROW_SAMPLE} more items*")
-        
+
         table = "\n".join(table_lines)
-        summary = f"Found {len(data)} items"
-        
+
+        # Let LLM generate the summary - use _format_concise for rich summary
+        concise_result = self._format_concise(data, query, analysis)
+        summary = concise_result.get("summary", f"Found {len(data)} items")
+
         return {
             "format": "table",
             "summary": summary,

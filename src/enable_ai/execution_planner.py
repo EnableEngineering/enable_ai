@@ -6,7 +6,7 @@ Handles dependency resolution and sequential execution ordering.
 """
 
 import json
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 
 from .utils import get_openai_client, setup_logger, DETERMINISTIC_TEMP
 
@@ -29,17 +29,17 @@ class ExecutionPlanner:
         self.logger.info("ExecutionPlanner initialized")
     
     def create_execution_plan(
-        self, 
-        parsed_query: Dict[str, Any], 
+        self,
+        parsed_query: Dict[str, Any],
         schema: Dict[str, Any]
     ) -> Dict[str, Any]:
         """
         Create a multi-step execution plan from parsed query and schema.
-        
+
         Args:
             parsed_query: Parsed query with intent, resource, entities
             schema: API schema with available endpoints
-            
+
         Returns:
             {
                 "steps": [
@@ -73,9 +73,17 @@ class ExecutionPlanner:
                 "is_multi_step": False,
                 "total_steps": 1,
             }
+
+        # Smart FK detection - auto-generate lookup steps if needed
+        fk_lookups = self._detect_fk_lookups_needed(parsed_query, schema)
+
+        if fk_lookups:
+            self.logger.info(f"Auto-detected FK lookups needed: {[l['field'] for l in fk_lookups]}")
+            return self._build_fk_lookup_plan(parsed_query, fk_lookups, schema)
+
         # Check if query requires multiple steps
         requires_multiple_steps = self._analyze_complexity(parsed_query)
-        
+
         if not requires_multiple_steps:
             # Simple single-step query
             return {
@@ -83,9 +91,178 @@ class ExecutionPlanner:
                 "is_multi_step": False,
                 "total_steps": 1
             }
-        
+
         # Complex multi-step query - use LLM to plan
         return self._plan_with_llm(parsed_query, schema)
+
+    def _detect_fk_lookups_needed(self, parsed: Dict[str, Any], schema: Dict[str, Any]) -> List[Dict]:
+        """
+        Intelligently detect FK fields that need ID lookup.
+
+        Auto-detection logic:
+        1. If field name matches a resource name (singular/plural), it's likely a FK
+           - "company" -> "companies" resource
+           - "technician" -> "users" resource (via resource_hints synonyms)
+        2. If field ends with "_id", the base name might be a resource
+        3. If value is a string (not numeric), likely needs lookup
+
+        Returns:
+            List of dicts with field, value, target_resource, search_field
+        """
+        lookups_needed = []
+        resources = schema.get("resources", {})
+        resource_hints = schema.get("resource_hints", {})
+        filters = parsed.get("filters", {}) or {}
+
+        for field, filter_val in filters.items():
+            value = filter_val.get("value") if isinstance(filter_val, dict) else filter_val
+
+            # Skip if already numeric (ID)
+            if isinstance(value, int) or (isinstance(value, str) and value.isdigit()):
+                continue
+
+            # Skip if it's a known enum field (has values in resource_hints)
+            current_resource = parsed.get("resource", "")
+            field_hints = resource_hints.get(current_resource, {}).get(field, {})
+            if isinstance(field_hints, dict) and field_hints.get("values"):
+                continue  # This is an enum field, not a FK
+
+            # Try to find matching resource for this field
+            target_resource = self._find_fk_target_resource(field, resources, resource_hints)
+
+            if target_resource:
+                lookups_needed.append({
+                    "field": field,
+                    "value": value,
+                    "target_resource": target_resource,
+                    "search_field": self._get_search_field(target_resource, resources)
+                })
+
+        return lookups_needed
+
+    def _find_fk_target_resource(
+        self,
+        field: str,
+        resources: Dict[str, Any],
+        resource_hints: Dict[str, Any]
+    ) -> Optional[str]:
+        """
+        Find the target resource for a FK field.
+
+        Matching strategies:
+        1. Exact match: field "companies" -> resource "companies"
+        2. Singular/plural: field "company" -> resource "companies"
+        3. Synonym match: field "technician" -> users (via __resource_synonyms__)
+        4. Common patterns: field "assigned_to" -> users, "created_by" -> users
+        """
+        field_lower = field.lower().replace("_id", "")
+
+        # Strategy 1 & 2: Direct or plural match
+        for res_name in resources.keys():
+            res_lower = res_name.lower()
+            if field_lower == res_lower:
+                return res_name
+            if field_lower + "s" == res_lower:
+                return res_name
+            if field_lower + "es" == res_lower:
+                return res_name
+            if field_lower == res_lower.rstrip("s"):
+                return res_name
+            # Handle "ies" -> "y" (e.g., "company" -> "companies")
+            if res_lower.endswith("ies") and field_lower == res_lower[:-3] + "y":
+                return res_name
+
+        # Strategy 3: Check resource_hints synonyms
+        for res_name, hints in resource_hints.items():
+            if not isinstance(hints, dict):
+                continue
+            synonyms = hints.get("__resource_synonyms__", [])
+            if not isinstance(synonyms, list):
+                synonyms = [synonyms]
+            if field_lower in [str(s).lower() for s in synonyms]:
+                return res_name
+
+        # Strategy 4: Common FK patterns
+        user_fields = ["technician", "assigned_to", "created_by", "updated_by", "owner", "assignee"]
+        if field_lower in user_fields and "users" in resources:
+            return "users"
+
+        return None
+
+    def _get_search_field(self, resource: str, resources: Dict[str, Any]) -> str:
+        """
+        Determine the best field to search by for a resource.
+        Priority: name > title > username > email > id
+        """
+        resource_data = resources.get(resource, {})
+        fields = resource_data.get("fields", [])
+
+        # If fields is a dict (field definitions), get keys
+        if isinstance(fields, dict):
+            fields = list(fields.keys())
+
+        for preferred in ["name", "title", "username", "email"]:
+            if preferred in fields:
+                return preferred
+        return "name"  # Default fallback
+
+    def _build_fk_lookup_plan(
+        self,
+        parsed: Dict[str, Any],
+        fk_lookups: List[Dict],
+        schema: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """
+        Build a multi-step plan with FK lookup steps.
+
+        Creates:
+        1. One lookup step per FK field
+        2. Final main query step with variable substitutions
+        """
+        steps = []
+
+        # Generate lookup steps
+        for i, lookup in enumerate(fk_lookups):
+            steps.append({
+                "step_id": i + 1,
+                "intent": "read",
+                "resource": lookup["target_resource"],
+                "filters": {
+                    lookup["search_field"]: {
+                        "operator": "icontains",  # Case-insensitive search
+                        "value": lookup["value"]
+                    }
+                },
+                "entities": {},
+                "extract": {f"{lookup['field']}_id": "$.results[0].id"},
+                "depends_on": [],
+                "description": f"Lookup {lookup['target_resource']} ID for '{lookup['value']}'"
+            })
+
+        # Main query step with variable substitution
+        main_filters = dict(parsed.get("filters", {}) or {})
+        for lookup in fk_lookups:
+            # Replace string value with variable reference
+            main_filters[lookup["field"]] = {
+                "operator": "equals",
+                "value": f"{{{lookup['field']}_id}}"  # Will be substituted
+            }
+
+        steps.append({
+            "step_id": len(steps) + 1,
+            "intent": parsed.get("intent", "read"),
+            "resource": parsed.get("resource"),
+            "entities": parsed.get("entities", {}),
+            "filters": main_filters,
+            "depends_on": list(range(1, len(steps) + 1)),
+            "description": f"Get {parsed.get('resource')} with resolved FK IDs"
+        })
+
+        return {
+            "steps": steps,
+            "is_multi_step": True,
+            "total_steps": len(steps)
+        }
     
     def _analyze_complexity(self, parsed_query: Dict[str, Any]) -> bool:
         """
