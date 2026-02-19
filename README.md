@@ -112,14 +112,30 @@ orchestrator = APIOrchestrator(schemas={"api": "path/to/api_schema.json"})
 
 Required: **OPENAI_API_KEY** (env). **Schema:** pass at init `APIOrchestrator(schemas={"api": path_or_dict})`. **base_url:** from `config.json` (`data_sources.api.base_url`) or from the schema (`base_url`). Optional: `config.json` for auth (JWT/OAuth/API keys) and schema paths; `.env` for credentials.
 
+### **Configurable limits**
+
+Key limits are in `enable_ai.constants` and can be overridden by **environment variables** (set before import or in `.env`):
+
+| Env var | Default | Effect |
+|--------|--------|--------|
+| `ENABLE_AI_SAFETY_MAX_PAGES` | 500 | Max pages when auto-paginating (stops and logs warning if API has more). |
+| `ENABLE_AI_PAGE_SIZE_CAP` | 100 | Max `page_size` per request (e.g. "show 200 items" → 100 per page). |
+| `ENABLE_AI_CONVERSATION_HISTORY_LIMIT` | 10 | Messages loaded per session for context (long chats may lose earlier filters). |
+| `ENABLE_AI_IN_MEMORY_MAX_MESSAGES` | 10 | Max messages kept per session (InMemoryConversationStore). |
+| `ENABLE_AI_REDIS_MAX_MESSAGES` | 20 | Max messages kept per session (RedisConversationStore). |
+| `ENABLE_AI_REQUEST_TIMEOUT` | 30 | HTTP timeout in seconds (api_client, schema fetch, auth). |
+| `ENABLE_AI_PROGRESS_MIN_DISPLAY_MS` | 0 | Minimum ms to show each progress stage (e.g. 400 so frontend can display each stage before the next). |
+
+Example: `export ENABLE_AI_SAFETY_MAX_PAGES=1000` or in `.env`: `ENABLE_AI_REQUEST_TIMEOUT=60`.
+
 ### **Multi-step and pagination**
 
 - **Multi-step:** The workflow runs 3–4+ API calls in sequence when your query implies related resources (e.g. “get users and their orders”). Conversation history and planner `extract` pass data between steps.
-- **Pagination:** Responses with `has_more`/`next` are detected; pagination info and “show more” suggestions are returned. **Automatic pagination** fetches and merges next page(s) until no `next` link (single-step and multi-step; safety cap in `enable_ai.constants.SAFETY_MAX_PAGES`).
+- **Pagination:** Responses with `has_more`/`next` are detected; pagination info and “show more” suggestions are returned. **Automatic pagination** fetches and merges next page(s) until no `next` link (single-step and multi-step; cap `ENABLE_AI_SAFETY_MAX_PAGES`).
 
 ### **Progress and streaming**
 
-- **Progress:** Pass `progress_callback=(stage, message, progress, metadata)` to `process()` for real-time stage updates (e.g. PARSING_QUERY, EXECUTING_API, SUMMARIZING). The **final response is returned once** at the end (no token-level streaming of the summary).
+- **Progress:** Pass `progress_callback=(stage, message, progress, metadata)` to `process()` for real-time stage updates. All stages are emitted in order: STARTED → PARSING_QUERY → INTENT_DETECTED → MATCHING_API → PLANNING → API_MATCHED → PLAN_READY → EXECUTING_API → API_COMPLETED → SUMMARIZING → COMPLETED (or ERROR). If stages flash by too quickly, set `ENABLE_AI_PROGRESS_MIN_DISPLAY_MS=400` (or similar) so each stage is shown for at least that many ms. The **final response is returned once** at the end (no token-level streaming of the summary).
 - **Optional stream:** Use `process_stream()` to receive state updates after each workflow node (e.g. for richer frontend progress or partial results). See `examples/streaming_backend.py` for SSE.
 
 ---

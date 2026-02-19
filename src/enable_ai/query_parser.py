@@ -1,5 +1,8 @@
 """
-LLM-Based Parser - Uses GPT-4 to parse natural language queries.
+Query Parser / Intent Analyser - LLM-based understanding of natural language queries.
+
+This module is the intent analyser: it turns user text into structured intent, resource,
+filters, and display preferences. The orchestrator calls it via _understand_query().
 
 Supports:
 - API Schema (REST endpoints)
@@ -7,10 +10,12 @@ Supports:
 - Knowledge Graph (Entities & relationships for PDFs/docs)
 
 Features:
+- Intent detection (read/create/update/delete) and resource extraction
 - Natural language understanding (any phrasing)
 - Complex query parsing (multiple conditions, relationships)
 - Schema-aware extraction (validates against schema)
 - Relationship detection (joins, nested queries)
+- Follow-up context: "show me more", "next page", refinement ("of them", filters merge)
 - Date/time calculation (relative dates like "last week")
 """
 
@@ -24,13 +29,16 @@ from .utils import get_openai_client, setup_logger, DETERMINISTIC_TEMP
 
 class QueryParser:
     """
-    LLM-based parser that uses GPT-4 to understand natural language queries.
+    Intent analyser and query parser: understands natural language and outputs
+    structured intent, resource, filters, display_mode, question_type, and
+    use_next_page/next_page_url for "show me more".
     
-    Advantages over regex:
+    Used by APIOrchestrator._understand_query(). Advantages over regex:
     - Understands ANY phrasing (not just keywords)
     - Handles complex conditions and relationships
     - Calculates relative dates ("last week" → actual date)
     - Schema-aware (knows valid resources, fields, values)
+    - Multi-turn: get_query_context() for refinement and "show me more"
     - Multi-language support potential
     """
     
@@ -44,15 +52,23 @@ class QueryParser:
         
         self.logger.info("Parser initialized")
     
-    def parse_input(self, natural_language_input: str, schema: Optional[Dict[str, Any]] = None, conversation_history: Optional[list] = None) -> Dict[str, Any]:
+    def parse_input(
+        self,
+        natural_language_input: str,
+        schema: Optional[Dict[str, Any]] = None,
+        conversation_history: Optional[list] = None,
+        user_context: Optional[Dict[str, Any]] = None  # v0.3.29: User identity for pronoun resolution
+    ) -> Dict[str, Any]:
         """
         Parse natural language input using LLM with schema context and conversation history.
-        
+
         Args:
             natural_language_input: User's natural language query
             schema: Active schema (api, database, or knowledge_graph)
             conversation_history: Previous messages for multi-turn context (list of {role, content})
-        
+            user_context: Optional user identity for resolving "me"/"my" pronouns (v0.3.29)
+                         Structure: {'user_id': int, 'username': str, 'role': str, 'company_id': int, 'company': str}
+
         Returns:
             {
                 'intent': 'read|create|update|delete',
@@ -65,7 +81,7 @@ class QueryParser:
                 'original_input': '...',
                 'schema_type': 'api|database|knowledge_graph'
             }
-        
+
         Examples:
             >>> parse_input("get user with id 5", api_schema)
             {
@@ -74,19 +90,13 @@ class QueryParser:
                 'entities': {'id': 5},
                 'filters': {'id': {'operator': 'equals', 'value': 5}}
             }
-            
-            >>> parse_input("show urgent service orders created last week", api_schema)
+
+            >>> parse_input("show service orders assigned to me", api_schema, user_context={'user_id': 123})
             {
                 'intent': 'read',
                 'resource': 'service_orders',
-                'entities': {
-                    'priority': 'urgent',
-                    'created_after': '2024-01-13'
-                },
-                'filters': {
-                    'priority': {'operator': 'equals', 'value': 'urgent'},
-                    'created_date': {'operator': 'gte', 'value': '2024-01-13'}
-                }
+                'entities': {'technician': 123},
+                'filters': {'technician': {'operator': 'equals', 'value': 123}}
             }
         """
         if not natural_language_input or not natural_language_input.strip():
@@ -96,14 +106,14 @@ class QueryParser:
             return APIError("Schema is required for LLM parsing")
         
         try:
-            # Check cache first
+            # Check cache first (only if no user_context - personalized queries shouldn't be cached)
             cache_key = self._get_cache_key(natural_language_input, schema)
-            if cache_key in self.cache:
+            if cache_key in self.cache and not user_context:
                 self.logger.info(f"Using cached parse result for: '{natural_language_input[:50]}...'")
                 return self.cache[cache_key]
-            
-            # Build prompt with schema context
-            prompt = self._build_prompt(natural_language_input, schema)
+
+            # Build prompt with schema context and user context
+            prompt = self._build_prompt(natural_language_input, schema, user_context)
             
             # Build messages list with conversation history for context (Issue #2 fix)
             messages = [{"role": "system", "content": self._get_system_prompt()}]
@@ -122,7 +132,7 @@ class QueryParser:
             
             if conversation_history:
                 # Use function calling to provide structured context
-                parsed = self._parse_with_context_function(messages, schema, conversation_history)
+                parsed = self._parse_with_context_function(messages, schema, conversation_history, user_context)
             else:
                 # No conversation history - regular parsing
                 parsed = self.openai_client.parse_json_response(
@@ -161,65 +171,30 @@ class QueryParser:
     def _get_system_prompt(self) -> str:
         """
         System prompt that defines the LLM's role and output format.
-        
+
         Returns:
             System prompt string
         """
         return """You are an expert query parser for a natural language to API/Database system.
 
-Your task: Extract structured information from user queries to enable programmatic data access.
+Your task: Understand the user's intent and extract structured information so the system can execute the right operations.
 
-⚠️ CRITICAL: Detecting Refinement Queries (v0.3.12 FIX)
-**IF THE QUERY CONTAINS ANY OF THESE KEYWORDS, YOU MUST CALL get_query_context():**
-- Pronouns: "them", "those", "these", "it", "they"
-- Phrases: "of them", "among them", "from them", "in them"
-- Continuations: "show me more", "the same ones", "give me all"
-- Filters on previous: "the one/ones that", "which are", "where"
+**Intent and context**
+- Decide whether the user is starting a new request, continuing or refining the previous one (referring to prior results), asking for a count/total, asking for the next page of results, or changing how results are shown.
+- When the user's intent clearly refers to or continues the previous turn (e.g. "them", "those", "the same", "more", "next page", refining or filtering prior results), call get_query_context() to retrieve previous_resource and previous_filters, then use that resource and merge filters. Set merge_with_previous=true.
+- When the user is asking for the next page of a prior list (e.g. more results, next page), use context's next_url and set use_next_page=true and next_page_url from context.
+- When the user is asking for a total or count (how many, number of, total), set question_type="count".
+- When the user wants a small sample of prior results (e.g. "a few", "some"), set a small limit and question_type="list" so they see items, not only a count.
 
-**WHEN YOU DETECT A REFINEMENT QUERY:**
-1. CALL get_query_context() to get: previous_resource, previous_intent, previous_filters
-2. Use previous_resource (don't try to infer a new one)
-3. Set merge_with_previous=true
-4. ADD new filters to the returned previous_filters (don't replace them)
-5. **If the user asks to "list a few", "show a few", "name a few", "give me a few/some"**: set limit to 5 or 10 and question_type to "list" so they see example items, not just a count.
-
-**Examples:**
-❌ BAD: "how many of them are named BOROSCOPE?"
-   → Detected as: {intent: "read", resource: "inventory", filters: {name: "BOROSCOPE"}}
-   → Previous filters LOST!
-
-✓ GOOD: "how many of them are named BOROSCOPE?"
-   1. Detect "of them" → CALL get_query_context()
-   2. Get: {previous_resource: "equipment", previous_filters: {status: "low_stock"}}
-   3. Return: {
-       intent: "read",
-       resource: "equipment",  ← Use previous_resource!
-       filters: {
-         status: {operator: "equals", value: "low_stock"},  ← Previous filter!
-         name: {operator: "contains", value: "BOROSCOPE"}  ← New filter!
-       },
-       merge_with_previous: true,
-       question_type: "count"  ← Detect "how many"
-     }
-
-✓ GOOD: "can you list a few of them?" / "show me a few" (after "which equipment has BOROSCOPE?")
-   1. Detect "of them" or "a few" → CALL get_query_context()
-   2. Get: {previous_resource: "equipment", previous_filters: {name: {"operator": "contains", "value": "BOROSCOPE"}}}
-   3. Return: {
-       intent: "read",
-       resource: "equipment",
-       filters: {name: {operator: "contains", value: "BOROSCOPE"}},
-       merge_with_previous: true,
-       limit: 5,  ← So user sees example names, not only "Found 25 items"
-       question_type: "list"
-     }
-
-⚠️ CRITICAL: Detecting Count Questions (v0.3.12 FIX)
-**IF THE QUERY ASKS FOR A COUNT, SET question_type="count":**
-- Starts with: "how many", "count", "what's the count", "number of"
-- Contains: "how much", "quantity", "total number"
-
-**This triggers COUNT formatting instead of LIST formatting!**
+**User Identity / Pronoun Resolution (IMPORTANT)**
+- When the user says "me", "my", "mine", "assigned to me", "my reports", "my orders", etc., they are referring to THEMSELVES.
+- If USER_CONTEXT is provided in the prompt, use the user_id from that context to resolve these pronouns.
+- Map pronouns to the appropriate filter field based on the resource:
+  - "service orders assigned to me" → filter by technician={user_id}
+  - "my reports" or "reports I created" → filter by technician={user_id} or created_by={user_id}
+  - "my company's orders" → filter by company={company_id}
+  - "customers in my company" → filter by company={company_id}
+- Always use the actual user_id/company_id values, never leave "me" or "my" as string values in filters.
 
 EXTRACT THE FOLLOWING:
 
@@ -233,7 +208,7 @@ EXTRACT THE FOLLOWING:
    - Use ONLY resources defined in the schema
    - Map synonyms and abbreviations (e.g., "SOs" → "service_orders")
    - Use canonical form (usually plural: "users", "orders")
-   - **If this is a follow-up query**, check conversation history for [Context: ... on RESOURCE] and use that resource unless explicitly changed
+   - For follow-up or refinement intents, use the resource from get_query_context() unless the user clearly switches topic
 
 3. **entities** (optional) - Field-value pairs for filtering/matching
    - Extract ALL mentioned field values
@@ -258,36 +233,29 @@ EXTRACT THE FOLLOWING:
    - Default: often by created_date desc or id asc
 
 7. **limit** (optional) - Number of results to return
-   - Extract from: "top 10", "first 5", "show 20", etc.
-   - **"list a few", "show a few", "name a few", "give me a few/some", "can you list a few"** → use limit: 5 or 10 so the user sees example items
+   - Infer from user phrasing (e.g. "top 10", "first 5", or "a few" → small limit so they see example items)
    - If not specified, omit (let system use default)
 
-8. **display_mode** (optional) - How to display results (v0.3.7)
-   - "summary": Brief summary with examples (default for large results)
-   - "full": Complete list of all items
-   - "detailed": Detailed view with all fields
-   - Detect from: "show me all", "give me the full list", "show everything", "all of them"
-   - Also detect: "in detail", "detailed view", "show more info"
+8. **display_mode** (optional) - How to display results
+   - "summary": Brief summary (default)
+   - "full": User wants the complete list
+   - "detailed": User wants a detailed or expanded view
+   - Infer from intent (e.g. "all", "everything", "in detail")
 
-9. **merge_with_previous** (optional) - Whether to merge with previous query (v0.3.7)
-   - true: This is a refinement of the previous query (add filters, change display)
-   - false: This is a completely new query
-   - Detect from context: If query contains only filters/display preferences without specifying a new resource
+9. **merge_with_previous** (optional) - Whether this continues or refines the previous query
+   - true: User is refining, filtering, or continuing the same topic
+   - false: New, independent request
 
-10. **question_type** (required in v0.3.12) - Type of question being asked
-   - "count": User asking "how many" / "count" / "what's the total" → Answer with number only
-   - "list": User wants to see the items → Show list with details
+10. **question_type** - What the user wants to see
+   - "count": User wants a total or number (infer from intent)
+   - "list": User wants to see items
    - "details": User wants detailed info about specific item(s)
-   - DEFAULT: If query starts with "how many" / "count" / "what's the total", ALWAYS set to "count"
 
 RULES:
 - Use ONLY field names and resources defined in the provided schema
-- Map common synonyms to schema field names
-- Calculate dates relative to today's date (provided in prompt)
-- Return valid JSON matching the exact format below
-- If you cannot determine a field, omit it (don't guess)
-- For ambiguous queries, prefer 'read' intent
-- **CRITICAL**: For relationship filters, populate BOTH entities and relationships
+- Map synonyms to schema names; calculate relative dates from today when provided
+- Return valid JSON in the exact format below; omit fields you cannot determine
+- For relationship filters, populate BOTH entities and relationships
 
 OUTPUT FORMAT (JSON):
 {
@@ -317,7 +285,9 @@ OUTPUT FORMAT (JSON):
     "limit": 10,
     "display_mode": "summary|full|detailed",
     "merge_with_previous": true|false,
-    "question_type": "count|list|details"
+    "question_type": "count|list|details",
+    "use_next_page": true|false,
+    "next_page_url": "url or omit"
 }
 
 EXAMPLES:
@@ -393,44 +363,73 @@ Output: {
     "question_type": "list"
 }
 
-Example 5 - COUNT question with refinement (CRITICAL for v0.3.12):
+Example 5 - Refinement + count intent (user refers to prior results and asks for a total):
 Query: "how many of them are named BOROSCOPE?"
-Context from get_query_context(): {
-    "previous_resource": "equipment",
-    "previous_filters": {"status": {"operator": "equals", "value": "low_stock"}}
-}
+Context from get_query_context(): { "previous_resource": "equipment", "previous_filters": {"status": {"operator": "equals", "value": "low_stock"}} }
 Output: {
     "intent": "read",
-    "resource": "equipment",  ← From previous_resource!
-    "entities": {
-        "status": "low_stock",  ← From previous!
-        "name": "BOROSCOPE"
-    },
+    "resource": "equipment",
+    "entities": {"status": "low_stock", "name": "BOROSCOPE"},
     "filters": {
-        "status": {"operator": "equals", "value": "low_stock"},  ← MERGED!
+        "status": {"operator": "equals", "value": "low_stock"},
         "name": {"operator": "contains", "value": "BOROSCOPE"}
     },
-    "merge_with_previous": true,  ← Mark as refinement!
-    "question_type": "count"  ← Detect "how many"!
+    "merge_with_previous": true,
+    "question_type": "count"
 }
 
-CRITICAL: Return ONLY the JSON object, no explanations or markdown.
+Example 6 - User pronoun resolution ("assigned to me"):
+Query: "show me the new service orders assigned to me"
+USER_CONTEXT: {"user_id": 123, "username": "john@example.com", "role": "Technician"}
+Output: {
+    "intent": "read",
+    "resource": "service_orders",
+    "entities": {"technician": 123, "status": "New"},
+    "filters": {
+        "technician": {"operator": "equals", "value": 123},
+        "status__name": {"operator": "equals", "value": "New"}
+    },
+    "question_type": "list"
+}
+
+Example 7 - User pronoun resolution ("my reports"):
+Query: "what are the observations for my last report?"
+USER_CONTEXT: {"user_id": 456, "username": "jane@example.com", "role": "Technician"}
+Output: {
+    "intent": "read",
+    "resource": "details_reports",
+    "entities": {"technician": 456},
+    "filters": {
+        "technician": {"operator": "equals", "value": 456}
+    },
+    "sort": {"field": "created_at", "order": "desc"},
+    "limit": 1,
+    "question_type": "details"
+}
+
+Return ONLY the JSON object, no explanations or markdown.
 """
     
-    def _build_prompt(self, query: str, schema: Dict[str, Any]) -> str:
+    def _build_prompt(
+        self,
+        query: str,
+        schema: Dict[str, Any],
+        user_context: Optional[Dict[str, Any]] = None  # v0.3.29: User identity
+    ) -> str:
         """
-        Build user prompt with schema context and query.
-        
+        Build user prompt with schema context, query, and user context.
+
         Args:
             query: Natural language query
             schema: Active schema
-        
+            user_context: Optional user identity for pronoun resolution
+
         Returns:
             Formatted prompt string
         """
         schema_type = schema.get('type')
         today = datetime.now().strftime('%Y-%m-%d')
-        
+
         # Extract schema information
         if schema_type == 'api':
             schema_info = self._extract_api_schema_info(schema)
@@ -440,7 +439,7 @@ CRITICAL: Return ONLY the JSON object, no explanations or markdown.
             schema_info = self._extract_kg_schema_info(schema)
         else:
             schema_info = {"resources": [], "fields": {}}
-        
+
         # Optional: allowed values and synonyms per resource/field (configurable via resource_hints)
         hints_section = ""
         resource_hints = schema.get("resource_hints") or {}
@@ -455,12 +454,26 @@ CRITICAL: Return ONLY the JSON object, no explanations or markdown.
                 "(for example, \"equipment\", \"equipments\", \"consumables\", \"materials\"), choose the "
                 "corresponding resource instead of another with a similar shape.\n"
             )
-        
+
+        # v0.3.29: User context section for pronoun resolution
+        user_context_section = ""
+        if user_context:
+            user_context_section = f"""
+USER_CONTEXT (use this to resolve "me", "my", "mine", "assigned to me" pronouns):
+{json.dumps(user_context, indent=2)}
+
+IMPORTANT: When the query contains "me", "my", "mine", "assigned to me", "my reports", etc.:
+- Use user_id={user_context.get('user_id')} for technician/created_by/assigned_to filters
+- Use company_id={user_context.get('company_id')} for company filters
+- User's role is: {user_context.get('role', 'Unknown')}
+- NEVER leave "me" or "my" as string values in filters - always resolve to actual IDs
+"""
+
         return f"""Parse this natural language query:
 "{query}"
 
 TODAY'S DATE: {today}
-
+{user_context_section}
 AVAILABLE SCHEMA:
 
 Resources/Tables:
@@ -476,6 +489,7 @@ INSTRUCTIONS:
 4. Return valid JSON matching the format in the system prompt
 5. Be precise - map the query to the exact schema structure
 6. For status/filter fields with allowed values above, use EXACTLY those values (or their synonym mapping)
+7. If USER_CONTEXT is provided and query contains "me"/"my" pronouns, resolve them to actual user_id/company_id values
 
 Return the parsed JSON now:
 """
@@ -576,56 +590,76 @@ Return the parsed JSON now:
     def _validate_parsed_output(self, parsed: Dict[str, Any], schema: Dict[str, Any]) -> Dict[str, Any]:
         """
         Validate LLM output against schema.
-        
+
         Ensures:
         - Intent is valid CRUD operation
         - Resource exists in schema
         - Fields are valid for the resource
         - Operators are supported
-        
+
         Args:
             parsed: LLM parsed output
             schema: Active schema
-        
+
         Returns:
             Validated parsed dict
-        
+
         Raises:
             ValueError: If validation fails
         """
         schema_type = schema.get('type')
-        
+
         # Validate intent
         valid_intents = ['read', 'create', 'update', 'delete', 'search']
         if parsed.get('intent') not in valid_intents:
             # Default to read if invalid
             parsed['intent'] = 'read'
-        
+
         # Validate resource
         if schema_type == 'api':
-            valid_resources = schema.get('resources', {}).keys()
+            valid_resources = list(schema.get('resources', {}).keys())
         elif schema_type == 'database':
-            valid_resources = schema.get('tables', {}).keys()
+            valid_resources = list(schema.get('tables', {}).keys())
         elif schema_type == 'knowledge_graph':
-            valid_resources = schema.get('entities', {}).keys()
+            valid_resources = list(schema.get('entities', {}).keys())
         else:
             valid_resources = []
-        
-        if parsed.get('resource') not in valid_resources:
+
+        resource_found = False
+        if parsed.get('resource') in valid_resources:
+            resource_found = True
+        else:
             # Try to find closest match
             resource = parsed.get('resource', '').lower()
             for valid_resource in valid_resources:
                 if resource in valid_resource.lower() or valid_resource.lower() in resource:
                     parsed['resource'] = valid_resource
+                    resource_found = True
                     break
-        
+
+            # v0.3.29: Also check resource_hints for synonyms
+            if not resource_found:
+                resource_hints = schema.get('resource_hints', {})
+                for res_name, hints in resource_hints.items():
+                    synonyms = hints.get('__resource_synonyms__', [])
+                    if resource in [s.lower() for s in synonyms]:
+                        parsed['resource'] = res_name
+                        resource_found = True
+                        break
+
+        # v0.3.29: Mark as unknown_intent if resource not found
+        if not resource_found and parsed.get('resource'):
+            self.logger.warning(f"Resource '{parsed.get('resource')}' not found in schema. Available: {valid_resources}")
+            parsed['unknown_intent'] = True
+            parsed['available_resources'] = valid_resources
+
         # Ensure required fields exist
         if 'entities' not in parsed:
             parsed['entities'] = {}
-        
+
         if 'filters' not in parsed:
             parsed['filters'] = {}
-        
+
         # Convert entities to filters if filters are empty
         if parsed['entities'] and not parsed['filters']:
             for key, value in parsed['entities'].items():
@@ -633,7 +667,7 @@ Return the parsed JSON now:
                     'operator': 'equals',
                     'value': value
                 }
-        
+
         return parsed
     
     # ========================================================================
@@ -679,7 +713,8 @@ Return the parsed JSON now:
             "previous_resource": None,
             "previous_intent": None,
             "previous_query": None,
-            "previous_filters": None
+            "previous_filters": None,
+            "next_url": None,
         }
         
         # Look through conversation history in reverse (most recent first)
@@ -689,6 +724,9 @@ Return the parsed JSON now:
                 # Look for [Context: intent operation on resource]
                 if '[Context:' in content:
                     import re
+                    metadata = msg.get('metadata') or {}
+                    if isinstance(metadata, dict) and metadata.get('next_url'):
+                        context['next_url'] = metadata['next_url']
                     match = re.search(r'\[Context: (\w+) operation on ([\w_]+)\]', content)
                     if match:
                         context['previous_intent'] = match.group(1)
@@ -700,7 +738,7 @@ Return the parsed JSON now:
                             try:
                                 import json
                                 context['previous_filters'] = json.loads(filters_match.group(1))
-                            except:
+                            except Exception:
                                 pass
                         break
             elif msg.get('role') == 'user':
@@ -720,22 +758,9 @@ Return the parsed JSON now:
             "type": "function",
             "function": {
                 "name": "get_query_context",
-                "description": """CRITICAL: You MUST call this function if the query contains ANY of these keywords:
-- Pronouns: 'them', 'those', 'these', 'it', 'they', 'that', 'which'
-- Phrases: 'of them', 'among them', 'from them', 'in them', 'the ones', 'the same'
-- Examples requiring this call:
-  * "how many of them are named X?" ← MUST CALL
-  * "show me those in location Y" ← MUST CALL
-  * "which ones are available?" ← MUST CALL
-  * "the ones that match Z" ← MUST CALL
+                "description": """Call this when the user's intent refers to or continues the previous query: e.g. referring to prior results ("them", "those"), refining or filtering those results, asking for a specific number (e.g. "first 5", "show me 5"), or asking for the next page of results.
 
-Returns context from previous query:
-- previous_resource: The resource type user was querying (e.g., "equipment", "users")
-- previous_intent: The operation (e.g., "read", "create")
-- previous_query: The exact previous query text
-- previous_filters: CRITICAL - The filters from the previous query (e.g., {"status": {"operator": "equals", "value": "low_stock"}})
-
-You MUST use previous_resource and MERGE previous_filters with any new filters!""",
+Returns: previous_resource, previous_intent, previous_query, previous_filters, and next_url (if the previous response had more pages). Use previous_resource; merge previous_filters with any new conditions from the current query. If the user specifies how many results to return, the final parse must include limit set to that number (the system maps limit to the API's parameter from the schema). If the user is asking for the next page of results and next_url is provided, set use_next_page=true and next_page_url to that value.""",
                 "parameters": {
                     "type": "object",
                     "properties": {},
@@ -745,19 +770,21 @@ You MUST use previous_resource and MERGE previous_filters with any new filters!"
         }
     
     def _parse_with_context_function(
-        self, 
-        messages: List[Dict[str, str]], 
+        self,
+        messages: List[Dict[str, str]],
         schema: Dict[str, Any],
-        conversation_history: list
+        conversation_history: list,
+        user_context: Optional[Dict[str, Any]] = None  # v0.3.29: User identity
     ) -> Dict[str, Any]:
         """
         Parse query using OpenAI function calling to provide structured context (v0.3.12 enhanced).
-        
+
         Args:
             messages: Messages for the LLM
             schema: Schema for validation
             conversation_history: Full conversation history with context markers
-            
+            user_context: Optional user identity for pronoun resolution
+
         Returns:
             Parsed query dict
         """
@@ -786,6 +813,7 @@ You MUST use previous_resource and MERGE previous_filters with any new filters!"
             self.logger.info(f"   - previous_resource: {context.get('previous_resource')}")
             self.logger.info(f"   - previous_intent: {context.get('previous_intent')}")
             self.logger.info(f"   - previous_filters: {context.get('previous_filters')}")
+            self.logger.info(f"   - next_url: {context.get('next_url') and 'yes' or 'no'}")
             
             # Build function response
             function_response = {
@@ -813,18 +841,28 @@ You MUST use previous_resource and MERGE previous_filters with any new filters!"
             })
             messages.append(function_response)
             
-            # Add explicit instruction to use the context
+            # Add intent-based instruction to use the context
+            next_url_instruction = ""
+            if context.get("next_url"):
+                next_url_instruction = "\n- If the user is asking for the next page of results, set use_next_page=true and next_page_url to the value from context (next_url)."
+
+            # v0.3.29: Add user context reminder for pronoun resolution
+            user_context_reminder = ""
+            if user_context:
+                user_context_reminder = f"""
+- IMPORTANT: If the query contains "me", "my", "mine", "assigned to me", resolve these pronouns using:
+  - user_id={user_context.get('user_id')} for technician/created_by/assigned_to filters
+  - company_id={user_context.get('company_id')} for company filters
+  - NEVER leave "me"/"my" as string values - always use the actual IDs"""
+
             messages.append({
                 "role": "user",
-                "content": f"""Now parse the query using the context provided.
+                "content": f"""Parse the query using the context provided.
 
-CRITICAL INSTRUCTIONS:
-1. Use previous_resource as the resource (don't infer a new one)
-2. MERGE previous_filters with any new filters from the current query
-3. Set merge_with_previous=true
-4. If query asks "how many", set question_type="count"
+Use previous_resource; merge previous_filters with any new conditions from the current query. Set merge_with_previous=true. Infer question_type from intent (count vs list vs details).
+- If the user specifies how many results to return (a number or phrases like first N, top N), set limit to that number; the system will map it to the API's parameter from the schema.{next_url_instruction}{user_context_reminder}
 
-Return the complete parsed JSON now with ALL filters merged."""
+Return the complete parsed JSON with all filters merged and limit set when the user asks for a specific number of results."""
             })
             
             self.logger.info("🔄 Calling LLM again with context to get final parse...")
@@ -838,6 +876,7 @@ Return the complete parsed JSON now with ALL filters merged."""
             self.logger.info(f"✅ Final parsed output:")
             self.logger.info(f"   - resource: {final_response.get('resource')}")
             self.logger.info(f"   - filters: {final_response.get('filters')}")
+            self.logger.info(f"   - limit: {final_response.get('limit')}")
             self.logger.info(f"   - merge_with_previous: {final_response.get('merge_with_previous')}")
             self.logger.info(f"   - question_type: {final_response.get('question_type')}")
             

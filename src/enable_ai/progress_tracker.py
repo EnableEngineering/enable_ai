@@ -12,6 +12,7 @@ from typing import Callable, Optional, Dict, Any, List
 from enum import Enum
 import time
 from .utils import setup_logger
+from . import constants
 
 logger = setup_logger(__name__)
 
@@ -79,6 +80,7 @@ class ProgressTracker:
         self.callback = callback
         self.updates: List[ProgressUpdate] = []
         self.start_time = time.time()
+        self._last_update_time: float = 0.0
         self._current_stage = ProgressStage.STARTED
         logger.info("ProgressTracker initialized")
     
@@ -98,6 +100,13 @@ class ProgressTracker:
             progress: Optional progress percentage (0.0 to 1.0)
             **metadata: Additional metadata (e.g., api_name, endpoint)
         """
+        # Optional: ensure minimum display time so frontend can show each stage (avoids stages flashing by)
+        min_ms = getattr(constants, "PROGRESS_MIN_DISPLAY_MS", 0) or 0
+        if min_ms > 0 and self._last_update_time > 0:
+            elapsed_ms = (time.time() - self._last_update_time) * 1000
+            if elapsed_ms < min_ms:
+                time.sleep((min_ms - elapsed_ms) / 1000.0)
+
         # Auto-calculate progress if not provided
         if progress is None:
             progress = self._calculate_progress(stage)
@@ -105,6 +114,7 @@ class ProgressTracker:
         update = ProgressUpdate(stage, message, progress, metadata)
         self.updates.append(update)
         self._current_stage = stage
+        self._last_update_time = time.time()
         
         logger.info(f"Progress: {stage.value} - {message} ({progress*100:.0f}%)")
         

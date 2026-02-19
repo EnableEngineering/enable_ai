@@ -61,6 +61,18 @@ class ExecutionPlanner:
                 "total_steps": int
             }
         """
+        # "Show me more" / next page: single step that fetches the stored next_url
+        if parsed_query.get("use_next_page") and parsed_query.get("next_page_url"):
+            return {
+                "steps": [{
+                    "step_id": 1,
+                    "type": "fetch_next_page",
+                    "url": parsed_query["next_page_url"],
+                    "description": "Fetch next page of results",
+                }],
+                "is_multi_step": False,
+                "total_steps": 1,
+            }
         # Check if query requires multiple steps
         requires_multiple_steps = self._analyze_complexity(parsed_query)
         
@@ -180,12 +192,12 @@ class ExecutionPlanner:
     
     def _get_planner_system_prompt(self) -> str:
         """System prompt for the LLM planner."""
-        return """You are an API execution planner. Your job is to create a step-by-step execution plan for complex API queries.
+        return """You are an API execution planner. Your job is to turn a parsed user query and API schema into a step-by-step execution plan.
 
-Given a parsed user query and API schema, create an execution plan with:
-1. **steps**: List of API calls to execute
-2. **dependencies**: Which steps depend on previous steps
-3. **data_extraction**: What data to extract from each step and pass to the next
+Given the parsed query and schema, produce a plan with:
+1. **steps**: Ordered list of API calls to execute
+2. **dependencies**: Which steps depend on previous steps (depends_on)
+3. **data_extraction**: What to extract from each step and pass to the next (extract with JSONPath)
 
 OUTPUT FORMAT (JSON):
 {
@@ -207,35 +219,14 @@ OUTPUT FORMAT (JSON):
 RULES:
 - step_id starts at 1 and increments
 - depends_on lists step_ids that must complete first
-- extract uses JSONPath to extract data from previous step's response
-- Variables extracted can be used in later steps via {variable_name}
-- fetch_all_pages (optional): set true when the user asks for "all items", "all pages", or "everything" for a list endpoint; the executor will fetch next pages until none left
+- extract uses JSONPath to get data from the previous step's response; use {variable_name} in later steps
+- fetch_all_pages (optional): set true when the user wants the full set of results (e.g. all items or all pages) for a list endpoint; the executor will fetch pages until none left
 
-EXAMPLE:
-Query: "Get user 5 and all their orders"
-
-Plan:
+EXAMPLE (Query: "Get user 5 and all their orders"):
 {
     "steps": [
-        {
-            "step_id": 1,
-            "intent": "read",
-            "resource": "users",
-            "entities": {"id": 5},
-            "filters": {"id": {"operator": "equals", "value": 5}},
-            "depends_on": [],
-            "extract": {"user_id": "$.id"},
-            "description": "Fetch user with ID 5"
-        },
-        {
-            "step_id": 2,
-            "intent": "read",
-            "resource": "orders",
-            "entities": {"user_id": "{user_id}"},
-            "filters": {"user_id": {"operator": "equals", "value": "{user_id}"}},
-            "depends_on": [1],
-            "description": "Fetch all orders for the user"
-        }
+        {"step_id": 1, "intent": "read", "resource": "users", "entities": {"id": 5}, "filters": {"id": {"operator": "equals", "value": 5}}, "depends_on": [], "extract": {"user_id": "$.id"}, "description": "Fetch user with ID 5"},
+        {"step_id": 2, "intent": "read", "resource": "orders", "entities": {"user_id": "{user_id}"}, "filters": {"user_id": {"operator": "equals", "value": "{user_id}"}}, "depends_on": [1], "description": "Fetch orders for the user"}
     ]
 }
 

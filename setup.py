@@ -7,7 +7,7 @@ long_description = readme_file.read_text(encoding='utf-8') if readme_file.exists
 
 setup(
     name='enable-ai',
-    version='0.3.28',
+    version='0.3.32',
     author='Enable Engineering',
     author_email='engineering@enableyou.co',
     description='AI-powered natural language interface for REST APIs with OpenAPI support and real-time streaming',

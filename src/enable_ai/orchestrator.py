@@ -7,6 +7,7 @@ Main interface for processing natural language queries against REST APIs.
 from typing import Dict, Any, Optional, Union, List, Callable
 from pathlib import Path
 import json
+import re
 import sys
 
 from .query_parser import QueryParser
@@ -417,18 +418,19 @@ class APIOrchestrator:
             print(f"  - Client support: {', '.join(client_support)}", file=sys.stderr)
     
     def process(
-        self, 
-        query: str, 
-        access_token: Optional[str] = None, 
-        context: Optional[Any] = None, 
+        self,
+        query: str,
+        access_token: Optional[str] = None,
+        context: Optional[Any] = None,
         runtime_schema: Optional[dict] = None,
         schema: Optional[dict] = None,  # Deprecated, use runtime_schema
         session_id: Optional[str] = None,
-        progress_callback: Optional[Callable] = None  # v0.3.10: Real-time progress
+        progress_callback: Optional[Callable] = None,  # v0.3.10: Real-time progress
+        user_context: Optional[Dict[str, Any]] = None  # v0.3.29: User identity for pronoun resolution
     ) -> Dict[str, Any]:
         """
         Process a natural language query with multi-step planning and execution.
-        
+
         Pipeline (LangGraph):
             1. Load schema (determine active schema)
             2. Parse query (understand intent with schema) - OpenAI
@@ -436,7 +438,7 @@ class APIOrchestrator:
             4. Execute plan (sequential API calls with context passing)
             5. Summarize result (format response) - OpenAI
             6. Return result
-        
+
         Args:
             query: Natural language query from user
             access_token: Optional JWT token for authentication
@@ -448,6 +450,14 @@ class APIOrchestrator:
             progress_callback: Optional callback for real-time progress updates (v0.3.10)
                               Signature: callback(stage: str, message: str, progress: float, metadata: dict)
                               Example: callback("parsing_query", "Understanding...", 0.1, {})
+            user_context: Optional user identity context for resolving "me"/"my" pronouns (v0.3.29)
+                         Structure: {
+                             'user_id': int,           # Current user's ID
+                             'username': str,          # Username/email
+                             'role': str,              # Role name (e.g., 'Technician', 'Admin')
+                             'company_id': int,        # User's company ID (optional)
+                             'company': str            # Company name (optional)
+                         }
             
         Returns:
             {
@@ -536,6 +546,7 @@ class APIOrchestrator:
                     "session_id": session_id,
                     "conversation_history": conversation_history,
                     "progress_tracker": progress_tracker,  # v0.3.10: pass tracker to workflow
+                    "user_context": user_context,  # v0.3.29: user identity for pronoun resolution
                 }
             )
             
@@ -587,12 +598,16 @@ class APIOrchestrator:
                 if filters:
                     assistant_message += f"\n[Filters: {json.dumps(filters)}]"
                 
-                # Add assistant message with metadata
+                # Add assistant message with metadata (include next_url for "show me more")
+                meta = {'resource': resource, 'intent': intent, 'filters': filters}
+                next_url = (response.get('pagination') or {}).get('next_url')
+                if next_url:
+                    meta['next_url'] = next_url
                 self.conversation_store.add_message(
                     session_id, 
                     'assistant', 
                     assistant_message,
-                    metadata={'resource': resource, 'intent': intent, 'filters': filters}
+                    metadata=meta
                 )
             
             return response
@@ -607,6 +622,7 @@ class APIOrchestrator:
         context: Optional[Any] = None,
         runtime_schema: Optional[dict] = None,
         session_id: Optional[str] = None,
+        user_context: Optional[Dict[str, Any]] = None,  # v0.3.29: User identity
     ):
         """
         Process a query and stream state updates after each workflow node.
@@ -626,6 +642,7 @@ class APIOrchestrator:
             "session_id": session_id,
             "conversation_history": conversation_history,
             "progress_tracker": None,
+            "user_context": user_context,  # v0.3.29: user identity for pronoun resolution
         }
         try:
             for event in self.workflow.stream(initial_state, stream_mode="values"):
@@ -677,17 +694,33 @@ class APIOrchestrator:
         # Priority 4: None
         return None
     
-    def _understand_query(self, query: str, schema: dict, context: Optional[Any] = None, conversation_history: Optional[list] = None) -> Dict[str, Any]:
+    def _understand_query(
+        self,
+        query: str,
+        schema: dict,
+        context: Optional[Any] = None,
+        conversation_history: Optional[list] = None,
+        user_context: Optional[Dict[str, Any]] = None  # v0.3.29: User identity
+    ) -> Dict[str, Any]:
         """
-        Step 2: Parse and understand user query with schema.
-        
+        Step 2: Intent analysis and query parsing (QueryParser = intent analyser).
+
+        Uses self.parser (QueryParser) to extract intent, resource, filters,
+        display_mode, question_type, and use_next_page/next_page_url for "show me more".
+
         Args:
             query: User's natural language query
             schema: Active schema for entity extraction
             context: Optional conversation context
             conversation_history: Optional conversation history for multi-turn queries
+            user_context: Optional user identity for resolving "me"/"my" pronouns
         """
-        parsed = self.parser.parse_input(query, schema, conversation_history=conversation_history)
+        parsed = self.parser.parse_input(
+            query,
+            schema,
+            conversation_history=conversation_history,
+            user_context=user_context  # v0.3.29: pass user context for pronoun resolution
+        )
         
         if not parsed:
             raise ValueError("Could not parse query")
@@ -730,7 +763,44 @@ class APIOrchestrator:
     # ========================================================================
     # PLAN CREATORS (Schema-Type Specific)
     # ========================================================================
-    
+
+    def _get_limit_param_for_endpoint(self, schema: dict, endpoint_path: str) -> str:
+        """
+        Resolve the API's result-limit param name from the schema for the matched endpoint.
+        Returns the first query param that matches known limit names (page_size, limit, etc.);
+        if none in schema, falls back to constants.LIMIT_PARAM_NAMES[0] (page_size).
+        """
+        def _norm(p: str) -> str:
+            return (p or "").rstrip("/") or "/"
+
+        target = _norm(endpoint_path)
+        limit_names_lower = {n.lower() for n in constants.LIMIT_PARAM_NAMES}
+
+        for _res_name, resource_data in (schema.get("resources") or {}).items():
+            for ep in resource_data.get("endpoints") or []:
+                path = ep.get("path") or ""
+                if _norm(path) == target:
+                    return self._pick_limit_param_from_endpoint(ep, limit_names_lower)
+                # Match path with placeholders (e.g. /api/orders/{id}/) to request path
+                try:
+                    parts = re.split(r"(\{[^}]+\})", path)
+                    regex = "".join("[^/]+" if re.match(r"^\{[^}]+\}$", p) else re.escape(p) for p in parts)
+                    regex = regex.rstrip("/") + "/?"
+                    if re.match(f"^{regex}$", target + "/"):
+                        return self._pick_limit_param_from_endpoint(ep, limit_names_lower)
+                except re.error:
+                    pass
+        return constants.LIMIT_PARAM_NAMES[0]  # page_size
+
+    def _pick_limit_param_from_endpoint(self, endpoint_data: dict, limit_names_lower: set) -> str:
+        """From endpoint definition, return first query param in limit_names_lower; else default."""
+        params = (endpoint_data.get("parameters") or {}).get("query") or []
+        for p in params:
+            name = p.get("name") if isinstance(p, dict) else (p if isinstance(p, str) else None)
+            if name and name.lower() in limit_names_lower:
+                return name
+        return constants.LIMIT_PARAM_NAMES[0]
+
     def _create_api_plan(self, parsed: Dict[str, Any], schema: dict) -> Optional[Dict[str, Any]]:
         """
         Create API execution plan.
@@ -773,13 +843,14 @@ class APIOrchestrator:
         if isinstance(result, APIRequest):
             # Extract information from APIRequest object
             params = dict(result.params) if result.params else {}
-            # When user asks "list a few" etc., parsed has limit — send as page_size for DRF/pagination
+            # When user asks for a result cap, parsed has limit — map to API's param from schema (page_size, limit, etc.)
             limit = parsed.get("limit")
             if limit is not None:
                 try:
                     n = min(int(limit), constants.PAGE_SIZE_CAP)
-                    params["page_size"] = n
-                    self.logger.info(f"Adding page_size={n} from parsed limit for 'list a few' style query")
+                    param_name = self._get_limit_param_for_endpoint(schema, result.endpoint)
+                    params[param_name] = n
+                    self.logger.info(f"Adding {param_name}={n} from parsed limit (schema-driven)")
                 except (TypeError, ValueError):
                     pass
             return {

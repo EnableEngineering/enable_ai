@@ -2,29 +2,57 @@
 Centralized constants for limits and static response strings.
 Update these to change behavior or copy without touching business logic.
 See todo.md § Limits affecting correctness for impact of limit constants.
+
+Key limits can be overridden by environment variables (see README § Configurable limits):
+- ENABLE_AI_SAFETY_MAX_PAGES
+- ENABLE_AI_PAGE_SIZE_CAP
+- ENABLE_AI_CONVERSATION_HISTORY_LIMIT
+- ENABLE_AI_IN_MEMORY_MAX_MESSAGES
+- ENABLE_AI_REDIS_MAX_MESSAGES
+- ENABLE_AI_REQUEST_TIMEOUT
 """
 
+import os
+
+# -----------------------------------------------------------------------------
+# Helper: read int from env with default (invalid/missing -> default)
+# -----------------------------------------------------------------------------
+
+
+def _env_int(name: str, default: int) -> int:
+    val = os.environ.get(name)
+    if val is None:
+        return default
+    try:
+        return int(val)
+    except ValueError:
+        return default
+
+
 # =============================================================================
-# LIMITS (configurable; see todo.md § Limits affecting correctness)
+# LIMITS (configurable via env; see todo.md § Limits affecting correctness)
 # =============================================================================
 
 # Pagination: safety cap to avoid infinite loop on buggy APIs (workflow.py)
-SAFETY_MAX_PAGES = 500
+SAFETY_MAX_PAGES = _env_int("ENABLE_AI_SAFETY_MAX_PAGES", 500)
 
 # Max page_size when user says "list a few" / limit (orchestrator.py)
-PAGE_SIZE_CAP = 100
+PAGE_SIZE_CAP = _env_int("ENABLE_AI_PAGE_SIZE_CAP", 100)
+
+# Known query/body param names for result limit (orchestrator picks from API schema; fallback if not in schema)
+LIMIT_PARAM_NAMES = ("page_size", "limit", "per_page", "pageSize", "size")
 
 # Max examples in summaries (orchestrator._extract_examples)
 MAX_EXAMPLES = 3
 
 # Conversation history: messages to load per session (conversation_store get_history)
-CONVERSATION_HISTORY_LIMIT = 10
+CONVERSATION_HISTORY_LIMIT = _env_int("ENABLE_AI_CONVERSATION_HISTORY_LIMIT", 10)
 
 # In-memory store: max messages to keep per session (InMemoryConversationStore)
-IN_MEMORY_MAX_MESSAGES = 10
+IN_MEMORY_MAX_MESSAGES = _env_int("ENABLE_AI_IN_MEMORY_MAX_MESSAGES", 10)
 
 # Redis store: max messages to keep per session (RedisConversationStore)
-REDIS_MAX_MESSAGES = 20
+REDIS_MAX_MESSAGES = _env_int("ENABLE_AI_REDIS_MAX_MESSAGES", 20)
 
 # Chart: max items in labels/datasets (response_formatter)
 CHART_MAX_ITEMS = 20
@@ -35,7 +63,7 @@ MAX_TOKENS_SUMMARY = 150
 MAX_TOKENS_DETAILED = 500
 
 # HTTP and schema fetch timeout (seconds) (api_client, orchestrator, schema_loader)
-REQUEST_TIMEOUT = 30
+REQUEST_TIMEOUT = _env_int("ENABLE_AI_REQUEST_TIMEOUT", 30)
 
 # API client retry: max attempts (including first), delay in seconds between attempts (backoff)
 REQUEST_RETRY_ATTEMPTS = 3
@@ -88,6 +116,10 @@ SCHEMA_REFRESH_INTERVAL_DEFAULT = 3600
 
 # Response formatter: list length range for "medium sample" hint (6–50 items)
 MIN_LIST_LENGTH_MEDIUM_SAMPLE = 6
+
+# Response formatter: data is "simple" (no AI) only when trivial (see _is_simple_data)
+SIMPLE_DICT_MAX_KEYS = 3
+SIMPLE_LIST_MAX_PRIMITIVE_ITEMS = 10
 
 
 # =============================================================================
@@ -165,6 +197,9 @@ PROGRESS_COMPLETED = "Done! ✓"
 PROGRESS_ERROR = "Error: {error}"
 PROGRESS_DEFAULT = "Processing..."
 
+# Minimum ms to show each progress stage so frontend can display it (0 = no delay; set e.g. 400 to avoid stages flashing by)
+PROGRESS_MIN_DISPLAY_MS = _env_int("ENABLE_AI_PROGRESS_MIN_DISPLAY_MS", 0)
+
 
 # =============================================================================
 # STRINGS – Response formatter
@@ -219,3 +254,44 @@ MCP_AUTH_SUCCESS_MESSAGE = "Authentication successful. Use this token with proce
 API_FAILED_CONNECT = "Failed to connect to API at {base_url}"
 API_TIMEOUT_MESSAGE = "API request timed out after {timeout} seconds"
 API_REQUEST_TIMEOUT = "Request timed out"
+
+
+# =============================================================================
+# STRINGS – Unknown Intent Handling (v0.3.29)
+# =============================================================================
+
+UNKNOWN_INTENT_INTRO = "I'm not sure I understand that query."
+
+UNKNOWN_INTENT_CAPABILITIES = """I can help you with:
+• **Service Orders** - status, assignments, scheduling
+• **Reports** - observations, flash reports, detailed reports
+• **Inventory** - low stock items, equipment status, consumables
+• **Technicians** - availability, skills, workload
+• **Companies** - customer information"""
+
+UNKNOWN_INTENT_EXAMPLES = """Try asking something like:
+- "Show me my assigned service orders"
+- "What's the status of SO-123?"
+- "Which items are low in stock?"
+- "Who is available right now?"
+- "What are the observations for my last report?"
+"""
+
+UNKNOWN_INTENT_REPHRASE = "Could you rephrase your question?"
+
+# Full unknown intent response template
+UNKNOWN_INTENT_FULL = f"""{UNKNOWN_INTENT_INTRO}
+
+{UNKNOWN_INTENT_CAPABILITIES}
+
+{UNKNOWN_INTENT_EXAMPLES}
+
+{UNKNOWN_INTENT_REPHRASE}
+"""
+
+# No matching resource found
+NO_MATCHING_RESOURCE = "I couldn't find a matching resource for '{resource}'. Available resources: {available}"
+
+# No results found (but query was understood)
+NO_RESULTS_FOUND = "No {resource} found matching your criteria."
+NO_RESULTS_SUGGESTION = "Try broadening your search or using different filters."

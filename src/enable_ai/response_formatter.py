@@ -2,10 +2,13 @@
 Response Formatter - Intelligent formatting of API responses
 
 Provides context-aware formatting including:
-- Concise text summaries
+- Concise text summaries (data-bound, generic wording)
 - Markdown tables for structured data
 - Chart-ready JSON for visualizations
 - Grouping and categorization
+
+Summarization is designed to be generic and accurate: it uses only the provided
+data and query, includes exact counts, and avoids domain-specific or invented content.
 """
 
 from typing import Dict, Any, List, Optional, Union, Literal
@@ -20,7 +23,9 @@ FormatType = Literal["auto", "concise", "detailed", "table", "chart", "grouped"]
 
 class ResponseFormatter:
     """
-    Intelligent response formatter using LLM to choose optimal format.
+    Response formatter: chooses presentation format and produces summaries.
+    Summaries are data-bound (no invented facts) and use generic wording
+    unless the query or data clearly indicates a specific type.
     """
     
     def __init__(self, model: str = "gpt-4o", config: Optional[Dict[str, Any]] = None):
@@ -77,21 +82,22 @@ class ResponseFormatter:
         )
     
     def format_response(
-        self, 
-        data: Any, 
-        query: str, 
+        self,
+        data: Any,
+        query: str,
         format_type: FormatType = "auto",
         context: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """
         Format API response intelligently based on data structure and query context.
-        
+
         Args:
             data: The API response data
             query: Original user query
             format_type: Desired format ("auto" lets LLM decide)
             context: Optional context about the data (e.g., field names, data types)
-        
+                     Can include schema with formatting_hints for resource-specific formatting
+
         Returns:
             Dict with:
                 - format: chosen format type
@@ -149,12 +155,32 @@ class ResponseFormatter:
             return self._format_concise(format_data, query, data_analysis)
     
     def _is_simple_data(self, data: Any) -> bool:
-        """Check if data is simple enough to not need special formatting."""
-        if isinstance(data, (str, int, float, bool)):
+        """
+        Return True only for trivial data that does not need AI formatting.
+        Any list of records (dicts) or nested structure is not simple — we use
+        the formatter so the user gets an understandable summary, not raw JSON.
+        """
+        if isinstance(data, (str, int, float, bool)) or data is None:
             return True
-        if isinstance(data, dict) and len(data) <= 3:
-            return True
-        if isinstance(data, list) and len(data) <= 2:
+        if isinstance(data, list):
+            if len(data) == 0:
+                return True
+            # List of any dicts → never simple; always format via AI
+            if any(isinstance(x, dict) for x in data):
+                return False
+            # List of primitives only, small length → simple
+            if all(isinstance(x, (str, int, float, bool, type(None))) for x in data):
+                return len(data) <= constants.SIMPLE_LIST_MAX_PRIMITIVE_ITEMS
+            return False
+        if isinstance(data, dict):
+            # Only flat key-value with primitive values is simple
+            if len(data) > constants.SIMPLE_DICT_MAX_KEYS:
+                return False
+            for v in data.values():
+                if isinstance(v, (dict, list)):
+                    return False
+                if not isinstance(v, (str, int, float, bool, type(None))):
+                    return False
             return True
         return False
     
@@ -280,13 +306,14 @@ class ResponseFormatter:
         Decide the best format for the data.
         
         Strategy:
-        - First, apply lightweight heuristics using analysis/context
-        - If still ambiguous, fall back to LLM-based choice
+        - Apply heuristics using analysis/context when they clearly apply.
+        - When heuristics don't pick a format, ask the LLM to choose.
+        - Raises on LLM failure or invalid format response (caller can surface to user).
         """
         context = context or {}
 
         # ------------------------------------------------------------------
-        # Heuristic layer (fast, no LLM)
+        # Heuristic layer (no LLM)
         # ------------------------------------------------------------------
         question_type = context.get("question_type")
         display_mode = context.get("display_mode")
@@ -294,45 +321,36 @@ class ResponseFormatter:
         count = analysis.get("count", 0)
         has_fields = bool(analysis.get("fields"))
 
-        # Count-style questions are handled upstream; default to concise here
         if question_type == "count":
             return "concise"
 
-        # Very small lists: concise/bullet-style text is usually better
         if is_list and 1 <= count <= 5:
             if display_mode == "detailed":
                 return "detailed"
-            # small set → concise summary (prompt will guide bullets)
             return "concise"
 
-        # Larger structured lists: tables tend to work well
         if is_list and count > 5 and has_fields:
             if question_type in (None, "list"):
                 return "table"
 
-        # Fallback: let LLM choose
-        prompt = f"""Given this data structure and user query, determine the best format:
+        # Heuristics didn't pick a format: ask LLM to choose (raises on failure or invalid response)
+        prompt = f"""Given the data structure and user query below, choose the best presentation format.
 
 Query: "{query}"
 
-Data Analysis:
-- Type: {analysis['type']}
-- Count: {analysis['count']} items
-- Has categories: {analysis['has_categories']}
-- Has numbers: {analysis['has_numbers']}
-- Fields: {', '.join(analysis['fields'][:constants.ANALYSIS_FIELDS_MAX])}
+Data: type={analysis['type']}, count={analysis['count']} items, has_categories={analysis['has_categories']}, has_numbers={analysis['has_numbers']}. Fields: {', '.join(analysis['fields'][:constants.ANALYSIS_FIELDS_MAX])}
 
-Sample data:
+Sample:
 {json.dumps(data[:constants.LLM_DATA_SAMPLE_SMALL] if isinstance(data, list) else data, indent=2)[:constants.LLM_DATA_PREVIEW_500]}
 
-Choose ONE format:
-- "concise": Brief text summary (good for simple queries, confirmations)
-- "table": Markdown table (good for structured data, comparisons, lists)
-- "grouped": Grouped by category (good for inventory, categorized items)
-- "chart": Chart-ready JSON (good for numeric trends, statistics)
-- "detailed": Detailed breakdown (good for complex single items)
+Choose ONE format that best fits the data and what the user asked for:
+- concise: Brief text summary
+- table: Markdown table (structured lists, comparisons)
+- grouped: Grouped by category
+- chart: Chart-ready JSON (numeric trends, statistics)
+- detailed: Detailed breakdown (complex or single items)
 
-Respond with ONLY the format name (lowercase).
+Respond with only the format name, lowercase.
 """
         
         try:
@@ -349,23 +367,30 @@ Respond with ONLY the format name (lowercase).
             if format_choice in valid_formats:
                 logger.info(f"LLM selected format: {format_choice}")
                 return format_choice
-            else:
-                logger.warning(f"Invalid format from LLM: {format_choice}, defaulting to concise")
-                return "concise"
+            raise ValueError(
+                f"Format selection failed: LLM returned invalid format {format_choice!r} "
+                f"(expected one of {valid_formats}). Response was: {content[:100]!r}"
+            )
                 
         except Exception as e:
             logger.error("Error determining format: %s", e)
             raise
     
     def _format_simple(self, data: Any, query: str) -> Dict[str, Any]:
-        """Format simple data as plain text."""
+        """Format trivial data as short plain text. Only used for primitives, empty list, or tiny flat dict/list of primitives."""
         if isinstance(data, (str, int, float, bool)):
             summary = str(data)
+        elif data is None:
+            summary = ""
+        elif isinstance(data, list):
+            if len(data) == 0:
+                summary = constants.FORMAT_NO_DATA_RETURNED
+            else:
+                summary = ", ".join(str(x) for x in data)
         elif isinstance(data, dict):
             summary = json.dumps(data, indent=2)
         else:
             summary = str(data)
-        
         return {
             "format": "text",
             "summary": summary,
@@ -379,27 +404,31 @@ Respond with ONLY the format name (lowercase).
         is_small_list = isinstance(data, list) and 1 <= len(data) <= 5
 
         hint_section = ""
+        # Pass the exact count so the summary is accurate
+        n = len(data) if isinstance(data, list) else 0
+        if n > 0:
+            hint_section += f"\nTotal count: {n} item(s). Include this exact count in your summary (e.g. 'Found {n} items: ...'). Use wording that matches the user's query.\n"
         if display_field:
-            hint_section = f"\nWhen listing items, use the '{display_field}' field as the primary item name.\n"
-
+            hint_section += f"\nWhen listing items, prefer the '{display_field}' field from the data as the primary identifier.\n"
         if is_small_list:
-            # Encourage the model to produce a short bullet list for small result sets
-            hint_section += "\nFormat the answer as a short bullet list, one bullet per item, optionally preceded by a one-line summary.\n"
-
-        # For medium-size lists, encourage including many concrete items, not just a count
+            hint_section += "\nUse a short bullet list (one bullet per item), optionally with a one-line summary first.\n"
         if isinstance(data, list) and constants.MIN_LIST_LENGTH_MEDIUM_SAMPLE <= len(data) <= constants.LLM_DATA_SAMPLE_MEDIUM:
-            hint_section += "\nThe user prefers less aggressive summarisation: include as many concrete item names or identifiers as reasonably possible instead of only saying 'Found N items'.\n"
+            hint_section += "\nInclude as many concrete item names or identifiers from the data as reasonably possible, not only the count.\n"
 
-        prompt = f"""Summarize this API response for the user in a small number of short sentences or bullets (typically 2-5), not a single ultra-brief line.
+        prompt = f"""Summarize this API response for the user in a small number of short sentences or bullets (typically 2-5).
 
-User Query: "{query}"
+Rules:
+- Base your summary only on the data and query below. Do not add or assume information not present in the data.
+- Use the exact count given for the total number of items. Keep wording generic (e.g. "items" or terms that match what the user asked for).
+- Where the data contains names or identifiers, you may list representative examples; do not invent examples.
+
+User query: "{query}"
 
 Data: {json.dumps(data[:constants.LLM_DATA_SAMPLE_MEDIUM] if isinstance(data, list) else data, indent=2)[:constants.LLM_DATA_PREVIEW_1000]}
 
 {hint_section}
 
-Provide a helpful, concise summary focused on what the user asked for.
-Include key numbers/counts and, where meaningful, list representative item names.
+Provide a concise, accurate summary that answers what the user asked and reflects only the data above.
 """
         
         try:
@@ -578,17 +607,18 @@ Include key numbers/counts and, where meaningful, list representative item names
     
     def _format_detailed(self, data: Any, query: str, analysis: Dict[str, Any]) -> Dict[str, Any]:
         """Provide detailed breakdown of data."""
-        prompt = f"""Provide a detailed, well-structured breakdown of this API response.
+        prompt = f"""Provide a detailed, well-structured breakdown of this API response that answers what the user asked.
 
-User Query: "{query}"
+Rules:
+- Base your breakdown only on the data below. Do not add facts, numbers, or details that are not present in the data.
+- Use generic wording (e.g. "items", "records") unless the query or data clearly indicates a specific type.
+- Organize with key findings and important details from the data. Use markdown (headers, lists, bold) where it helps.
+
+User query: "{query}"
 
 Data: {json.dumps(data, indent=2)[:constants.LLM_DATA_PREVIEW_2000]}
 
-Create a clear, detailed summary with:
-- Key findings/highlights
-- Important details
-- Organized in sections if appropriate
-- Use markdown formatting (headers, lists, bold)
+Summarize accurately from the data above only.
 """
         
         try:
@@ -615,18 +645,149 @@ Create a clear, detailed summary with:
     def _select_important_fields(self, item: Dict, query: str) -> List[str]:
         """Select most important fields for display based on query."""
         fields = list(item.keys())
-        
+
         # Prioritize common important fields (configurable)
         priority_fields = self._get_priority_fields()
-        
+
         # Put priority fields first
         sorted_fields = []
         for pf in priority_fields:
             if pf in fields:
                 sorted_fields.append(pf)
                 fields.remove(pf)
-        
+
         # Add remaining fields
         sorted_fields.extend(fields)
-        
+
         return sorted_fields
+
+    def _get_formatting_hints(self, context: Optional[Dict[str, Any]], resource: str) -> Optional[Dict[str, Any]]:
+        """
+        Extract formatting hints from schema for a specific resource (v0.3.32).
+
+        Args:
+            context: Context dict containing schema
+            resource: Resource name (e.g., 'service_orders')
+
+        Returns:
+            Formatting hints dict or None
+        """
+        if not context:
+            return None
+
+        schema = context.get("schema", {})
+        formatting_hints = schema.get("formatting_hints", {})
+
+        return formatting_hints.get(resource)
+
+    def _format_with_hints(
+        self,
+        data: List[Dict],
+        hints: Dict[str, Any],
+        resource: str
+    ) -> str:
+        """
+        Format data using schema-provided formatting hints (v0.3.32).
+
+        This enables resource-specific formatting like tables with links,
+        status indicators, etc.
+
+        Args:
+            data: List of items to format
+            hints: Formatting hints from schema
+            resource: Resource name
+
+        Returns:
+            Formatted markdown string
+        """
+        list_format = hints.get("list_format", "table")
+        columns = hints.get("columns", [])
+        column_labels = hints.get("column_labels", columns)
+        link_patterns = hints.get("link_patterns", {})
+        status_indicators = hints.get("status_indicators", {})
+
+        if list_format == "table" and columns:
+            return self._format_table_with_hints(data, columns, column_labels, link_patterns)
+        elif list_format == "detailed":
+            return self._format_detailed_with_hints(data, hints)
+        else:
+            # Fall back to default formatting
+            return None
+
+    def _format_table_with_hints(
+        self,
+        data: List[Dict],
+        columns: List[str],
+        column_labels: List[str],
+        link_patterns: Dict[str, str]
+    ) -> str:
+        """Format data as markdown table with links using hints."""
+        lines = []
+
+        # Header
+        lines.append("| " + " | ".join(column_labels) + " |")
+        lines.append("| " + " | ".join(["---"] * len(column_labels)) + " |")
+
+        # Rows
+        for item in data[:20]:  # Limit to 20 rows
+            row_values = []
+            for col in columns:
+                value = self._extract_nested_value(item, col)
+
+                # Apply link pattern if exists for this column
+                base_col = col.split(".")[0]
+                if base_col in link_patterns:
+                    pattern = link_patterns[base_col]
+                    try:
+                        link = pattern.format(**item, **{base_col: value})
+                        value = f"[{value}]({link})"
+                    except (KeyError, ValueError):
+                        pass
+
+                row_values.append(str(value)[:50] if value else "-")
+
+            lines.append("| " + " | ".join(row_values) + " |")
+
+        if len(data) > 20:
+            lines.append(f"\n*...and {len(data) - 20} more items*")
+
+        return "\n".join(lines)
+
+    def _format_detailed_with_hints(self, data: List[Dict], hints: Dict[str, Any]) -> str:
+        """Format data in detailed view with specific fields."""
+        include_fields = hints.get("include_fields", [])
+        observations_format = hints.get("observations_format", "default")
+
+        lines = []
+        for item in data[:5]:  # Limit to 5 items for detailed view
+            for field in include_fields:
+                value = self._extract_nested_value(item, field)
+
+                if field == "observations" and observations_format == "bullet_list_with_status":
+                    lines.append(f"\n**Observations:**\n")
+                    if isinstance(value, list):
+                        for obs in value:
+                            area = obs.get("area", "Unknown")
+                            result = obs.get("result", "")
+                            notes = obs.get("notes", "")
+                            status = "✅" if result.lower() in ["pass", "acceptable", "ok"] else "⚠️"
+                            lines.append(f"{status} **{area}** - {result}")
+                            if notes:
+                                lines.append(f"   {notes}")
+                else:
+                    lines.append(f"**{field.replace('_', ' ').title()}:** {value}")
+
+            lines.append("")  # Blank line between items
+
+        return "\n".join(lines)
+
+    def _extract_nested_value(self, item: Dict, path: str) -> Any:
+        """Extract value from nested dict using dot notation (e.g., 'company.name')."""
+        keys = path.split(".")
+        value = item
+        for key in keys:
+            if isinstance(value, dict) and key in value:
+                value = value[key]
+            else:
+                return None
+        return value

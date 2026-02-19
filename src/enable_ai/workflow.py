@@ -35,7 +35,8 @@ def _analyze_pagination(data: Any) -> Dict[str, Any]:
         'total_count': 0,
         'actual_count': 0,
         'has_more': False,
-        'is_paginated': False
+        'is_paginated': False,
+        'next_url': None,
     }
     
     # Check for paginated response (Django REST framework style)
@@ -45,6 +46,8 @@ def _analyze_pagination(data: Any) -> Dict[str, Any]:
         results = data.get('results', [])
         info['actual_count'] = len(results)
         info['has_more'] = data.get('next') is not None
+        if data.get('next'):
+            info['next_url'] = data.get('next')
     # Simple list
     elif isinstance(data, list):
         info['actual_count'] = len(data)
@@ -232,15 +235,16 @@ def _resolve_step_dependencies(
 
 class APIQueryState(TypedDict, total=False):
     """
-    State for LangGraph API workflow (v0.3.13: cleaned up unused fields).
-    
+    State for LangGraph API workflow (v0.3.29: added user_context for pronoun resolution).
+
     Input fields:
         query: User's natural language query
         session_id: Session identifier for conversation context
         access_token: JWT token for API authentication
         runtime_schema: Optional schema override for this query
         conversation_history: Previous messages (loaded externally, passed through)
-    
+        user_context: User identity for resolving "me"/"my" pronouns (v0.3.29)
+
     Processing fields:
         active_schema: Schema being used for this query
         parsed: Parsed query (intent, resource, filters)
@@ -248,15 +252,15 @@ class APIQueryState(TypedDict, total=False):
         current_step: Current step index in plan
         step_results: Results from executed steps
         result: Final execution result
-    
+
     Output fields:
         summary: Human-readable summary
         response: Complete response dict
         error: Error message if any
-    
+
     Progress tracking:
         progress_tracker: ProgressTracker instance (not serialized in checkpoints)
-    
+
     Note: Removed in v0.3.13:
         - context: Unused
         - plan: Legacy field, replaced by execution_plan
@@ -267,7 +271,8 @@ class APIQueryState(TypedDict, total=False):
     access_token: Optional[str]
     runtime_schema: Optional[dict]
     conversation_history: Optional[list]
-    
+    user_context: Optional[dict]  # v0.3.29: {user_id, username, role, company_id, company}
+
     # Processing
     active_schema: dict
     parsed: dict
@@ -275,12 +280,12 @@ class APIQueryState(TypedDict, total=False):
     current_step: int
     step_results: List[dict]
     result: dict
-    
+
     # Output
     summary: str
     response: dict
     error: Optional[str]
-    
+
     # Progress (not serialized)
     progress_tracker: Any
 
@@ -303,6 +308,7 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
     formatter = ResponseFormatter(config=formatter_config)
 
     def load_schema(state: APIQueryState) -> Dict[str, Any]:
+        """Node duty: Resolve and validate active schema only. No parsing or execution."""
         active_schema = processor._get_active_schema(state.get("runtime_schema"))
         if not active_schema:
             error_msg = constants.ERROR_NO_SCHEMA
@@ -336,10 +342,11 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
         return {"active_schema": active_schema}
 
     def parse_query(state: APIQueryState) -> Dict[str, Any]:
+        """Node duty: Intent analysis and query parsing only. Output: structured parsed (intent, resource, filters, etc.). No planning or execution."""
         # Progress update (v0.3.10)
         tracker = state.get("progress_tracker")
         if tracker:
-            tracker.update(ProgressStage.PARSING_QUERY, "Understanding your question...")
+            tracker.update(ProgressStage.PARSING_QUERY, constants.PROGRESS_PARSING_QUERY)
         
         try:
             parsed = processor._understand_query(
@@ -347,6 +354,7 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
                 state["active_schema"],
                 state.get("context"),
                 state.get("conversation_history", []),
+                state.get("user_context"),  # v0.3.29: pass user context for pronoun resolution
             )
         except Exception as e:
             logger.exception("Query parsing (LLM) failed: %s", e)
@@ -401,11 +409,7 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
         return {"parsed": parsed}
 
     def create_execution_plan(state: APIQueryState) -> Dict[str, Any]:
-        """
-        Create multi-step execution plan with dependency resolution.
-        Enhanced in v0.3.9 to handle filter merging when merge_with_previous=true.
-        Enhanced in v0.3.12 to better handle filter merging and preserve all previous context.
-        """
+        """Node duty: Turn parsed query into an execution plan (steps). Merges previous filters when merge_with_previous; does not parse or execute."""
         # Progress update (v0.3.10)
         tracker = state.get("progress_tracker")
         if tracker:
@@ -500,8 +504,12 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
             total_steps = len(execution_plan.get("steps", []))
             if tracker:
                 tracker.update(
+                    ProgressStage.API_MATCHED,
+                    constants.PROGRESS_API_MATCHED.format(api_name="request"),
+                )
+                tracker.update(
                     ProgressStage.PLAN_READY,
-                    f"Plan ready: {total_steps} step(s)" if total_steps else "Plan ready",
+                    constants.PROGRESS_PLAN_READY.format(step_count=total_steps),
                     step_count=total_steps,
                 )
             return {
@@ -515,10 +523,7 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
             return {"error": str(e)}
     
     def execute_next_step(state: APIQueryState) -> Dict[str, Any]:
-        """
-        Execute the next step in the execution plan.
-        Handles context passing from previous steps.
-        """
+        """Node duty: Execute one step (API call or fetch_next_page). No parsing, planning, or summarization."""
         tracker = state.get("progress_tracker")
         execution_plan = state.get("execution_plan", {})
         steps = execution_plan.get("steps", [])
@@ -530,6 +535,42 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
             return {"current_step": current_step_idx}
         
         current_step_def = steps[current_step_idx]
+        
+        # "Show me more" / fetch next page: use stored next_url instead of building API plan
+        if current_step_def.get("type") == "fetch_next_page":
+            url = current_step_def.get("url")
+            if not url:
+                step_results.append({
+                    "step_id": current_step_def.get("step_id"),
+                    "step_description": current_step_def.get("description"),
+                    "result": None,
+                    "status": "failed",
+                    "error": "No next page URL available",
+                })
+                return {
+                    "current_step": current_step_idx + 1,
+                    "step_results": step_results,
+                    "result": {"data": None, "error": "No next page URL available"},
+                    "error": "No next page URL available",
+                }
+            page_result = processor._fetch_next_page(url, state["active_schema"], state.get("access_token"))
+            data = page_result.get("data") if not page_result.get("error") else None
+            err = page_result.get("error")
+            step_result = {
+                "step_id": current_step_def.get("step_id"),
+                "step_description": current_step_def.get("description"),
+                "result": data,
+                "status": "success" if not err else "failed",
+                "error": err,
+            }
+            step_results.append(step_result)
+            if tracker:
+                tracker.update(ProgressStage.API_COMPLETED, "Next page fetched", endpoint="next page")
+            return {
+                "current_step": current_step_idx + 1,
+                "step_results": step_results,
+                "result": {"data": data, "error": err},
+            }
         
         # Resolve dependencies - substitute variables from previous steps (uses planner's extract when present)
         resolved_step = _resolve_step_dependencies(current_step_def, step_results, all_steps=steps)
@@ -648,6 +689,7 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
         return {"result": result}
 
     def format_missing_info(state: APIQueryState) -> Dict[str, Any]:
+        """Node duty: Return a structured response when required info is missing. No execution."""
         plan = state.get("plan", {})
         return {
             "response": {
@@ -661,13 +703,39 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
         }
 
     def format_error(state: APIQueryState) -> Dict[str, Any]:
-        """
-        Format error response with consistent structure (Issue #4 fix).
-        
-        All responses should have the same fields for consistent error handling.
-        """
+        """Node duty: Format error response with consistent structure. No parsing, execution, or summarization."""
         plan_error = state.get("plan", {}).get("error")
         error = plan_error or state.get("error") or constants.ERROR_UNKNOWN
+
+        # v0.3.29: Check if this is an unknown intent / no matching resource error
+        # If so, return helpful suggestions instead of a raw error
+        is_unknown_intent = (
+            "No matching API" in str(error) or
+            "could not be parsed" in str(error).lower() or
+            "unknown" in str(error).lower() or
+            "not found" in str(error).lower()
+        )
+
+        if is_unknown_intent:
+            # Return helpful response with suggestions
+            return {
+                "response": {
+                    "success": False,
+                    "data": None,
+                    "summary": constants.UNKNOWN_INTENT_FULL,
+                    "error": error,
+                    "query": state.get("query"),
+                    "total_steps": 0,
+                    "schema_type": state.get("active_schema", {}).get("type") if state.get("active_schema") else "unknown",
+                    "suggested_actions": [
+                        "Try rephrasing your question",
+                        "Ask about service orders, reports, inventory, or technicians",
+                        "Use specific resource names like 'service orders' or 'consumables'"
+                    ],
+                    "is_unknown_intent": True,
+                }
+            }
+
         return {
             "response": {
                 "success": False,
@@ -681,17 +749,11 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
         }
 
     def summarize(state: APIQueryState) -> Dict[str, Any]:
-        """
-        Summarize results from all executed steps.
-        v0.3.7: Respects display_mode from parsed query.
-        v0.3.10: Progress tracking for completion.
-        v0.3.11: Enhanced count handling, pagination detection, and contextual help (Issues #2-7 fix).
-        v0.3.12: Count-specific formatting when question_type="count".
-        """
+        """Node duty: Format and summarize execution results only (count handling, pagination info, LLM summary). No parsing, planning, or execution."""
         # Progress update (v0.3.10)
         tracker = state.get("progress_tracker")
         if tracker:
-            tracker.update(ProgressStage.SUMMARIZING, "Preparing your results...")
+            tracker.update(ProgressStage.SUMMARIZING, constants.PROGRESS_SUMMARIZING)
         
         execution_plan = state.get("execution_plan", {})
         step_results = state.get("step_results", [])
@@ -786,27 +848,28 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
             # v0.3.11: Enhanced handling with accurate counts and pagination (Issues #2-7)
             # v0.3.12: Count-specific formatting
             data = result.get("data", {})
-            # Automatic pagination: when response has has_more/next, fetch next page(s) and merge.
-            # Safety cap only to avoid infinite loop on buggy APIs; see todo.md § Limits affecting correctness.
+            # Automatic pagination: only when display_mode is "full" do we fetch all pages.
+            # When display_mode is "summary" or "detailed", return first page so user can say "show me more" for next page.
             pages_fetched = 1
-            while isinstance(data, dict) and data.get("next") and pages_fetched < constants.SAFETY_MAX_PAGES:
-                next_url = data.get("next")
-                page_result = processor._fetch_next_page(next_url, state["active_schema"], state.get("access_token"))
-                if page_result.get("error"):
-                    logger.warning("Automatic pagination stopped: %s", page_result.get("error"))
-                    break
-                next_data = page_result.get("data")
-                if not next_data or not isinstance(next_data, dict):
-                    break
-                if "results" in data and "results" in next_data and isinstance(data["results"], list) and isinstance(next_data.get("results"), list):
-                    data["results"].extend(next_data["results"])
-                data["next"] = next_data.get("next")
-                data["count"] = next_data.get("count", data.get("count", 0))
-                pages_fetched += 1
-                if tracker:
-                    tracker.update(ProgressStage.EXECUTING_API, constants.PROGRESS_FETCHING_PAGE.format(page=pages_fetched))
-            if pages_fetched >= constants.SAFETY_MAX_PAGES and isinstance(data, dict) and data.get("next"):
-                logger.warning(constants.PAGINATION_SAFETY_CAP_WARNING.format(max_pages=constants.SAFETY_MAX_PAGES))
+            if display_mode == "full":
+                while isinstance(data, dict) and data.get("next") and pages_fetched < constants.SAFETY_MAX_PAGES:
+                    next_url = data.get("next")
+                    page_result = processor._fetch_next_page(next_url, state["active_schema"], state.get("access_token"))
+                    if page_result.get("error"):
+                        logger.warning("Automatic pagination stopped: %s", page_result.get("error"))
+                        break
+                    next_data = page_result.get("data")
+                    if not next_data or not isinstance(next_data, dict):
+                        break
+                    if "results" in data and "results" in next_data and isinstance(data["results"], list) and isinstance(next_data.get("results"), list):
+                        data["results"].extend(next_data["results"])
+                    data["next"] = next_data.get("next")
+                    data["count"] = next_data.get("count", data.get("count", 0))
+                    pages_fetched += 1
+                    if tracker:
+                        tracker.update(ProgressStage.EXECUTING_API, constants.PROGRESS_FETCHING_PAGE.format(page=pages_fetched))
+                if pages_fetched >= constants.SAFETY_MAX_PAGES and isinstance(data, dict) and data.get("next"):
+                    logger.warning(constants.PAGINATION_SAFETY_CAP_WARNING.format(max_pages=constants.SAFETY_MAX_PAGES))
             # Analyze response to extract accurate counts (Issue #2-4)
             pagination_info = _analyze_pagination(data)
             
