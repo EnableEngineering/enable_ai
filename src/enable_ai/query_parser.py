@@ -205,6 +205,19 @@ Your task: Understand the user's intent and extract structured information so th
   - "customers in my company" → filter by company={company_id}
 - Always use the actual user_id/company_id values, never leave "me" or "my" as string values in filters.
 
+**CRITICAL: NO HARDCODED DATA - ANTI-HALLUCINATION RULES**
+- NEVER generate example data, user lists, or sample responses
+- NEVER return specific IDs, names, or values that are NOT explicitly mentioned in the user's query
+- ONLY extract: intent, resource, filters, sort, limit from what the user ACTUALLY said
+- If user asks for "orders" without specifying which ones, return EMPTY filters - do NOT guess IDs
+- If user says "my orders" but no USER_CONTEXT is provided, set question_type="needs_clarification"
+- Filter values MUST come from ONE of these sources:
+  1. The user's explicit query text
+  2. USER_CONTEXT (for "me"/"my" pronouns)
+  3. Conversation history via get_query_context() (for "those"/"them" references)
+- NEVER invent example values like "ABC", "123", "John", or sample names
+- If you cannot trace a filter value to the sources above, OMIT it entirely
+
 EXTRACT THE FOLLOWING:
 
 1. **intent** (required) - CRUD operation:
@@ -687,6 +700,64 @@ Return the parsed JSON now:
         if 'filters' not in parsed:
             parsed['filters'] = {}
 
+        # BUG FIX (v0.3.36): Validate filter fields exist in schema
+        # This prevents hallucinating filter results when a field doesn't exist
+        if resource_found and parsed.get('filters') and schema_type == 'api':
+            resource_name = parsed.get('resource')
+            resource_schema = schema.get('resources', {}).get(resource_name, {})
+
+            # Extract valid query parameters from GET endpoints
+            valid_params = set()
+            for endpoint in resource_schema.get('endpoints', []):
+                if endpoint.get('method', '').upper() == 'GET':
+                    params = endpoint.get('parameters', {})
+                    query_params = params.get('query', []) if isinstance(params, dict) else []
+                    for param in query_params:
+                        if isinstance(param, dict):
+                            param_name = param.get('name', '')
+                            if param_name:
+                                valid_params.add(param_name)
+                                # Also add base name without Django lookups
+                                base_name = param_name.split('__')[0]
+                                valid_params.add(base_name)
+                        elif isinstance(param, str):
+                            valid_params.add(param)
+                            valid_params.add(param.split('__')[0])
+
+            # Also add fields from resource_hints
+            resource_hints = schema.get('resource_hints', {}).get(resource_name, {})
+            if isinstance(resource_hints, dict):
+                for field_name in resource_hints.keys():
+                    if not field_name.startswith('__'):
+                        valid_params.add(field_name)
+
+            # Warn and remove invalid filter fields
+            invalid_filters = []
+            for filter_field in list(parsed['filters'].keys()):
+                base_field = filter_field.split('__')[0]
+                if filter_field not in valid_params and base_field not in valid_params:
+                    # Check if it's a common field that might be aliased
+                    # e.g., 'technician' -> 'technician__id' or 'assigned_to'
+                    is_valid = False
+                    for vp in valid_params:
+                        if base_field in vp or vp.startswith(base_field + '__'):
+                            is_valid = True
+                            break
+
+                    if not is_valid:
+                        invalid_filters.append(filter_field)
+                        self.logger.warning(
+                            f"Filter field '{filter_field}' not found in schema for {resource_name}. "
+                            f"Valid params: {sorted(valid_params)[:10]}... Removing to prevent hallucination."
+                        )
+                        del parsed['filters'][filter_field]
+                        # Also remove from entities
+                        if filter_field in parsed.get('entities', {}):
+                            del parsed['entities'][filter_field]
+
+            if invalid_filters:
+                parsed['_removed_invalid_filters'] = invalid_filters
+
         # Convert entities to filters if filters are empty
         if parsed['entities'] and not parsed['filters']:
             for key, value in parsed['entities'].items():
@@ -695,7 +766,79 @@ Return the parsed JSON now:
                     'value': value
                 }
 
+        # Anti-hardcoding check: warn and optionally remove suspicious values
+        original_input = parsed.get('original_input', '').lower()
+        entities_to_check = list(parsed.get('entities', {}).items())
+
+        for field, value in entities_to_check:
+            if self._looks_like_hardcoded(value, original_input):
+                self.logger.warning(
+                    f"Potentially hardcoded value detected: {field}={value}. "
+                    f"Value not found in original input. Removing suspicious entity."
+                )
+                # Remove suspicious values to prevent hallucination
+                del parsed['entities'][field]
+                # Also remove from filters if present
+                if field in parsed.get('filters', {}):
+                    del parsed['filters'][field]
+
         return parsed
+
+    def _looks_like_hardcoded(self, value: Any, original_input: str) -> bool:
+        """
+        Check if a value appears to be hardcoded (not from user input).
+
+        This helps detect LLM hallucinations where it invents example data.
+
+        Args:
+            value: The value to check
+            original_input: The original user query (lowercase)
+
+        Returns:
+            True if value appears to be hardcoded/hallucinated
+        """
+        if value is None:
+            return False
+
+        value_str = str(value).lower()
+
+        # Check if value appears in original input
+        if value_str in original_input:
+            return False
+
+        # Allow common defaults and boolean values
+        allowed_defaults = {
+            'true', 'false', 'null', 'none', 'yes', 'no',
+            'asc', 'desc', 'ascending', 'descending',
+            'active', 'inactive', 'enabled', 'disabled',
+        }
+        if value_str in allowed_defaults:
+            return False
+
+        # Allow small integers (often legitimate IDs from context)
+        if isinstance(value, int) and value < 10:
+            return False
+
+        # Allow values that are just digits (might be parsed from input)
+        if value_str.isdigit():
+            return False
+
+        # Suspicious: specific string names that don't appear in input
+        if isinstance(value, str) and len(value) > 2:
+            # Check for common example/placeholder patterns
+            suspicious_patterns = [
+                'example', 'sample', 'test', 'demo', 'john', 'jane',
+                'abc', 'xyz', 'foo', 'bar', 'acme', 'widget',
+            ]
+            for pattern in suspicious_patterns:
+                if pattern in value_str:
+                    return True
+
+            # If it's a name-like string (capitalized) not in input, suspicious
+            if value[0].isupper() and value_str not in original_input:
+                return True
+
+        return False
     
     # ========================================================================
     # FUNCTION CALLING FOR CONTEXT (v0.3.6)

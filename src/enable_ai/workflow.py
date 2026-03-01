@@ -6,13 +6,200 @@ from langgraph.graph import StateGraph, END
 
 from .types import APIError
 from .execution_planner import ExecutionPlanner
+from .intent_classifier import IntentClassifier
 from .utils import setup_logger, get_openai_client, CREATIVE_TEMP
 from .progress_tracker import ProgressStage
 from .response_formatter import ResponseFormatter
+from .tracing import QueryTracer, get_tracer_store, create_tracer
 from . import constants
 
 # Module-level logger
 logger = setup_logger('enable_ai.workflow')
+
+# Global tracer store
+_tracer_store = get_tracer_store()
+
+
+def _is_follow_up_query(query: str) -> bool:
+    """
+    Detect if this is a follow-up query referring to previous results (v0.3.37).
+
+    Examples:
+        - "show me next 2" -> True
+        - "show me first 3" -> True
+        - "which are those?" -> True
+        - "list all users" -> False
+
+    Args:
+        query: User's query string
+
+    Returns:
+        True if query appears to be a follow-up
+    """
+    query_lower = query.lower().strip()
+
+    # Patterns that indicate follow-up
+    follow_up_patterns = [
+        'next', 'more', 'previous', 'first', 'last',
+        'show me more', 'show more', 'continue',
+        'which are those', 'what are those', 'which ones',
+        'show them', 'list them', 'the same',
+        'of them', 'of those', 'from those',
+        'next page', 'previous page',
+    ]
+
+    for pattern in follow_up_patterns:
+        if pattern in query_lower:
+            return True
+
+    # Check for "next N" or "first N" patterns
+    if re.search(r'\b(next|first|last|show me)\s+\d+\b', query_lower):
+        return True
+
+    return False
+
+
+def _extract_last_result_metadata(conversation_history: list) -> dict:
+    """
+    Extract last_result_metadata from conversation history (v0.3.38).
+
+    The orchestrator stores metadata in assistant message metadata including:
+    - resource: The resource type that was queried
+    - intent: The operation type (read, etc.)
+    - filters: Filters that were applied
+    - next_url: URL for next page if paginated
+
+    Args:
+        conversation_history: List of conversation messages
+
+    Returns:
+        Dict with last result metadata or empty dict if not found
+    """
+    if not conversation_history:
+        return {}
+
+    # Look for the most recent assistant message with metadata
+    for msg in reversed(conversation_history):
+        if msg.get('role') == 'assistant':
+            metadata = msg.get('metadata', {})
+            if metadata and (metadata.get('resource') or metadata.get('next_url')):
+                return {
+                    'resource': metadata.get('resource'),
+                    'intent': metadata.get('intent'),
+                    'filters': metadata.get('filters', {}),
+                    'next_url': metadata.get('next_url'),
+                    'count': metadata.get('count'),
+                    'has_more': metadata.get('has_more', False),
+                }
+
+    return {}
+
+
+def _get_follow_up_type(query: str) -> str:
+    """
+    Determine the type of follow-up query (v0.3.38).
+
+    Returns:
+        - "next_page": User wants next page of results
+        - "first_n": User wants first N items
+        - "last_n": User wants last N items
+        - "reference": User is referring to previous results generically
+        - "unknown": Can't determine follow-up type
+    """
+    query_lower = query.lower().strip()
+
+    # Check for "next" patterns (pagination)
+    if any(p in query_lower for p in ['next page', 'next', 'more', 'continue', 'show more']):
+        return "next_page"
+
+    # Check for "first N" patterns
+    if re.search(r'\b(first|show me first|the first)\s*\d*\b', query_lower):
+        return "first_n"
+
+    # Check for "last N" patterns
+    if re.search(r'\b(last|show me last|the last)\s*\d*\b', query_lower):
+        return "last_n"
+
+    # Generic reference to previous results
+    if any(p in query_lower for p in ['those', 'them', 'these', 'the same']):
+        return "reference"
+
+    return "unknown"
+
+
+def _extract_limit_from_query(query: str) -> int:
+    """
+    Extract numeric limit from follow-up queries like "next 2" or "show me first 5".
+
+    Args:
+        query: User's query string
+
+    Returns:
+        Extracted limit or default (10)
+    """
+    import re
+    query_lower = query.lower()
+
+    # Match patterns like "next 2", "first 5", "show me 10"
+    patterns = [
+        r'\b(?:next|first|last|show me|show)\s+(\d+)\b',
+        r'\b(\d+)\s+(?:more|results|items)\b',
+    ]
+
+    for pattern in patterns:
+        match = re.search(pattern, query_lower)
+        if match:
+            return int(match.group(1))
+
+    return 10  # Default limit
+
+
+def _unwrap_json_response(summary: str) -> str:
+    """
+    Fix JSON wrapper issue (v0.3.37).
+
+    Sometimes the LLM returns a JSON wrapper like:
+        {"format": "table", "response": "Here are all 25..."}
+
+    Instead of clean text. This function extracts the actual response.
+
+    Args:
+        summary: Summary text that may contain JSON wrapper
+
+    Returns:
+        Clean text without JSON wrapper
+    """
+    if not isinstance(summary, str):
+        return str(summary) if summary else ""
+
+    summary = summary.strip()
+
+    # Check if it looks like JSON
+    if summary.startswith('{') and summary.endswith('}'):
+        try:
+            parsed = json.loads(summary)
+            if isinstance(parsed, dict):
+                # Extract 'response' field if present
+                if 'response' in parsed:
+                    return str(parsed['response'])
+                # Try other common fields
+                for field in ['summary', 'text', 'content', 'message']:
+                    if field in parsed:
+                        return str(parsed[field])
+        except json.JSONDecodeError:
+            pass
+
+    # Check for partial JSON (starting with { but malformed)
+    if summary.startswith('{"format"') or summary.startswith('{"response"'):
+        # Try to extract the response value using regex
+        match = re.search(r'"response"\s*:\s*"(.*)"', summary, re.DOTALL)
+        if match:
+            # Unescape the string
+            extracted = match.group(1)
+            extracted = extracted.replace('\\"', '"').replace('\\n', '\n')
+            return extracted
+
+    return summary
 
 
 def _analyze_pagination(data: Any) -> Dict[str, Any]:
@@ -235,7 +422,7 @@ def _resolve_step_dependencies(
 
 class APIQueryState(TypedDict, total=False):
     """
-    State for LangGraph API workflow (v0.3.29: added user_context for pronoun resolution).
+    State for LangGraph API workflow (v0.3.37: added tracing and follow-up context).
 
     Input fields:
         query: User's natural language query
@@ -258,8 +445,13 @@ class APIQueryState(TypedDict, total=False):
         response: Complete response dict
         error: Error message if any
 
-    Progress tracking:
+    Progress & debugging:
         progress_tracker: ProgressTracker instance (not serialized in checkpoints)
+        _tracer: QueryTracer instance for debugging (v0.3.37)
+
+    Follow-up context (v0.3.37):
+        last_result_metadata: {resource, count, has_more, next_url, filters}
+        is_follow_up: Whether this query continues a previous one
 
     Note: Removed in v0.3.13:
         - context: Unused
@@ -286,8 +478,14 @@ class APIQueryState(TypedDict, total=False):
     response: dict
     error: Optional[str]
 
-    # Progress (not serialized)
+    # Progress & debugging (not serialized)
     progress_tracker: Any
+    _tracer: Any  # v0.3.37: QueryTracer instance
+
+    # Follow-up context (v0.3.37)
+    last_result_metadata: Optional[dict]
+    is_follow_up: bool
+    filter_warnings: List[str]  # v0.3.37: Warnings about unmatched filters
 
 
 def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[Dict[str, Any]] = None) -> "StateGraph":
@@ -345,9 +543,14 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
         """Node duty: Intent analysis and query parsing only. Output: structured parsed (intent, resource, filters, etc.). No planning or execution."""
         # Progress update (v0.3.10)
         tracker = state.get("progress_tracker")
+        tracer = state.get("_tracer")
         if tracker:
             tracker.update(ProgressStage.PARSING_QUERY, constants.PROGRESS_PARSING_QUERY)
-        
+
+        # v0.3.37: Detect follow-up queries
+        is_follow_up = _is_follow_up_query(state["query"])
+        last_metadata = state.get("last_result_metadata")
+
         try:
             parsed = processor._understand_query(
                 state["query"],
@@ -356,9 +559,21 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
                 state.get("conversation_history", []),
                 state.get("user_context"),  # v0.3.29: pass user context for pronoun resolution
             )
+
+            # v0.3.37: Log to tracer
+            if tracer:
+                tracer.log_stage("parse", {
+                    "intent": parsed.get("intent") if isinstance(parsed, dict) else None,
+                    "resource": parsed.get("resource") if isinstance(parsed, dict) else None,
+                    "filters": parsed.get("filters", {}) if isinstance(parsed, dict) else {},
+                    "is_follow_up": is_follow_up,
+                }, success=not isinstance(parsed, APIError))
+
         except Exception as e:
             logger.exception("Query parsing (LLM) failed: %s", e)
             error_msg = str(e)
+            if tracer:
+                tracer.log_stage("parse", {"error": error_msg}, success=False, error=error_msg)
             if tracker:
                 tracker.update(ProgressStage.ERROR, f"{constants.ERROR_PREFIX}{error_msg}")
             return {
@@ -638,10 +853,16 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
                 f"Step {current_step_idx + 1} completed: {endpoint}",
                 endpoint=endpoint,
             )
+        # v0.3.37: Propagate filter warnings from API result to state
+        api_warnings = result.get("warnings", [])
+        existing_warnings = state.get("filter_warnings", [])
+        all_warnings = existing_warnings + api_warnings
+
         out = {
             "current_step": current_step_idx + 1,
             "step_results": step_results,
-            "result": result  # Last result for compatibility
+            "result": result,  # Last result for compatibility
+            "filter_warnings": all_warnings,  # v0.3.37: Accumulate filter warnings
         }
         # When all steps failed, set error so route_after_step can send to format_error
         if step_result.get("status") == "failed" and (current_step_idx + 1) >= len(steps):
@@ -815,6 +1036,9 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
                 logger.error("ResponseFormatter (multi-step) failed: %s", e)
                 format_error = str(e)
             
+            # v0.3.37: Get filter warnings for multi-step
+            filter_warnings = state.get("filter_warnings", [])
+
             response = {
                 "success": not has_error,
                 "data": all_data if len(all_data) > 1 else (all_data[0] if all_data else None),
@@ -832,14 +1056,20 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
                 "total_steps": len(step_results),
                 "schema_type": state.get("active_schema", {}).get("type"),
             }
-            
+
+            # v0.3.37: Add filter warnings to multi-step response
+            if filter_warnings:
+                response["filter_warnings"] = filter_warnings
+                warning_text = "\n".join(f"⚠️ {w}" for w in filter_warnings)
+                response["summary"] = f"{warning_text}\n\n{summary}"
+
             if formatted is not None:
                 response["formatted"] = formatted
             if fmt_format is not None:
                 response["format"] = fmt_format
             if format_error is not None:
                 response["format_error"] = format_error
-            
+
             if has_error:
                 failed_steps = [sr for sr in step_results if sr.get("status") == "failed"]
                 response["errors"] = [sr.get("error") for sr in failed_steps]
@@ -997,8 +1227,16 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
             format_error = None
             if question_type != "count":
                 try:
+                    # BUG FIX (v0.3.36): Pass the actual results array to formatter, not wrapper
+                    # This ensures LLM sees ALL items and can list them all
+                    if isinstance(final_data, dict) and 'results' in final_data:
+                        # Pass the results array directly, with pagination context
+                        format_data = final_data['results']
+                    else:
+                        format_data = final_data if final_data is not None else data
+
                     fmt = formatter.format_response(
-                        data=final_data if final_data is not None else data,
+                        data=format_data,
                         query=state.get("query", ""),
                         format_type="auto",
                         context={
@@ -1006,16 +1244,24 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
                             "schema": state.get("active_schema", {}),
                             "question_type": question_type,
                             "display_mode": display_mode,
+                            "filters": parsed.get("filters", {}),
                         },
                     )
                     if fmt.get("summary"):
                         summary = fmt["summary"]
+
+                    # v0.3.37: Fix JSON wrapper issue - extract clean text
+                    summary = _unwrap_json_response(summary)
+
                     formatted = fmt.get("formatted")
                     fmt_format = fmt.get("format")
                 except Exception as e:
                     logger.error("ResponseFormatter (single-step) failed: %s", e)
                     format_error = str(e)
-            
+
+            # v0.3.37: Add filter warnings if any
+            filter_warnings = state.get("filter_warnings", [])
+
             response = {
                 "success": not has_error,
                 "data": final_data,
@@ -1027,30 +1273,288 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
                 "total_steps": 1,
                 "schema_type": state.get("active_schema", {}).get("type"),
             }
-            
+
+            # v0.3.37: Add filter warnings to response
+            if filter_warnings:
+                response["filter_warnings"] = filter_warnings
+                # Prepend warning to summary
+                warning_text = "\n".join(f"⚠️ {w}" for w in filter_warnings)
+                response["summary"] = f"{warning_text}\n\n{summary}"
+
             if formatted is not None:
                 response["formatted"] = formatted
             if fmt_format is not None:
                 response["format"] = fmt_format
             if format_error is not None:
                 response["format_error"] = format_error
-            
+
             if has_error:
                 response["error"] = result.get("error")
-        
+
+        # v0.3.37: Store result metadata for follow-up queries
+        last_result_metadata = {
+            "resource": parsed.get("resource"),
+            "filters": parsed.get("filters", {}),
+            "count": pagination_info.get("total_count", 0) if 'pagination_info' in dir() else 0,
+            "has_more": pagination_info.get("has_more", False) if 'pagination_info' in dir() else False,
+            "next_url": pagination_info.get("next_url") if 'pagination_info' in dir() else None,
+        }
+
+        # v0.3.37: Log to tracer and save
+        tracer = state.get("_tracer")
+        if tracer:
+            tracer.log_stage("summarize", {
+                "success": response.get("success", False),
+                "data_count": pagination_info.get("actual_count", 0) if 'pagination_info' in dir() else 0,
+                "has_filter_warnings": len(filter_warnings) > 0 if 'filter_warnings' in dir() else False,
+            })
+            _tracer_store.save_trace(tracer)
+
         # Final progress update (v0.3.10)
         if tracker:
             if response.get("success"):
                 tracker.update(ProgressStage.COMPLETED, constants.PROGRESS_DONE)
             else:
                 tracker.update(ProgressStage.ERROR, constants.PROGRESS_ERROR_OCCURRED)
-        
-        return {"summary": summary, "response": response}
+
+        return {"summary": summary, "response": response, "last_result_metadata": last_result_metadata}
+
+    def handle_follow_up(state: APIQueryState) -> Dict[str, Any]:
+        """
+        Handle follow-up queries like "show me next 2" or "show me first 3" (v0.3.38).
+
+        This node:
+        1. Checks if the query is a follow-up
+        2. Extracts context from conversation history
+        3. If follow-up + has next_url: fetches next page
+        4. If follow-up + no context: returns helpful error
+        5. If not follow-up: continues to normal parsing
+        """
+        query = state["query"]
+        conversation_history = state.get("conversation_history", [])
+        tracker = state.get("progress_tracker")
+
+        # Check if this is a follow-up query
+        is_follow_up = _is_follow_up_query(query)
+
+        if not is_follow_up:
+            # Not a follow-up, continue normal flow
+            return {"is_follow_up": False}
+
+        # Extract metadata from previous results
+        last_metadata = _extract_last_result_metadata(conversation_history)
+        follow_up_type = _get_follow_up_type(query)
+        requested_limit = _extract_limit_from_query(query)
+
+        logger.info(
+            f"Follow-up detected: type={follow_up_type}, limit={requested_limit}, "
+            f"has_context={bool(last_metadata)}, next_url={last_metadata.get('next_url', 'None')}"
+        )
+
+        if tracker:
+            tracker.update(
+                ProgressStage.PARSING_QUERY,
+                f"Processing follow-up query: {follow_up_type}"
+            )
+
+        # Handle based on follow-up type
+        if follow_up_type == "next_page":
+            next_url = last_metadata.get("next_url")
+            if next_url:
+                # Fetch next page using the stored URL
+                try:
+                    if tracker:
+                        tracker.update(ProgressStage.EXECUTING_API, "Fetching next page...")
+
+                    page_result = processor._fetch_next_page(
+                        next_url,
+                        state["active_schema"],
+                        state.get("access_token")
+                    )
+
+                    if page_result.get("error"):
+                        return {
+                            "is_follow_up": True,
+                            "response": {
+                                "success": False,
+                                "error": page_result["error"],
+                                "summary": f"Failed to fetch next page: {page_result['error']}",
+                                "query": query,
+                            }
+                        }
+
+                    # Store result for summarization
+                    data = page_result.get("data", {})
+
+                    # v0.3.40: Apply requested_limit to slice results
+                    # When user says "show me next 2", we should only show 2 items
+                    if requested_limit and requested_limit < 100:  # Sanity check
+                        if isinstance(data, dict) and 'results' in data:
+                            original_count = len(data.get('results', []))
+                            data = {
+                                **data,
+                                'results': data['results'][:requested_limit]
+                            }
+                            logger.info(
+                                f"Applied follow-up limit: showing {len(data['results'])} of "
+                                f"{original_count} results (requested: {requested_limit})"
+                            )
+                        elif isinstance(data, list):
+                            original_count = len(data)
+                            data = data[:requested_limit]
+                            logger.info(
+                                f"Applied follow-up limit: showing {len(data)} of "
+                                f"{original_count} results (requested: {requested_limit})"
+                            )
+                        # Update page_result with sliced data
+                        page_result = {**page_result, 'data': data}
+
+                    pagination_info = _analyze_pagination(data)
+
+                    # Create parsed context for summarization
+                    parsed = {
+                        "intent": "read",
+                        "resource": last_metadata.get("resource", "items"),
+                        "filters": last_metadata.get("filters", {}),
+                        "display_mode": "summary",
+                        "question_type": "list",
+                        "limit": requested_limit,  # v0.3.40: Pass limit for summary
+                    }
+
+                    return {
+                        "is_follow_up": True,
+                        "parsed": parsed,
+                        "result": page_result,
+                        "step_results": [{
+                            "step_id": 1,
+                            "step_description": "Fetch next page",
+                            "result": data,
+                            "status": "success",
+                        }],
+                        "last_result_metadata": {
+                            "resource": last_metadata.get("resource"),
+                            "filters": last_metadata.get("filters", {}),
+                            "count": pagination_info.get("total_count", 0),
+                            "has_more": pagination_info.get("has_more", False),
+                            "next_url": pagination_info.get("next_url"),
+                        },
+                        # Skip to summarize
+                        "execution_plan": {"steps": [{"step_id": 1}], "is_multi_step": False},
+                        "current_step": 1,
+                    }
+                except Exception as e:
+                    logger.error(f"Failed to fetch next page: {e}")
+                    return {
+                        "is_follow_up": True,
+                        "response": {
+                            "success": False,
+                            "error": str(e),
+                            "summary": f"Failed to fetch next page: {e}",
+                            "query": query,
+                        }
+                    }
+            else:
+                # No next_url - provide helpful message
+                resource = last_metadata.get("resource", "items")
+                if last_metadata:
+                    msg = (
+                        f"There are no more {resource} to show. "
+                        f"The previous query returned all available results."
+                    )
+                else:
+                    msg = (
+                        "I don't have context from a previous query to show more results. "
+                        "Please start with a new query like 'list service orders' or 'show all users'."
+                    )
+
+                return {
+                    "is_follow_up": True,
+                    "response": {
+                        "success": True,
+                        "data": None,
+                        "summary": msg,
+                        "query": query,
+                        "total_steps": 0,
+                    }
+                }
+
+        elif follow_up_type in ("first_n", "last_n"):
+            # User wants first/last N items from previous results
+            if not last_metadata or not last_metadata.get("resource"):
+                return {
+                    "is_follow_up": True,
+                    "response": {
+                        "success": True,
+                        "data": None,
+                        "summary": (
+                            "I don't have context from a previous query. "
+                            "Please start with a query like 'list service orders' first, "
+                            "then ask for 'show me first 3'."
+                        ),
+                        "query": query,
+                        "total_steps": 0,
+                    }
+                }
+
+            # Re-run the previous query with a limit
+            # Continue to normal flow but with injected context
+            return {
+                "is_follow_up": True,
+                "last_result_metadata": last_metadata,
+                # Let normal parsing handle it, but with context hint
+                "context": {
+                    "previous_resource": last_metadata.get("resource"),
+                    "previous_filters": last_metadata.get("filters", {}),
+                    "requested_limit": requested_limit,
+                    "follow_up_type": follow_up_type,
+                },
+            }
+
+        elif follow_up_type == "reference":
+            # Generic reference like "show those" - needs previous context
+            if not last_metadata or not last_metadata.get("resource"):
+                return {
+                    "is_follow_up": True,
+                    "response": {
+                        "success": True,
+                        "data": None,
+                        "summary": (
+                            "I'm not sure what you're referring to. "
+                            "Please be more specific, like 'show all service orders' or 'list users'."
+                        ),
+                        "query": query,
+                        "total_steps": 0,
+                    }
+                }
+
+            # Continue to normal flow with context
+            return {
+                "is_follow_up": True,
+                "last_result_metadata": last_metadata,
+                "context": {
+                    "previous_resource": last_metadata.get("resource"),
+                    "previous_filters": last_metadata.get("filters", {}),
+                },
+            }
+
+        # Unknown follow-up type - continue normal flow
+        return {"is_follow_up": True, "last_result_metadata": last_metadata}
+
+    def route_after_follow_up(state: APIQueryState) -> str:
+        """Route after follow-up handling (v0.3.38)."""
+        # If we already have a response (follow-up was fully handled), go to end
+        if state.get("response"):
+            return "end"
+        # If we have result from follow-up (fetched next page), go to summarize
+        if state.get("is_follow_up") and state.get("result"):
+            return "summarize"
+        # Otherwise continue to classification
+        return "classify"
 
     def route_after_schema(state: APIQueryState) -> str:
         if state.get("response"):
             return "end"
-        return "parse"
+        return "handle_follow_up"  # v0.3.38: Check for follow-up queries first
 
     def route_after_planning(state: APIQueryState) -> str:
         """Route after execution planning."""
@@ -1075,8 +1579,58 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
             return "format_error"
         return "summarize"  # Partial or full success → summarize (with errors list when some failed)
 
+    def classify_intent(state: APIQueryState) -> Dict[str, Any]:
+        """
+        Fast rule-based intent classification (no LLM).
+
+        This node attempts to classify the query using rules before calling
+        the LLM-based parser. If classification confidence is high enough,
+        we can skip the LLM parser entirely, reducing cost and latency.
+
+        Returns:
+            Dict with optional 'parsed' (if high confidence) and 'classification_confidence'
+        """
+        active_schema = state.get("active_schema")
+        if not active_schema:
+            return {"classification_confidence": 0.0}
+
+        try:
+            classifier = IntentClassifier(active_schema)
+            classification, confidence = classifier.classify(state["query"])
+
+            logger.debug(
+                f"Intent classification: confidence={confidence:.2f}, "
+                f"resource={classification.resource if classification else 'None'}"
+            )
+
+            if classification and confidence >= constants.CLASSIFIER_MEDIUM_CONFIDENCE:
+                logger.info(
+                    f"Fast classification succeeded: {classification.intent} on "
+                    f"{classification.resource} (confidence={confidence:.2f})"
+                )
+                return {
+                    "parsed": classification.to_dict(),
+                    "classification_confidence": confidence,
+                    "skip_llm_parse": True,
+                }
+
+            return {"classification_confidence": confidence}
+
+        except Exception as e:
+            logger.warning(f"Intent classification failed: {e}")
+            return {"classification_confidence": 0.0}
+
+    def route_after_classification(state: APIQueryState) -> str:
+        """Route based on classification result."""
+        if state.get("skip_llm_parse") and state.get("parsed"):
+            logger.info("Skipping LLM parse - using rule-based classification")
+            return "create_plan"
+        return "parse"
+
     # Add nodes
     graph.add_node("load_schema", load_schema)
+    graph.add_node("handle_follow_up", handle_follow_up)  # v0.3.38: Follow-up query handler
+    graph.add_node("classify", classify_intent)
     graph.add_node("parse", parse_query)
     graph.add_node("create_plan", create_execution_plan)
     graph.add_node("execute_step", execute_next_step)
@@ -1085,14 +1639,32 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
 
     # Set entry point
     graph.set_entry_point("load_schema")
-    
+
     # Add edges
     graph.add_conditional_edges(
         "load_schema",
         route_after_schema,
         {
-            "parse": "parse",
+            "handle_follow_up": "handle_follow_up",  # v0.3.38: Route to follow-up handler
             "end": END,
+        },
+    )
+    # v0.3.38: Route after follow-up handling
+    graph.add_conditional_edges(
+        "handle_follow_up",
+        route_after_follow_up,
+        {
+            "classify": "classify",
+            "summarize": "summarize",  # Follow-up already fetched data
+            "end": END,  # Follow-up returned response directly
+        },
+    )
+    graph.add_conditional_edges(
+        "classify",
+        route_after_classification,
+        {
+            "parse": "parse",
+            "create_plan": "create_plan",
         },
     )
     graph.add_edge("parse", "create_plan")

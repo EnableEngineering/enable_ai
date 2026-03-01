@@ -295,3 +295,101 @@ NO_MATCHING_RESOURCE = "I couldn't find a matching resource for '{resource}'. Av
 # No results found (but query was understood)
 NO_RESULTS_FOUND = "No {resource} found matching your criteria."
 NO_RESULTS_SUGGESTION = "Try broadening your search or using different filters."
+
+
+# =============================================================================
+# INTENT CLASSIFIER (rule-based classification)
+# =============================================================================
+
+# Confidence thresholds for intent classification
+CLASSIFIER_HIGH_CONFIDENCE = 0.85
+CLASSIFIER_MEDIUM_CONFIDENCE = 0.65
+CLASSIFIER_LOW_CONFIDENCE = 0.40
+
+# Intent keywords for rule-based classification (domain-agnostic)
+CLASSIFIER_READ_KEYWORDS = frozenset({
+    'list', 'show', 'get', 'find', 'search', 'fetch', 'display', 'view',
+    'what', 'which', 'who', 'retrieve', 'see', 'look'
+})
+CLASSIFIER_CREATE_KEYWORDS = frozenset({
+    'create', 'add', 'new', 'insert', 'make', 'register', 'post'
+})
+CLASSIFIER_UPDATE_KEYWORDS = frozenset({
+    'update', 'modify', 'change', 'edit', 'set', 'patch', 'alter'
+})
+CLASSIFIER_DELETE_KEYWORDS = frozenset({
+    'delete', 'remove', 'drop', 'cancel', 'destroy'
+})
+CLASSIFIER_COUNT_KEYWORDS = frozenset({
+    'how many', 'count', 'total', 'number of', 'how much'
+})
+
+
+# =============================================================================
+# CONVERSATION LOOP (confirmation and correction)
+# =============================================================================
+
+# Confidence threshold below which we ask for confirmation
+CONFIRMATION_CONFIDENCE_THRESHOLD = 0.65
+
+# User responses that mean "yes" (case-insensitive)
+CONFIRMATION_YES_RESPONSES = frozenset({
+    'yes', 'correct', 'y', 'yep', 'yeah', 'right', 'that\'s right',
+    'yes that\'s correct', 'exactly', 'proceed', 'go ahead'
+})
+
+# User responses that mean "no" (case-insensitive)
+CONFIRMATION_NO_RESPONSES = frozenset({
+    'no', 'wrong', 'incorrect', 'n', 'nope', 'not quite', 'no that\'s wrong'
+})
+
+# Confirmation message templates
+CONFIRMATION_MESSAGE_TEMPLATE = "I understood: {interpretation}. Is that correct?"
+CONFIRMATION_CLARIFY_MESSAGE = "What did you mean instead?"
+
+
+# =============================================================================
+# CORRECTION STORE (learning from user corrections)
+# =============================================================================
+
+# Max corrections to store per session (in-memory store)
+CORRECTION_STORE_MAX_PER_SESSION = 100
+
+# Number of similar corrections to retrieve for context
+CORRECTION_SIMILAR_LIMIT = 5
+
+# Minimum times a correction must occur to be considered a learned pattern
+CORRECTION_PATTERN_MIN_FREQUENCY = 2
+
+
+# =============================================================================
+# SCHEMA INTROSPECTOR (filter discovery)
+# =============================================================================
+
+# Default filter operators supported
+DEFAULT_FILTER_OPERATORS = (
+    'equals', 'not_equals', 'contains', 'starts_with', 'ends_with',
+    'gt', 'gte', 'lt', 'lte', 'in', 'not_in'
+)
+
+# Django-style lookup suffixes to try when mapping filters
+DJANGO_LOOKUP_SUFFIXES = (
+    '__name', '__id', '__iexact', '__icontains', '__in',
+    '__gte', '__lte', '__gt', '__lt'
+)
+
+
+# =============================================================================
+# PAGINATION INFO (response formatting)
+# =============================================================================
+
+# Template for pagination info in responses
+PAGINATION_INFO_TEMPLATE = "Showing {shown} of {total} {resource}."
+PAGINATION_HAS_MORE_TEMPLATE = "Say 'show more' or 'next page' to see more."
+PAGINATION_SHOW_ALL_HINT = "Say 'show all' to see the complete list."
+
+# Empty response templates
+EMPTY_RESPONSE_MESSAGE = "No {resource} found matching your criteria."
+EMPTY_RESPONSE_FILTERS_APPLIED = "Filters applied:"
+EMPTY_RESPONSE_SUGGESTION = "Try broadening your search or using different filters."
+EMPTY_RESPONSE_VALID_VALUES_HINT = "Valid values for '{field}': {values}"

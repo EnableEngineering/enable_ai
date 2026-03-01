@@ -653,46 +653,62 @@ class APIOrchestrator:
     
     def _get_active_schema(self, runtime_schema: Optional[dict] = None) -> Optional[dict]:
         """
-        Determine which schema to use.
-        
+        Determine which schema to use, with resource_hints injection.
+
         Priority:
         1. Runtime schema (passed to process())
         2. Schema matching enabled data source
         3. First available init-time schema
         4. None
-        
+
+        v0.3.40: Injects resource_hints from config.json into the schema.
+        The resource_hints contain synonyms and semantic filter mappings
+        that are essential for proper resource matching.
+
         Args:
             runtime_schema: Optional runtime schema override
-            
+
         Returns:
-            Active schema dict or None
+            Active schema dict (with resource_hints injected) or None
         """
+        schema = None
+
         # Priority 1: Runtime override
         if runtime_schema:
-            return runtime_schema
-        
-        # Priority 2: Match enabled data source
-        enabled_source = self._get_enabled_data_source()
-        
-        # Map data source to schema type
-        source_to_schema = {
-            'api': 'api',
-            'database': 'database',
-            'json_files': 'knowledge_graph',
-            'pdf_documents': 'knowledge_graph',
-            'vector_search': 'knowledge_graph'
-        }
-        
-        schema_type = source_to_schema.get(enabled_source)
-        if schema_type and schema_type in self.schemas:
-            return self.schemas[schema_type]
-        
-        # Priority 3: First available schema
-        if self.schemas:
-            return next(iter(self.schemas.values()))
-        
-        # Priority 4: None
-        return None
+            schema = runtime_schema
+        else:
+            # Priority 2: Match enabled data source
+            enabled_source = self._get_enabled_data_source()
+
+            # Map data source to schema type
+            source_to_schema = {
+                'api': 'api',
+                'database': 'database',
+                'json_files': 'knowledge_graph',
+                'pdf_documents': 'knowledge_graph',
+                'vector_search': 'knowledge_graph'
+            }
+
+            schema_type = source_to_schema.get(enabled_source)
+            if schema_type and schema_type in self.schemas:
+                schema = self.schemas[schema_type]
+            # Priority 3: First available schema
+            elif self.schemas:
+                schema = next(iter(self.schemas.values()))
+
+        # v0.3.40: Inject resource_hints from config into schema
+        # The resource_hints in config.json contain synonyms and semantic filter mappings
+        # that are essential for proper resource matching and filter validation
+        if schema is not None:
+            # Get resource_hints from config.json data_sources.api.resource_hints
+            config_hints = self.config.get('data_sources', {}).get('api', {}).get('resource_hints', {})
+
+            if config_hints and not schema.get('resource_hints'):
+                # Inject resource_hints into a copy of the schema (don't mutate original)
+                schema = {**schema, 'resource_hints': config_hints}
+                self.logger.debug(f"Injected {len(config_hints)} resource_hints from config into schema")
+
+        return schema
     
     def _understand_query(
         self,
@@ -1073,6 +1089,7 @@ class APIOrchestrator:
             "endpoint": api_request.endpoint,
             "method": api_request.method,
             "params": api_request.params,
+            "warnings": getattr(api_request, 'warnings', []),  # v0.3.37: Filter warnings
         }
 
     def _fetch_next_page(self, next_url: str, schema: dict, access_token: Optional[str] = None) -> Dict[str, Any]:

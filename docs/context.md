@@ -1,6 +1,8 @@
 # Enable AI - Complete Context
 
-**For v1 remaining work and checklist:** see **[todo.md](todo.md)**. **For hardcoded limits and static strings:** all are in **`constants.py`** (update there as needed); impact described in **todo.md** § Limits affecting correctness.
+**For v1 remaining work, required config, and SLM plan:** see **[todo.md](todo.md)**. **Limits and static strings:** all are in **`constants.py`**; key limits can be overridden by **environment variables** (see **README** § Configurable limits).
+
+**How to verify:** Use **context.md** for a detailed picture of what the system does today (Current Status § What we have right now), required config (Technical Details § Configuration), and where to implement remaining work (Implementing v1 todo items). Cross-check with **todo.md** for the exact required-config list, remaining v1 tasks, limits note, and the full SLM plan.
 
 ---
 
@@ -83,7 +85,7 @@ Schema OK?   Intent found?   Multi-step?   API call OK?   Result ready
 ```
 enable_ai/
 ├── src/enable_ai/
-│   ├── constants.py          # Limits and static strings (see todo.md § Limits)
+│   ├── constants.py          # Limits and static strings (see todo.md; context § Current Status)
 │   ├── utils.py              # Centralized OpenAI & logging
 │   ├── orchestrator.py       # APIOrchestrator (main class)
 │   ├── query_parser.py       # LLM-based parser
@@ -219,8 +221,12 @@ enable_ai/
 
 ### Configuration
 
-**Required:** `OPENAI_API_KEY` (env). **Schema:** pass at init `APIOrchestrator(schemas={"api": path_or_dict})` or set in `config.json` (`schemas.api`, `data_sources.api.enabled: true`). **base_url:** from `config.json` (`data_sources.api.base_url`) or from the schema (`base_url`).  
-**Optional:** `config.json` (auth, schema paths), `.env` (JWT: `API_EMAIL`, `API_PASSWORD`), `conversation_store` (multi-turn). Full checklist: **[todo.md](todo.md)** § Configuration.
+**Required (see todo.md § Configuration):**
+- **OPENAI_API_KEY** (env) – For query parsing, planning, and summarization.
+- **API schema** – Pass at init: `APIOrchestrator(schemas={"api": path_or_dict})`, or set in **config.json** (`schemas.api`, `data_sources.api.enabled: true`).
+- **base_url** – From **config.json** (`data_sources.api.base_url`) or from the **schema** (`base_url`).
+
+**Optional:** `config.json` (auth, schema paths), `.env` (JWT: `API_EMAIL`, `API_PASSWORD`), `conversation_store` (multi-turn), `formatter_config`. See **todo.md** for reference.
 
 **Schema format (internal):**
 ```json
@@ -338,18 +344,142 @@ enable-schema generate \
 
 ## Current Status
 
-### ✅ Complete & Working (v1 scope)
-- Single-query → single API; multi-step (3–4+ APIs in sequence) with context passing; summarization (single and multi-step)
-- **Pagination:** Detection (total_count, has_more, "show more" suggestion) and **automatic fetch** of next page(s) when response has has_more/next (single-step and pagination-as-step; safety cap in constants)
-- OpenAPI as input (auto-convert); CLI `enable-schema generate`; auth (JWT/OAuth/API key); conversation_store (Django/Redis/InMemory)
-- Centralized OpenAI; logging; MCP server; schema_loader, schema_validator, response_formatter, progress_tracker
-- **LangGraph:** process_stream() yields (node_name, state) after each node; step failure (all failed → format_error; some failed → partial results + errors list)
-- **Error handling:** Errors returned as-is (no generic fallbacks); parse/plan/LLM failures surface actual exception; formatter failures set response["format_error"]
-- **Constants:** All limits and static strings in `constants.py` (see todo.md § Limits affecting correctness)
-- **Docs:** README environment setup (venv, .env, OPENAI_API_KEY, cwd) and Troubleshooting table
+### ✅ What we have right now (detailed)
 
-### 📋 What's left for v1
-See **[todo.md](todo.md)** for the v1 checklist: summarization & presentation (question-aware summary, smart format selection), testing & validation, package deployment; retry for API calls done; conditional/parallel deferred.
+Use this list to verify behaviour and alignment with **todo.md** § What's working.
+
+**Query execution**
+- **Single-query → single API:** Parse → match endpoint → call API → format/summarize. Works for any documented API via OpenAPI/schema.
+- **Multi-step (3–4+ APIs in sequence):** ExecutionPlanner produces steps with `depends_on` and `extract`; workflow runs steps in order and resolves variables from previous step results (`_resolve_step_dependencies`, `_extract_by_path`). Context passing and summarisation for multi-step.
+- **Summarisation:** Single-step and multi-step; question-aware LLM summaries (data-bound, query-focused); smart format selection (table/chart/text from heuristics + LLM when needed). Template summaries used as initial value; formatter output overwrites when formatter succeeds.
+
+**Pagination**
+- **Detection:** total_count, has_more, "show more" suggestion.
+- **Automatic fetch:** Single-step path and pagination-as-step (`fetch_all_pages: true`) fetch next page(s) when response has has_more/next. Safety cap in `constants.SAFETY_MAX_PAGES`; `api_client.get_full_url`, `orchestrator._fetch_next_page`.
+
+**Schema & auth**
+- **OpenAPI as input:** Auto-convert to internal schema; CLI `enable-schema generate` for file/URL.
+- **Auth:** JWT (Bearer), OAuth 2.0, API keys from config; auto-authentication when needed.
+
+**State & conversation**
+- **Conversation store:** InMemory (default), Django, Redis. Session history loaded before invoke; user/assistant messages saved after. Used for filter/entity merge and refinement (`merge_with_previous`, `_extract_previous_filters`, optional `metadata.filters`).
+- **LangGraph state:** Ephemeral per `invoke()` (no checkpointer). State includes query, access_token, runtime_schema, session_id, conversation_history, progress_tracker.
+
+**Workflow (LangGraph)**
+- **Graph:** load_schema → parse → create_plan → execute_step (loop) → summarize; conditional edges for schema error, planning error, step loop vs done.
+- **Streaming:** `progress_callback` (ProgressTracker) with stages: STARTED, PARSING_QUERY, INTENT_DETECTED, MATCHING_API, PLANNING, PLAN_READY, EXECUTING_API, API_COMPLETED, SUMMARIZING, COMPLETED, ERROR. Optional `process_stream(query, ...)` yields (node_name, state) after each node. SSE example: `examples/streaming_backend.py`. Summary tokens are not streamed.
+- **Step failure:** All steps failed → `format_error`; some failed → summarize with partial results + `errors` list.
+
+**Error handling & robustness**
+- **Errors returned as-is:** No generic fallbacks; parse/plan/LLM failures surface actual exception; formatter failures set `response["format_error"]`; OPENAI_API_KEY hint in utils.
+- **Retry:** `api_client` retries on timeout, connection error, 429/502/503/504 with exponential backoff (`constants.REQUEST_RETRY_ATTEMPTS`, `REQUEST_RETRY_BACKOFF_SECONDS`).
+
+**Codebase**
+- **Constants:** All limits and static strings in **`constants.py`** (pagination cap, page_size cap, conversation history limit, timeouts, retry settings, etc.). Make pagination cap, history limit, page_size cap, and timeouts configurable where needed (see todo.md § Limits affecting correctness).
+- **Centralized OpenAI:** `utils.py` (OpenAIClient, get_openai_client, logging, model constants). Used by query_parser, execution_planner, workflow.
+- **Components:** schema_loader, schema_validator, response_formatter, progress_tracker, mcp_server; types in types.py; config_loader for config.json.
+
+**Docs & examples**
+- README: environment setup (venv, .env, OPENAI_API_KEY, cwd), Troubleshooting table. Filter merge (metadata.filters), progress stages (PLAN_READY, API_COMPLETED). Examples: simple_usage, streaming_backend, streaming_frontend, backend_simulator.
+
+**Out of scope for v1**
+- **RAG and vector DB:** Not required for current API-only orchestration; grounding is API schema + live API responses. Omitted from v1.
+- **Conditional/parallel plans:** Deferred (if/else in plans; parallel steps).
+
+### 📋 Remaining work (v1) – from todo.md
+
+Only the following are left for v1:
+
+1. **Testing & validation** – Run full test suite with OpenAI API key; test MCP with Claude Desktop; verify schema generation and multi-step/session.
+2. **Package deployment** – Test pip install from local build and entry points; build and publish to TestPyPI then PyPI.
+
+**Limits:** All limits and static strings are in **`constants.py`**. See **todo.md** § Remaining work for the note on making pagination cap, history limit, page_size cap, and timeouts configurable where needed.
+
+### 📋 Planned: SLM plan (90% → 95% accuracy) – from todo.md
+
+**Why SLM:** We're not relying on prompt tweaks or a bigger LLM to improve accuracy. The plan is to add **Small Language Models (SLMs)** as **precision layers** for narrow, deterministic sub-tasks (intent, params, validation, guardrails) while the main LLM keeps reasoning and synthesis. That architectural separation improves reliability, cost, and regression stability. RAG and vector DB remain out of scope; grounding stays API schema + live API responses.
+
+**How it will look in future (with SLM layers):**
+
+```
+User Query
+    ↓
+[Optional] SLM guardrail (policy / prompt-injection check)
+    ↓
+SLM #1 → Intent classifier (list / get-one / multi-resource / refinement)  ← new
+    ↓
+Parse Query → Create Plan (existing LLM parser + planner)
+    ↓
+SLM #2 → Tool parameter extraction or validation (vs schema)                 ← new
+    ↓
+Execute API (existing matcher + client)
+    ↓
+Summarize (existing LLM formatter)
+    ↓
+SLM #3 → Output / schema validator (required fields, format, rules)          ← new
+    ↓
+[Optional] SLM guardrail (unsafe/off-topic output check)
+    ↓
+Response to caller
+```
+
+So the future flow is: **SLM → LLM (parse/plan) → SLM (params) → execute → LLM (summarize) → SLM (validate)**. SLMs specialize, constrain, and validate; the LLM reasons and synthesizes.
+
+**Layers (for verification):**
+
+| # | Layer | Purpose | Where (to implement) |
+|---|--------|---------|----------------------|
+| 1 | **Intent classification** | SLM before parser: classify intent and route. Reduces wrong workflows. | New step before `parse` node in orchestrator/workflow. |
+| 2 | **Tool parameter extraction / validation** | SLM **validates against endpoint signature and produces a corrected parameter object** (or "missing info"). Validate & correct, not just flag. | After parser: `query_parser.py` or new `param_extractor.py`. |
+| 3 | **Output / schema validation** | SLM validates summary against returned data; returns **OK** or **"Fix summary with these constraints…"**. Closed-loop quality gate. | `response_formatter.py` or summarize node in `workflow.py` after formatter LLM. |
+| 4 | **Guardrails** | SLM for policy violations, prompt injection, off-topic or unsafe output (allow/flag/block). | Before parse and/or before returning response. |
+
+**Implementation order (suggested):** 1 → 2 → 3 → 4.  
+**Technical notes:** Use a single small model (e.g. Phi-3, LLaMA 3 8B, Mistral 7B) or task-specific SLMs; low temp, fixed schema; run SLM steps in-process or on small endpoint; define fixed intents/schemas for regression testing. Full detail in **todo.md** § SLM plan.
+
+### Accuracy improvements on top of SLM (measurable 90% → 95%)
+
+These additions make accuracy **measurable** and **regress-testable**; do them alongside (or before) adding more models.
+
+**1) Evaluation harness (do first)**  
+- Create a **golden set** of ~200–500 queries per API schema.  
+- Track metrics **per layer:** routing accuracy (right resource/endpoint?), parameter accuracy (IDs/filters/limit correct?), execution success (HTTP, retries, pagination), answer faithfulness (summary matches returned data).  
+- Turns "90→95" into concrete deltas per layer; use to target the real failure mode.
+
+**2) Schema-constrained outputs + repair loop**  
+- For parser, planner, and validator steps: force **strict JSON schema** output (no free-form).  
+- **Allowed enums** derived from internal API schema (resources, intents, parameter names).  
+- **Reject/repair** outputs that don't conform (cheap repair loop).  
+- Often improves accuracy more than switching models.
+
+**3) SLM layers: validate & correct (not just validate)**  
+- **SLM #2 (params):** Validate against endpoint signature **and** produce a **corrected parameter object** (or "missing info").  
+- **SLM #3 (output):** Validate summary against returned data; return **OK** or **"Fix summary with these constraints…"**.  
+- Turns validation into a closed-loop quality gate.
+
+**4) Deterministic routing short-circuit**  
+- If the query **clearly** maps to one endpoint (keyword + path + method), **skip the big LLM:** use cheap rules/embeddings + SLM intent classifier.  
+- Only call LLM when ambiguity is high. Reduces variability and increases consistency.
+
+**5) Grounding contract for summaries**  
+- For every claim in the summary, require a **data pointer** (jsonpath or row index).  
+- If not possible, summary must say **"Not available in API response"**.  
+- Reduces hallucination-driven accuracy loss.
+
+**6) Error taxonomy + targeted fixes**  
+- Bucket failures: wrong endpoint, wrong ID/param, missing required param, pagination incomplete, multi-step `extract` paths wrong, summary contradicts API data.  
+- Fix the **biggest bucket first**; usually the fastest path to 95%.
+
+**7) Ask-clarifying-question as first-class outcome**  
+- When params are missing/ambiguous, **don't guess:** return structured **MissingInformation** with 1–3 very specific questions.  
+- Converts failures into recoverable interactions.
+
+**Top 3 for biggest jump (if picking only a few)**  
+1. **Strict schema-constrained outputs + repair loop**  
+2. **SLM param validator that corrects, not just flags** (SLM #2)  
+3. **Eval harness + error taxonomy** to target the real failure mode  
+
+*Optional next step:* Map 5–10 real failure examples to which layer should catch each (SLM #1/#2/#3 or planner) and what constraint/check to add in the workflow nodes.
 
 ---
 
@@ -370,15 +500,14 @@ See **[todo.md](todo.md)** for the v1 checklist: summarization & presentation (q
 
 ---
 
-## Other features (for doc updates)
+## Other features (reference for verification)
 
 - **Public API:** `APIOrchestrator.process(query, access_token=None, context=None, runtime_schema=None, session_id=None, progress_callback=None)`; `process_query(query, ...)` (standalone, new orchestrator each time); `orchestrator.clear_conversation(session_id)`; `load_schema(source)`; SchemaLoader, SchemaValidator, ResponseFormatter, ProgressTracker, types (APIRequest, APIResponse, APIError, MissingInformation).
-- **environment.py:** DEV config points to `examples/backend_simulator/` (folder exists with config.json, env.example, schema, README).
-- **Schema conversion:** Full OpenAPI → Enable AI is in orchestrator (`_convert_openapi_to_enable_ai` + schema_generator). Public `load_schema()` uses SchemaLoader with minimal OpenAPI conversion; for OpenAPI prefer orchestrator with path/dict or `enable-schema generate`.
+- **environment.py:** DEV config points to `examples/backend_simulator/` (config.json, env.example, schema, README).
+- **Schema conversion:** Full OpenAPI → Enable AI in orchestrator (`_convert_openapi_to_enable_ai` + schema_generator). Public `load_schema()` uses SchemaLoader; for OpenAPI prefer orchestrator with path/dict or `enable-schema generate`.
 - **MCP tools:** process_query, get_schema_resources, authenticate, get_config_info. `get_orchestrator(config_path)` no longer passes unsupported params.
-- **Progress stages:** Workflow emits STARTED, PARSING_QUERY, INTENT_DETECTED, MATCHING_API, PLANNING, PLAN_READY, EXECUTING_API, API_COMPLETED, SUMMARIZING, COMPLETED, ERROR.
+- **Progress stages:** STARTED, PARSING_QUERY, INTENT_DETECTED, MATCHING_API, PLANNING, PLAN_READY, EXECUTING_API, API_COMPLETED, SUMMARIZING, COMPLETED, ERROR.
 - **Filter merging:** get_history returns optional `metadata`; _extract_previous_filters prefers metadata.filters and uses balanced-bracket fallback for content.
-- **Audit (improve & use correctly):** See **todo.md** § "Other features – audit" for each feature: makes sense?, using correctly?, what to improve?
 
 ---
 
@@ -407,15 +536,16 @@ pytest tests/test_api_endpoint.py
 
 ## Implementing v1 todo items
 
-Use this map to implement pending items from **[todo.md](todo.md)** in the right place.
+Use this map to implement remaining items from **[todo.md](todo.md)**.
 
 | Todo item | Where to implement | Notes |
 |-----------|--------------------|--------|
-| **Summarization & presentation** | `response_formatter.py`, `workflow.py` (summarize), `orchestrator.py` (_summarize_*) | Question-aware summary: analyse user question and data; produce concise, suitable summary (not template strings). Smart format: choose table vs chart vs text from question + result shape. |
-| **Retry for failed API calls** | Done: `api_client.py` | Retries on timeout, connection error, 429/502/503/504 with exponential backoff; timeout from constants.REQUEST_TIMEOUT. |
-| **Conditional / parallel** (deferred) | `execution_planner.py` (plan format), `workflow.py` (routing) | Extend plan schema with conditionals; branch in graph or run parallel steps when `depends_on` allows. |
-| **Testing & deployment** | `tests/`, `pyproject.toml`, CI | Run full test suite with OPENAI_API_KEY; test MCP with Claude Desktop; verify schema generation; pip install from local build; publish to TestPyPI then PyPI. |
+| **Testing & validation** | `tests/`, CI | Run full test suite with OPENAI_API_KEY; test MCP with Claude Desktop; verify schema generation and multi-step/session. |
+| **Package deployment** | `pyproject.toml`, build/publish | Test pip install from local build; verify entry points; build and publish to TestPyPI then PyPI. |
+| **SLM plan** (planned, not v1 block) | See todo.md § SLM plan | Intent classification, param extraction/validation, output validator, guardrails. Order and locations in context.md § Planned: SLM plan and in todo.md. |
+
+**Done (for reference):** Retry for failed API calls (`api_client.py`); question-aware summarization and smart format selection (`response_formatter.py`). **Deferred:** Conditional/parallel plans.
 
 ---
 
-This context provides the architecture and implementation pointers for the enable_ai project; use **todo.md** for the v1 checklist.
+This context documents what exists now and aligns with **todo.md** (required config, remaining work, limits, SLM plan). Use **todo.md** as the v1 checklist for verification.

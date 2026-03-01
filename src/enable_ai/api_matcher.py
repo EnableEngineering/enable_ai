@@ -1,3 +1,4 @@
+from typing import Dict, Any, Optional, List
 from .types import APIRequest, APIError, MissingInformation
 from .utils import setup_logger
 from . import constants
@@ -259,12 +260,173 @@ class APIMatcher:
             
             if isinstance(validation_result, MissingInformation):
                 return validation_result
-            
-            # Build and return the API request
-            return self._build_api_request(matched_endpoint, entities)
-            
+
+            # v0.3.37: Collect filter warnings to pass to user
+            filter_warnings = []
+
+            # Validate filter values against schema
+            if filters:
+                validated = self._validate_filter_values(filters, resource, resource_hints)
+                if validated.get('filters'):
+                    filters = validated['filters']
+                if validated.get('warnings'):
+                    for warning in validated['warnings']:
+                        self.logger.warning(warning)
+                        filter_warnings.append(warning)
+
+                # v0.3.37: Check for filters that don't match any endpoint params
+                unmatched = self._check_unmatched_filters(filters, matched_endpoint, resource)
+                filter_warnings.extend(unmatched)
+
+            # Build and return the API request with validated filters and warnings
+            return self._build_api_request(
+                matched_endpoint, entities,
+                filters=filters,
+                schema=api_schema,
+                resource=resource,
+                warnings=filter_warnings  # v0.3.37: Pass warnings through
+            )
+
         except Exception as e:
             return APIError(f"API matching failed: {str(e)}")
+
+    def build_query_params(
+        self,
+        endpoint_data: Dict[str, Any],
+        parsed: Dict[str, Any],
+        schema: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """
+        Build server-side filter query parameters from parsed filters.
+
+        Maps parsed filter names to actual API query parameter names,
+        validates values against schema constraints, and applies synonyms.
+
+        Args:
+            endpoint_data: Matched endpoint definition
+            parsed: Parsed query with filters
+            schema: Full API schema
+
+        Returns:
+            Dict of query parameters to send to the API
+        """
+        params = {}
+        filters = parsed.get('filters', {})
+        resource = parsed.get('resource', '')
+        resource_hints = schema.get('resource_hints', {}).get(resource, {})
+
+        # Get endpoint's supported query params
+        query_params = self._get_query_params(endpoint_data)
+        available_params = set(query_params.keys())
+
+        # 1. Handle search/q parameter
+        search_term = parsed.get('search_term') or parsed.get('q')
+        if search_term:
+            if 'search' in available_params:
+                params['search'] = search_term
+            elif 'q' in available_params:
+                params['q'] = search_term
+
+        # 2. Map each filter to best matching API param
+        for field, filter_val in filters.items():
+            # Extract value and operator
+            if isinstance(filter_val, dict):
+                value = filter_val.get('value')
+                operator = filter_val.get('operator', 'equals')
+            else:
+                value = filter_val
+                operator = 'equals'
+
+            # Validate and transform value using schema constraints
+            validated = self._validate_filter_values(
+                {field: {'operator': operator, 'value': value}},
+                resource,
+                resource_hints
+            )
+            if validated.get('filters', {}).get(field):
+                value = validated['filters'][field]['value']
+
+            # Map to actual query param name
+            param_name = self._find_best_param_match(field, available_params)
+            if param_name:
+                params[param_name] = value
+            else:
+                # Use field name as-is if no match found
+                params[field] = value
+
+        # 3. Handle field selection (if API supports it)
+        requested_fields = parsed.get('fields', [])
+        if requested_fields and 'fields' in available_params:
+            params['fields'] = ','.join(requested_fields)
+
+        # 4. Handle sorting
+        sort = parsed.get('sort')
+        if sort:
+            if 'ordering' in available_params:
+                params['ordering'] = sort
+            elif 'sort' in available_params:
+                params['sort'] = sort
+            elif 'order_by' in available_params:
+                params['order_by'] = sort
+
+        # 5. Handle limit (don't add arbitrary limits - only if user specified)
+        limit = parsed.get('limit')
+        if limit:
+            for limit_param in constants.LIMIT_PARAM_NAMES:
+                if limit_param in available_params:
+                    params[limit_param] = limit
+                    break
+
+        return params
+
+    def _find_best_param_match(
+        self,
+        field: str,
+        available_params: set
+    ) -> Optional[str]:
+        """
+        Find the best matching API parameter for a filter field.
+
+        Tries multiple patterns:
+        1. Exact match
+        2. Django-style lookups (field__name, field__id, etc.)
+        3. Case-insensitive match
+
+        Args:
+            field: Filter field name
+            available_params: Set of available query parameter names
+
+        Returns:
+            Best matching parameter name or None
+        """
+        # 1. Exact match
+        if field in available_params:
+            return field
+
+        # 2. Try Django-style lookups
+        for suffix in constants.DJANGO_LOOKUP_SUFFIXES:
+            pattern = f"{field}{suffix}"
+            if pattern in available_params:
+                return pattern
+
+        # 3. Try without suffix if field has one
+        if '__' in field:
+            base_field = field.split('__')[0]
+            if base_field in available_params:
+                return base_field
+            # Try with different suffixes
+            for suffix in constants.DJANGO_LOOKUP_SUFFIXES:
+                pattern = f"{base_field}{suffix}"
+                if pattern in available_params:
+                    return pattern
+
+        # 4. Case-insensitive match
+        field_lower = field.lower()
+        for param in available_params:
+            if param.lower() == field_lower:
+                return param
+
+        return None
 
     def _is_match(self, endpoint_data, intent):
         """
@@ -329,7 +491,11 @@ class APIMatcher:
     def _validate_filter_values(self, filters: dict, resource: str, resource_hints: dict) -> dict:
         """
         Validate filter values against schema-defined allowed values.
-        Apply synonyms if needed.
+        Apply synonyms if needed, including semantic filter mappings.
+
+        Supports semantic filter mappings like:
+            "low stock" -> "current_quantity__lt=10"
+        Which transforms the filter from {stock_level: "low"} to {current_quantity: {operator: "lt", value: 10}}
 
         Args:
             filters: Dict of field -> filter_val (may be {"operator": ..., "value": ...} or raw value)
@@ -353,13 +519,50 @@ class APIMatcher:
                 synonyms = field_hints.get("synonyms", {})
 
                 # Check synonyms first (case-insensitive)
+                # v0.3.38: Support semantic filter mappings like "low" -> "current_quantity__lt=10"
                 if isinstance(synonyms, dict):
                     value_lower = str(value).lower()
                     for syn_key, syn_val in synonyms.items():
                         if value_lower == str(syn_key).lower():
-                            self.logger.debug(f"Applied synonym: {value} -> {syn_val}")
-                            value = syn_val
+                            self.logger.debug(f"Found synonym mapping: {value} -> {syn_val}")
+
+                            # v0.3.38: Check if this is a semantic filter mapping (field__operator=value)
+                            if isinstance(syn_val, str) and '=' in syn_val and '__' in syn_val.split('=')[0]:
+                                # Parse semantic filter: "current_quantity__lt=10"
+                                new_field_op, new_value = syn_val.split('=', 1)
+                                parts = new_field_op.rsplit('__', 1)
+                                if len(parts) == 2:
+                                    new_field, new_operator = parts
+                                    # Try to convert numeric values
+                                    try:
+                                        new_value = int(new_value)
+                                    except ValueError:
+                                        try:
+                                            new_value = float(new_value)
+                                        except ValueError:
+                                            pass  # Keep as string
+
+                                    self.logger.info(
+                                        f"Applied semantic filter: {field}={value} -> "
+                                        f"{new_field} {new_operator} {new_value}"
+                                    )
+                                    # Replace the field entirely with the new semantic filter
+                                    validated[new_field] = {"operator": new_operator, "value": new_value}
+                                    # Skip adding the original field
+                                    break
+                            else:
+                                # Simple value synonym
+                                value = syn_val
                             break
+                    else:
+                        # No synonym matched, continue with validation
+                        pass
+
+                    # If we applied a semantic filter mapping, skip to next filter
+                    if field not in [f for f in filters.keys()] or any(
+                        k != field and k in validated for k in validated.keys()
+                    ):
+                        continue
 
                 # Validate against allowed values (case-insensitive check for strings)
                 if allowed_values:
@@ -485,34 +688,113 @@ class APIMatcher:
         else:
             return f"Please provide the {field_name.replace('_', ' ')}."
     
-    def _build_api_request(self, endpoint_data, entities):
+    def _check_unmatched_filters(
+        self,
+        filters: Dict[str, Any],
+        endpoint_data: Dict[str, Any],
+        resource: str
+    ) -> List[str]:
         """
-        Build APIRequest from matched endpoint and extracted entities.
-        
+        Check if any filters don't match available endpoint parameters (v0.3.37).
+
+        This helps users understand when their filter won't be applied.
+
+        Args:
+            filters: Parsed filters
+            endpoint_data: Matched endpoint definition
+            resource: Resource name
+
+        Returns:
+            List of warning messages for unmatched filters
+        """
+        warnings = []
+
+        # Get available query parameters from endpoint
+        available_params = set()
+        params_def = endpoint_data.get('parameters', {})
+        query_params = params_def.get('query', []) if isinstance(params_def, dict) else []
+
+        for param in query_params:
+            if isinstance(param, dict):
+                name = param.get('name', '')
+                if name:
+                    available_params.add(name)
+                    # Also add base name for Django lookups
+                    base = name.split('__')[0]
+                    available_params.add(base)
+            elif isinstance(param, str):
+                available_params.add(param)
+                available_params.add(param.split('__')[0])
+
+        # Check each filter
+        for field in filters.keys():
+            base_field = field.split('__')[0]
+            # Check if filter matches any available param
+            if field not in available_params and base_field not in available_params:
+                # Check if any available param starts with this field
+                has_match = any(
+                    p.startswith(base_field + '__') or p == base_field
+                    for p in available_params
+                )
+                if not has_match and available_params:
+                    # Generate helpful warning
+                    sample_params = sorted(list(available_params))[:5]
+                    warnings.append(
+                        f"Filter '{field}' may not be available for {resource}. "
+                        f"Results may not be filtered. Available filters include: {', '.join(sample_params)}"
+                    )
+                    self.logger.warning(f"Unmatched filter '{field}' for {resource}")
+
+        return warnings
+
+    def _build_api_request(
+        self,
+        endpoint_data: Dict[str, Any],
+        entities: Dict[str, Any],
+        filters: Optional[Dict[str, Any]] = None,
+        schema: Optional[Dict[str, Any]] = None,
+        resource: Optional[str] = None,
+        warnings: Optional[List[str]] = None  # v0.3.37: Filter warnings
+    ) -> APIRequest:
+        """
+        Build APIRequest from matched endpoint and extracted entities/filters.
+
         Args:
             endpoint_data: Matched endpoint definition
             entities: Extracted entities from user input
-            
+            filters: Validated filters (optional, for server-side filtering)
+            schema: Full API schema (optional, for build_query_params)
+            resource: Resource name (optional, for context)
+            warnings: Filter validation warnings to include in request (v0.3.37)
+
         Returns:
-            APIRequest: Constructed API request
+            APIRequest: Constructed API request with warnings
         """
         method = endpoint_data.get('method', 'GET')
         path = endpoint_data.get('path', '')
-        
+
         # Replace path parameters with actual values from entities
         path_params = self._get_path_params(endpoint_data)
         for param_name in path_params.keys():
             if param_name in entities:
                 path = path.replace(f'{{{param_name}}}', str(entities[param_name]))
-        
+
         # Build query parameters or request body
         params = {}
-        
+
         if method in ['GET', 'DELETE']:
-            # For GET/DELETE, use query_parameters (or parameters.query from converter)
+            # For GET/DELETE, use build_query_params for server-side filtering
+            if filters and schema:
+                parsed_for_params = {
+                    'filters': filters,
+                    'resource': resource or '',
+                }
+                params = self.build_query_params(endpoint_data, parsed_for_params, schema)
+
+            # Also add any direct entity matches to query params
             query_params = self._get_query_params(endpoint_data)
             for param_name in query_params.keys():
-                if param_name in entities:
+                if param_name in entities and param_name not in params:
                     params[param_name] = entities[param_name]
         else:
             # For POST/PUT/PATCH, use request_body
@@ -524,10 +806,11 @@ class APIMatcher:
             else:
                 # If request_body is a string description, use all entities
                 params = entities.copy()
-        
+
         return APIRequest(
             endpoint=path,
             params=params,
             method=method,
-            authentication_required=endpoint_data.get('authentication_required', True)
+            authentication_required=endpoint_data.get('authentication_required', True),
+            warnings=warnings or []  # v0.3.37: Include filter warnings
         )

@@ -45,10 +45,10 @@ Usage:
     )
     # Result will filter by technician=123 automatically
 
-Version: 0.3.32
+Version: 0.3.40
 """
 
-__version__ = "0.3.32"
+__version__ = "0.3.40"
 
 from .query_parser import QueryParser
 from .api_matcher import APIMatcher
@@ -59,8 +59,18 @@ from .schema_loader import SchemaLoader, load_schema
 from .schema_validator import SchemaValidator, validate_schema
 from .response_formatter import ResponseFormatter
 from .progress_tracker import ProgressTracker, ProgressStage, ProgressUpdate
-from .types import APIRequest, APIResponse, APIError, MissingInformation
+from .types import (
+    APIRequest, APIResponse, APIError, MissingInformation,
+    FilterFieldInfo, ValidationResult, ClassificationResult, CorrectionRecord
+)
 from . import constants
+
+# New modules (v0.3.33)
+from .schema_introspector import SchemaIntrospector
+from .intent_classifier import IntentClassifier
+from .correction_store import CorrectionStore, InMemoryCorrectionStore
+from .conversation_loop import ConversationLoop
+from .response_builder import ResponseBuilder, create_response_builder
 
 # Conversation stores (v0.3.13)
 from .conversation_store import (
@@ -73,8 +83,8 @@ from .conversation_store import (
 __all__ = [
     'APIOrchestrator',
     'QueryParser',
-    'APIMatcher', 
-    'APIClient', 
+    'APIMatcher',
+    'APIClient',
     'ExecutionPlanner',
     'SchemaLoader',
     'load_schema',
@@ -85,11 +95,24 @@ __all__ = [
     'ProgressStage',
     'ProgressUpdate',
     'process_query',
-    'APIRequest', 
-    'APIResponse', 
-    'APIError', 
+    'APIRequest',
+    'APIResponse',
+    'APIError',
     'MissingInformation',
     'constants',
+    # New types (v0.3.33)
+    'FilterFieldInfo',
+    'ValidationResult',
+    'ClassificationResult',
+    'CorrectionRecord',
+    # New modules (v0.3.33)
+    'SchemaIntrospector',
+    'IntentClassifier',
+    'CorrectionStore',
+    'InMemoryCorrectionStore',
+    'ConversationLoop',
+    'ResponseBuilder',
+    'create_response_builder',
     # Conversation stores (v0.3.13)
     'ConversationStore',
     'DjangoConversationStore',

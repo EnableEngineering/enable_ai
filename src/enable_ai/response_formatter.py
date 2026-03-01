@@ -114,12 +114,20 @@ class ResponseFormatter:
             query[: constants.QUERY_PREVIEW_LENGTH],
         )
 
+        # Extract pagination info before normalizing
+        pagination = self._extract_pagination(data)
+
+        # Check for empty results
+        if self._is_empty_result(data):
+            return self._format_empty_response(query, context)
+
         if not data:
             return {
                 "format": "text",
                 "summary": constants.FORMAT_NO_DATA_RETURNED,
                 "formatted": constants.FORMAT_NO_DATA_RETURNED,
-                "raw_data": data
+                "raw_data": data,
+                "pagination": pagination
             }
 
         # Normalize data for formatting
@@ -133,16 +141,30 @@ class ResponseFormatter:
 
         # For simple/small data, just provide text
         if self._is_simple_data(format_data):
-            return self._format_simple(format_data, query)
+            result = self._format_simple(format_data, query)
+            result["pagination"] = pagination
+            return result
 
         # Use intelligent LLM-driven formatting for all complex data
-        return self._generate_intelligent_response(format_data, query, context)
+        result = self._generate_intelligent_response(format_data, query, context, pagination)
+
+        # Append pagination info to summary
+        if pagination.get("has_more") or pagination.get("total", 0) > pagination.get("returned", 0):
+            result["summary"] = self._append_pagination_info(
+                result.get("summary", ""),
+                pagination,
+                context
+            )
+
+        result["pagination"] = pagination
+        return result
 
     def _generate_intelligent_response(
         self,
         data: Any,
         query: str,
-        context: Optional[Dict[str, Any]] = None
+        context: Optional[Dict[str, Any]] = None,
+        pagination: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """
         Generate an intelligent response using a single LLM call.
@@ -156,26 +178,54 @@ class ResponseFormatter:
             data: The data to format
             query: User's original query
             context: Optional context (resource name, schema, etc.)
+            pagination: Optional pagination info from API response
 
         Returns:
             Dict with format, summary, formatted, and raw_data
         """
-        # Prepare data sample for LLM (limit size for token efficiency)
+        # BUG FIX (v0.3.36): Show ALL data to LLM for small datasets
+        # Previously only showed 10 items, causing "1 of 3 users" summaries
         if isinstance(data, list):
             data_count = len(data)
-            # Show more items for smaller lists, fewer for larger
-            sample_size = min(data_count, 10)
-            data_sample = data[:sample_size]
-            data_preview = json.dumps(data_sample, indent=2, default=str)[:3000]
+            # For small datasets (<=25 items), show ALL data to LLM
+            # For larger datasets, show a representative sample
+            if data_count <= 25:
+                sample_size = data_count  # Show ALL items
+                data_sample = data
+                # Allow larger preview for small datasets (8KB)
+                data_preview = json.dumps(data_sample, indent=2, default=str)[:8000]
+            else:
+                # For large datasets, show first 15 + mention total
+                sample_size = min(data_count, 15)
+                data_sample = data[:sample_size]
+                data_preview = json.dumps(data_sample, indent=2, default=str)[:5000]
             remaining = data_count - sample_size
         else:
             data_count = 1
-            data_preview = json.dumps(data, indent=2, default=str)[:3000]
+            data_preview = json.dumps(data, indent=2, default=str)[:5000]
             remaining = 0
+
+        # Build pagination context for LLM
+        pagination_info = ""
+        if pagination:
+            total = pagination.get("total", data_count)
+            returned = pagination.get("returned", data_count)
+            has_more = pagination.get("has_more", False)
+            if total > 0 or has_more:
+                pagination_info = f"""
+PAGINATION INFO:
+- Total items available: {total}
+- Items shown in this response: {returned}
+- Has more pages: {has_more}
+
+IMPORTANT: Include the total count in your response. If there are more items available,
+mention that the user can say "show more" or "next page" to see additional results.
+"""
 
         # Build the prompt
         prompt = f"""You are a helpful AI assistant. The user asked a question and I retrieved data from an API.
 Generate a natural, helpful response that answers the user's question.
+{pagination_info}
 
 USER'S QUESTION: "{query}"
 
@@ -183,43 +233,49 @@ DATA RETRIEVED ({data_count} item{"s" if data_count != 1 else ""} total):
 {data_preview}
 {"[... and " + str(remaining) + " more items not shown]" if remaining > 0 else ""}
 
-INSTRUCTIONS:
-1. **Understand what the user wants**: Are they asking for a count? A list? Details? Specific information?
+CRITICAL INSTRUCTIONS:
+1. **USE ALL THE DATA**: You MUST include ALL {data_count} items in your response, not just a subset.
+   - If there are 3 users, list ALL 3 users
+   - If there are 5 orders, show ALL 5 orders
+   - NEVER say "Found X items" without listing them ALL (unless there are more than 15)
 
-2. **Choose the best response format**:
+2. **Understand what the user wants**: Are they asking for a count? A list? Details? Specific information?
+
+3. **Choose the best response format**:
    - **Text response**: For counts, summaries, single items, or when natural language is clearest
-   - **Bullet list**: For 2-7 items where the user wants to see them
-   - **Markdown table**: For 5+ items with multiple fields worth comparing
+   - **Bullet list**: For 2-10 items where the user wants to see them (SHOW ALL)
+   - **Markdown table**: For 5+ items with multiple fields worth comparing (SHOW ALL)
    - **Detailed breakdown**: For complex single items or when user asks for details
 
-3. **Be specific and helpful**:
-   - Include actual names, IDs, or identifiers from the data - don't just say "Found X items"
-   - If showing a list, show the actual items (names, key details)
-   - If it's a count question, give the count AND mention what they are
-   - If there are many items, show the first few with key details
+4. **Be specific and helpful**:
+   - Include actual names, IDs, or identifiers from the data for EVERY item
+   - If showing a list, show ALL the actual items (names, key details) - do not truncate
+   - If it's a count question, give the count AND list what they are
+   - Only truncate if there are more than 15 items
 
-4. **Response format**:
+5. **Response format**:
    Return a JSON object with exactly these fields:
    {{
      "format": "text" | "table" | "bullets" | "detailed",
-     "response": "Your complete response to show the user"
+     "response": "Your complete response showing ALL items"
    }}
 
 EXAMPLES:
 
+User: "List all users"
+Data: [{{"username": "john@example.com", "role": "Admin"}}, {{"username": "jane@example.com", "role": "User"}}, {{"username": "bob@example.com", "role": "Manager"}}]
+Response: {{"format": "bullets", "response": "Here are all 3 users:\\n\\n• **john@example.com** - Admin\\n• **jane@example.com** - User\\n• **bob@example.com** - Manager"}}
+
 User: "Show me the service orders assigned to me"
-Data: [{{order_number: "SO-001", status: "New", customer: "ABC Corp"}}, ...]
-Response: {{"format": "bullets", "response": "You have 9 service orders assigned to you:\\n\\n• **SO-001** - ABC Corp (New)\\n• **SO-002** - XYZ Inc (In Progress)\\n• **SO-003** - Tech Solutions (New)\\n..."}}
+Data: [{{order_number: "SO-001", status: "New", customer: "ABC Corp"}}, {{order_number: "SO-002", status: "In Progress", customer: "XYZ Inc"}}]
+Response: {{"format": "bullets", "response": "You have 2 service orders assigned to you:\\n\\n• **SO-001** - ABC Corp (New)\\n• **SO-002** - XYZ Inc (In Progress)"}}
 
 User: "How many items are low stock?"
 Data: [{{"name": "Widget A"}}, {{"name": "Widget B"}}]
 Response: {{"format": "text", "response": "There are 2 items with low stock: Widget A and Widget B."}}
 
-User: "Which are those?" (follow-up to previous results)
-Data: [list of items from previous query]
-Response: {{"format": "bullets", "response": "Here are the items:\\n\\n• Item 1 - details\\n• Item 2 - details\\n..."}}
-
 Now generate your response for the user's question. Return ONLY the JSON object, no markdown code blocks.
+REMEMBER: Include ALL {data_count} items in your response!
 """
 
         try:
@@ -945,3 +1001,213 @@ Summarize accurately from the data above only.
             else:
                 return None
         return value
+
+    # =========================================================================
+    # PAGINATION AND EMPTY RESPONSE HANDLING
+    # =========================================================================
+
+    def _extract_pagination(self, data: Any) -> Dict[str, Any]:
+        """
+        Extract pagination info from API response.
+
+        Supports common pagination formats:
+        - DRF: {count, next, previous, results}
+        - Simple: {total, items}
+        - Plain list
+
+        Args:
+            data: Raw API response
+
+        Returns:
+            Dict with total, returned, has_more, next_url
+        """
+        if not data:
+            return {"total": 0, "returned": 0, "has_more": False}
+
+        # DRF pagination format
+        if isinstance(data, dict):
+            if "results" in data and "count" in data:
+                results = data.get("results", [])
+                return {
+                    "total": data.get("count", 0),
+                    "returned": len(results) if isinstance(results, list) else 1,
+                    "has_more": data.get("next") is not None,
+                    "next_url": data.get("next"),
+                    "previous_url": data.get("previous"),
+                }
+
+            # Simple total/items format
+            if "total" in data and ("items" in data or "data" in data):
+                items = data.get("items") or data.get("data", [])
+                return {
+                    "total": data.get("total", 0),
+                    "returned": len(items) if isinstance(items, list) else 1,
+                    "has_more": len(items) < data.get("total", 0) if isinstance(items, list) else False,
+                }
+
+            # Single object
+            return {"total": 1, "returned": 1, "has_more": False}
+
+        # Plain list response
+        if isinstance(data, list):
+            return {
+                "total": len(data),
+                "returned": len(data),
+                "has_more": False
+            }
+
+        return {"total": 1, "returned": 1, "has_more": False}
+
+    def _is_empty_result(self, data: Any) -> bool:
+        """
+        Check if the API response is empty.
+
+        Args:
+            data: API response data
+
+        Returns:
+            True if empty, False otherwise
+        """
+        if data is None:
+            return True
+
+        if isinstance(data, list) and len(data) == 0:
+            return True
+
+        if isinstance(data, dict):
+            # DRF pagination: check results
+            if "results" in data and isinstance(data["results"], list):
+                return len(data["results"]) == 0
+
+            # Check for empty items/data
+            if "items" in data and isinstance(data["items"], list):
+                return len(data["items"]) == 0
+            if "data" in data and isinstance(data["data"], list):
+                return len(data["data"]) == 0
+
+            # Empty dict counts as empty
+            if len(data) == 0:
+                return True
+
+        return False
+
+    def _format_empty_response(
+        self,
+        query: str,
+        context: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        """
+        Generate helpful message when query returns no results.
+
+        Provides:
+        - Clear acknowledgment that no results found
+        - List of filters that were applied
+        - Suggestions for broadening the search
+        - Valid filter values (if schema hints available)
+
+        Args:
+            query: Original user query
+            context: Context with resource, filters, schema
+
+        Returns:
+            Formatted response dict
+        """
+        context = context or {}
+        resource = context.get("resource", "items")
+        filters = context.get("filters", {})
+        schema = context.get("schema", {})
+        resource_hints = schema.get("resource_hints", {}).get(resource, {}) if schema else {}
+
+        # Build the message
+        message = constants.EMPTY_RESPONSE_MESSAGE.format(resource=resource)
+
+        # Show filters that were applied
+        if filters:
+            message += f"\n\n{constants.EMPTY_RESPONSE_FILTERS_APPLIED}"
+            for field, val in filters.items():
+                if isinstance(val, dict):
+                    value = val.get("value", val)
+                else:
+                    value = val
+                message += f"\n  • {field}: {value}"
+
+        message += f"\n\n💡 **Suggestions:**"
+        message += f"\n  • {constants.EMPTY_RESPONSE_SUGGESTION}"
+
+        if filters:
+            message += f"\n  • Remove filters: \"Show all {resource}\""
+
+        # Show valid filter values from resource_hints
+        if resource_hints and filters:
+            for field, val in filters.items():
+                if isinstance(val, dict):
+                    value = val.get("value", val)
+                else:
+                    value = val
+
+                field_hints = resource_hints.get(field, {})
+                if isinstance(field_hints, dict):
+                    valid_values = field_hints.get("values", [])
+                    if valid_values:
+                        display_values = valid_values[:5]
+                        values_str = ", ".join(str(v) for v in display_values)
+                        if len(valid_values) > 5:
+                            values_str += f" (+{len(valid_values) - 5} more)"
+                        message += f"\n  • {constants.EMPTY_RESPONSE_VALID_VALUES_HINT.format(field=field, values=values_str)}"
+
+        if not filters:
+            message += f"\n\n💡 This {resource} collection may be empty, or you may not have access."
+            message += f"\n  • Check with your administrator if you expect to see data here."
+
+        return {
+            "format": "text",
+            "summary": message,
+            "formatted": message,
+            "raw_data": [],
+            "pagination": {"total": 0, "returned": 0, "has_more": False}
+        }
+
+    def _append_pagination_info(
+        self,
+        summary: str,
+        pagination: Dict[str, Any],
+        context: Optional[Dict[str, Any]] = None
+    ) -> str:
+        """
+        Append pagination info to the response summary.
+
+        ALWAYS informs the user when there's more data available.
+
+        Args:
+            summary: Current summary text
+            pagination: Pagination info dict
+            context: Context with resource name
+
+        Returns:
+            Summary with pagination info appended
+        """
+        total = pagination.get("total", 0)
+        returned = pagination.get("returned", 0)
+        has_more = pagination.get("has_more", False)
+
+        # All data shown
+        if not has_more and returned == total:
+            if total > 0:
+                summary += f"\n\n✅ Showing all {total} result(s)."
+            return summary
+
+        # More data available - ALWAYS inform user
+        if has_more or returned < total:
+            remaining = total - returned
+            resource = context.get("resource", "items") if context else "items"
+
+            summary += f"\n\n📊 **{constants.PAGINATION_INFO_TEMPLATE.format(shown=returned, total=total, resource=resource)}**"
+            summary += f"\n\n💡 **To see more:**"
+            summary += f"\n  • \"Show me next {min(remaining, 20) if remaining > 0 else 20}\" - see more results"
+            summary += f"\n  • \"Show all {resource}\" - see complete list"
+            summary += f"\n  • Add filters to narrow down: \"Show only active ones\""
+
+            if total > 100:
+                summary += f"\n  • Consider exporting for {total}+ records"
+
+        return summary
