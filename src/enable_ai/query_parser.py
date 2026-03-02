@@ -486,14 +486,32 @@ Return ONLY the JSON object, no explanations or markdown.
         if resource_hints:
             hints_section = "\nALLOWED VALUES AND SYNONYMS (use these exact values in filters; map user words via synonyms):\n"
             hints_section += json.dumps(resource_hints, indent=2)
-            hints_section += (
-                "\n\nWhen the user says e.g. \"pending\" or \"quoted\", use the synonym or value above. "
-                "For \"pending\" you may need to use multiple values (e.g. status__name__in or one canonical "
-                "\"pending\" value per your API). Prefer the exact strings listed in \"values\" or given by \"synonyms\".\n"
-                "\nSome resources may also define \"__resource_synonyms__\". When the user uses those nouns "
-                "(for example, \"equipment\", \"equipments\", \"consumables\", \"materials\"), choose the "
-                "corresponding resource instead of another with a similar shape.\n"
-            )
+            hints_section += """
+
+CRITICAL - SEMANTIC PHRASE MAPPING (v0.3.42):
+When the user uses descriptive phrases, map them to the corresponding filter field and value:
+
+1. RESOURCE SYNONYMS (__resource_synonyms__):
+   - "items", "supplies", "materials" → resource: "consumables"
+   - "company", "customer", "client" → resource: "companies"
+   - "flash report", "flash" → resource: "flash-reports"
+   - Use the resource name that has these words in its __resource_synonyms__ list
+
+2. SEMANTIC FILTER PHRASES:
+   Look for field "synonyms" in the hints above. When user says a synonym KEY, use that field with the KEY as value:
+   - "low in stock", "low stock", "running low" → filters: {stock_level: {operator: "equals", value: "low"}}
+   - "out of stock", "empty" → filters: {stock_level: {operator: "equals", value: "out of stock"}}
+   - The backend will translate "low" to the actual API filter (e.g., current_quantity__lt=10)
+
+3. EXAMPLES:
+   - "show me items low in stock" → resource: "consumables", filters: {stock_level: "low in stock"}
+   - "list low stock consumables" → resource: "consumables", filters: {stock_level: "low stock"}
+   - "show companies" → resource: "companies"
+   - "list flash reports" → resource: "flash-reports"
+
+When the user says e.g. "pending" or "quoted", use the synonym or value above.
+Prefer the exact strings listed in "values" or given by "synonyms".
+"""
 
         # v0.3.29: User context section for pronoun resolution
         user_context_section = ""

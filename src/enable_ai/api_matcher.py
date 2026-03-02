@@ -55,6 +55,10 @@ class APIMatcher:
             # v0.3.41: Use resource_hints to resolve resource name via synonyms
             # This handles cases where parser returns "company" but schema has "companies"
             # or parser returns "flash report" but schema has "flash-reports"
+            self.logger.info(
+                f"v0.3.42 debug: resource='{resource}', resource_hints={bool(resource_hints)}, "
+                f"hints_count={len(resource_hints) if resource_hints else 0}"
+            )
             if resource and resource_hints:
                 parsed_res_l = resource.lower().replace('-', ' ').replace('_', ' ')
                 original_tokens = set(
@@ -166,6 +170,12 @@ class APIMatcher:
                     )
                     resource = best_child
             
+            # v0.3.42: Log resource matching for debugging
+            self.logger.info(
+                f"Looking for resource '{resource}' in schema with {len(resources)} resources. "
+                f"resource_hints available: {bool(resource_hints)}, hint_keys: {list(resource_hints.keys())[:5]}"
+            )
+
             # Search through all resources and endpoints
             # When a resource has multiple read endpoints (e.g. service-orders list vs
             # service-orders/customer-workflow-configs), prefer the one whose path is
@@ -176,6 +186,8 @@ class APIMatcher:
                 rn = (resource_name or '').lower().replace('-', '_')
                 rr = (resource or '').lower().replace('-', '_')
                 if resource and rn != rr:
+                    # v0.3.42: Log skipped resources for debugging
+                    self.logger.debug(f"Skipping resource '{resource_name}' (rn={rn}, rr={rr})")
                     continue
 
                 endpoints = resource_data.get('endpoints', [])
@@ -314,6 +326,12 @@ class APIMatcher:
                     matched_resource_name, matched_endpoint = candidates[0]
 
             if not matched_endpoint:
+                # v0.3.42: Log available resources for debugging
+                available_resources = list(resources.keys())
+                self.logger.warning(
+                    f"No endpoint found for resource='{resource}', intent='{intent}'. "
+                    f"Available resources: {available_resources[:10]}"
+                )
                 return APIError(constants.ERROR_NO_MATCHING_API.format(intent=intent, resource=resource))
             
             # Validate if all required information is present

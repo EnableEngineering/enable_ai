@@ -45,10 +45,10 @@ Usage:
     )
     # Result will filter by technician=123 automatically
 
-Version: 0.3.41
+Version: 0.3.42
 """
 
-__version__ = "0.3.41"
+__version__ = "0.3.42"
 
 from .query_parser import QueryParser
 from .api_matcher import APIMatcher
