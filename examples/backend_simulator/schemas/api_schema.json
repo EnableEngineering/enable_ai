@@ -165,20 +165,26 @@
       }
     },
     "consumables": {
-      "__resource_synonyms__": ["consumable", "consumables", "inventory", "stock", "items", "materials", "supplies"],
+      "__resource_synonyms__": ["consumable", "consumables", "inventory", "stock", "items", "materials", "supplies", "parts"],
       "stock_level": {
         "values": ["low", "normal", "high"],
         "synonyms": {
           "low stock": "low",
+          "low in stock": "low",
+          "low on stock": "low",
+          "running low": "low",
           "low": "low",
           "refill": "low",
           "reorder": "low",
           "needs refill": "low",
-          "running low": "low",
+          "out of stock": "low",
+          "empty": "low",
           "normal": "normal",
           "ok": "normal",
+          "in stock": "normal",
           "high": "high",
-          "overstocked": "high"
+          "overstocked": "high",
+          "plenty": "high"
         }
       }
     }

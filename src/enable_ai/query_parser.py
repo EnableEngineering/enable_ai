@@ -506,16 +506,17 @@ When the user uses descriptive phrases, map them to the corresponding filter fie
 
 2. SEMANTIC FILTER PHRASES:
    Look for field "synonyms" in the hints above. When user says a synonym KEY, use that field with the KEY as value:
-   - "low in stock", "low stock", "running low" → filters: {stock_level: {operator: "equals", value: "low"}}
-   - "out of stock", "empty" → filters: {stock_level: {operator: "equals", value: "out of stock"}}
+   - "low in stock", "low stock", "running low" → filters: {"stock_level": {"operator": "equals", "value": "low"}}
+   - "out of stock", "empty" → filters: {"stock_level": {"operator": "equals", "value": "out of stock"}}
    - The backend will translate "low" to the actual API filter (e.g., current_quantity__lt=10)
 
-3. EXAMPLES:
-   - "show me items low in stock" → resource: "consumables", filters: {stock_level: "low in stock"}
-   - "list low stock consumables" → resource: "consumables", filters: {stock_level: "low stock"}
+3. EXAMPLES (Note: query may be pre-processed to "with FIELD VALUE" format):
+   - "show me consumables with stock_level low" → resource: "consumables", filters: {"stock_level": {"operator": "equals", "value": "low"}}
+   - "list items low in stock" → resource: "consumables", filters: {"stock_level": {"operator": "equals", "value": "low"}}
    - "show companies" → resource: "companies"
    - "list flash reports" → resource: "flash-reports"
 
+When you see "with FIELD VALUE" patterns, extract as: filters: {FIELD: {operator: "equals", value: VALUE}}
 When the user says e.g. "pending" or "quoted", use the synonym or value above.
 Prefer the exact strings listed in "values" or given by "synonyms".
 """
@@ -1092,20 +1093,23 @@ Return the complete parsed JSON with all filters merged and limit set when the u
                 raise ValueError("No content in LLM response")
     
     # ========================================================================
-    # SEMANTIC PHRASE PREPROCESSING (v0.3.43)
+    # SEMANTIC PHRASE PREPROCESSING (v0.3.44 - Enhanced with fuzzy matching)
     # ========================================================================
 
     def _preprocess_semantic_phrases(self, query: str, schema: Dict[str, Any]) -> str:
         """
         Pre-process query to transform semantic phrases into explicit filter syntax.
 
-        This runs BEFORE the LLM sees the query, ensuring semantic phrases like
-        "low in stock" are transformed to "stock_level low" which the LLM can parse.
+        v0.3.44 enhancements:
+        - Fuzzy matching for semantic phrases (word overlap matching)
+        - Always resolve resource synonyms (not just when semantic phrase found)
+        - Better handling of phrase variations ("low in stock" → "low stock")
 
         Examples:
             "show me items low in stock" → "show me consumables with stock_level low"
             "show low stock consumables" → "show consumables with stock_level low"
-            "list companies" → "list companies" (no change - handled by resource resolution)
+            "list items" → "list consumables"
+            "list flash reports" → "list flash-reports"
 
         Args:
             query: Original user query
@@ -1121,18 +1125,19 @@ Return the complete parsed JSON with all filters merged and limit set when the u
         query_lower = query.lower()
         transformed = query
 
-        # Build a mapping of semantic phrases to their transformations
-        # Structure: {phrase: (resource, field, value)}
+        # STEP 1: Always resolve resource synonyms first (v0.3.44 enhancement)
+        # This handles "items" → "consumables", "flash reports" → "flash-reports", etc.
+        transformed = self._resolve_resource_synonyms(transformed, resource_hints)
+
+        # STEP 2: Build semantic phrase mappings with fuzzy matching support
         semantic_mappings = []
 
         for resource_name, hints in resource_hints.items():
             if not isinstance(hints, dict):
                 continue
 
-            # Get resource synonyms for replacement
             resource_synonyms = hints.get('__resource_synonyms__', [])
 
-            # Check each field's synonyms
             for field_name, field_hints in hints.items():
                 if field_name.startswith('__') or not isinstance(field_hints, dict):
                     continue
@@ -1141,55 +1146,276 @@ Return the complete parsed JSON with all filters merged and limit set when the u
                 if not isinstance(synonyms, dict):
                     continue
 
+                # v0.3.46: Find canonical values - shortest synonym key for each mapped value
+                # This lets us use "low" instead of "current_quantity__lt=10" in preprocessing
+                canonical_values = {}
+                for syn_key, syn_val in synonyms.items():
+                    syn_val_str = str(syn_val)
+                    if syn_val_str not in canonical_values or len(syn_key) < len(canonical_values[syn_val_str]):
+                        canonical_values[syn_val_str] = str(syn_key).lower()
+
                 for phrase, mapped_value in synonyms.items():
                     phrase_lower = str(phrase).lower()
-                    # Only process multi-word semantic phrases
+                    phrase_words = set(phrase_lower.split())
+
+                    # Process multi-word phrases and significant single-word phrases
                     if ' ' in phrase_lower or len(phrase_lower) > 5:
+                        # v0.3.46: Use simple value for preprocessing, not full API translation
+                        # "low stock" → filter_value="low" (api_matcher will translate to current_quantity__lt=10)
+                        mapped_str = str(mapped_value)
+                        if '=' in mapped_str or '__' in mapped_str:
+                            # Use the canonical (shortest) key that maps to this value
+                            # e.g., "running low" → "low" (both map to current_quantity__lt=10)
+                            simple_value = canonical_values.get(mapped_str, phrase_lower.split()[0])
+                        else:
+                            simple_value = mapped_str
+
                         semantic_mappings.append({
                             'phrase': phrase_lower,
+                            'phrase_words': phrase_words,
                             'resource': resource_name,
                             'resource_synonyms': resource_synonyms,
                             'field': field_name,
-                            'value': phrase_lower.split()[0] if ' ' in phrase_lower else phrase_lower,
+                            'mapped_value': mapped_str,
+                            'filter_value': simple_value,
                         })
 
         # Sort by phrase length (longest first) to avoid partial replacements
         semantic_mappings.sort(key=lambda x: len(x['phrase']), reverse=True)
 
-        # Apply transformations
+        # STEP 3: Apply transformations with fuzzy matching (v0.3.44)
+        transformed_lower = transformed.lower()
+        query_words = set(transformed_lower.split())
+        applied_fields = set()  # Track which fields have been transformed
+
         for mapping in semantic_mappings:
             phrase = mapping['phrase']
-            if phrase in query_lower:
-                resource = mapping['resource']
-                field = mapping['field']
-                value = mapping['value']
+            phrase_words = mapping['phrase_words']
+            field = mapping['field']
 
-                # Check if query mentions a generic term that should be replaced with resource
-                generic_terms = ['items', 'item', 'things', 'stuff', 'products']
-                for term in generic_terms:
-                    if term in query_lower:
-                        # Replace generic term with specific resource
-                        transformed = re.sub(
-                            rf'\b{term}s?\b',
-                            resource,
-                            transformed,
-                            flags=re.IGNORECASE
+            # Skip if we've already applied a transformation for this field
+            if field in applied_fields:
+                continue
+
+            # Check for exact phrase match first
+            if phrase in transformed_lower:
+                transformed = self._apply_semantic_replacement(
+                    transformed, phrase, mapping, exact_match=True
+                )
+                transformed_lower = transformed.lower()
+                query_words = set(transformed_lower.split())  # Update query_words!
+                applied_fields.add(field)
+                self.logger.info(
+                    f"v0.3.44 exact match: '{phrase}' → 'with {field} {mapping['filter_value']}'"
+                )
+                continue
+
+            # v0.3.44: Fuzzy matching - check if query contains the key semantic words
+            # "low in stock" should match if "low" + "stock" are both in query
+            if len(phrase_words) >= 2:
+                # Calculate word overlap
+                overlap = phrase_words & query_words
+                overlap_ratio = len(overlap) / len(phrase_words)
+
+                # If 80%+ of phrase words are in query, consider it a match
+                # AND the words should be contextually close (within 4 words of each other)
+                if overlap_ratio >= 0.8:
+                    if self._words_are_contextually_close(transformed_lower, list(overlap)):
+                        self.logger.info(
+                            f"v0.3.44 fuzzy match: '{phrase}' matched via words {overlap} "
+                            f"(overlap={overlap_ratio:.0%})"
                         )
-                        break
+                        transformed = self._apply_semantic_replacement(
+                            transformed, None, mapping, exact_match=False,
+                            matched_words=overlap
+                        )
+                        transformed_lower = transformed.lower()
+                        query_words = set(transformed_lower.split())  # Update query_words!
+                        applied_fields.add(field)
 
-                # Replace semantic phrase with explicit filter syntax
-                # "low in stock" → "with stock_level low"
+        return transformed
+
+    def _resolve_resource_synonyms(self, query: str, resource_hints: Dict[str, Any]) -> str:
+        """
+        Resolve generic terms to specific resource names using __resource_synonyms__.
+
+        v0.3.44: This now runs unconditionally, not just when semantic phrases are found.
+
+        Examples:
+            "list items" → "list consumables"
+            "show flash reports" → "show flash-reports"
+            "list all companies" → "list all companies" (if companies is a valid resource)
+
+        Args:
+            query: User query
+            resource_hints: Schema resource hints
+
+        Returns:
+            Query with generic terms replaced by resource names
+        """
+        transformed = query
+        query_lower = query.lower()
+
+        # Common generic terms that might refer to specific resources
+        generic_terms = {
+            'items', 'item', 'things', 'thing', 'stuff', 'products', 'product',
+            'materials', 'material', 'supplies', 'supply'
+        }
+
+        # Build mapping of synonyms to resource names
+        synonym_to_resource = {}
+        for resource_name, hints in resource_hints.items():
+            if not isinstance(hints, dict):
+                continue
+            synonyms = hints.get('__resource_synonyms__', [])
+            if not isinstance(synonyms, (list, tuple)):
+                synonyms = [synonyms]
+            for syn in synonyms:
+                syn_lower = str(syn).lower()
+                synonym_to_resource[syn_lower] = resource_name
+                # Also add singular/plural variants
+                if syn_lower.endswith('s'):
+                    synonym_to_resource[syn_lower[:-1]] = resource_name
+                else:
+                    synonym_to_resource[syn_lower + 's'] = resource_name
+
+        # Replace generic terms if they match a resource synonym
+        for term in generic_terms:
+            if term in query_lower and term in synonym_to_resource:
+                resource_name = synonym_to_resource[term]
+                # Only replace if the term is a standalone word
                 transformed = re.sub(
-                    rf'\b{re.escape(phrase)}\b',
-                    f'with {field} {value}',
+                    rf'\b{term}s?\b',
+                    resource_name,
                     transformed,
                     flags=re.IGNORECASE
                 )
-
-                self.logger.debug(
-                    f"Semantic phrase transformation: '{phrase}' → '{field} {value}' "
-                    f"for resource '{resource}'"
+                self.logger.info(
+                    f"v0.3.44 resource synonym: '{term}' → '{resource_name}'"
                 )
+                break
+
+        # Also handle multi-word resource synonyms like "flash reports" → "flash-reports"
+        for syn, resource_name in sorted(synonym_to_resource.items(),
+                                         key=lambda x: len(x[0]), reverse=True):
+            if ' ' in syn and syn in query_lower:
+                transformed = re.sub(
+                    rf'\b{re.escape(syn)}\b',
+                    resource_name,
+                    transformed,
+                    flags=re.IGNORECASE
+                )
+                self.logger.info(
+                    f"v0.3.44 multi-word resource synonym: '{syn}' → '{resource_name}'"
+                )
+
+        return transformed
+
+    def _words_are_contextually_close(self, text: str, words: List[str], max_distance: int = 4) -> bool:
+        """
+        Check if words appear close to each other in the text.
+
+        This helps avoid false positives where words appear in unrelated parts of a query.
+
+        Args:
+            text: The text to check
+            words: List of words to find
+            max_distance: Maximum number of words between any two target words
+
+        Returns:
+            True if words are contextually close
+        """
+        if len(words) < 2:
+            return True
+
+        text_words = text.split()
+        word_positions = {}
+
+        for i, w in enumerate(text_words):
+            w_clean = re.sub(r'[^\w]', '', w.lower())
+            for target in words:
+                if target.lower() in w_clean or w_clean in target.lower():
+                    if target not in word_positions:
+                        word_positions[target] = []
+                    word_positions[target].append(i)
+
+        # Check if all words were found
+        if len(word_positions) < len(words):
+            return False
+
+        # Check if any combination of positions is within max_distance
+        positions = [min(pos_list) for pos_list in word_positions.values()]
+        if max(positions) - min(positions) <= max_distance + len(words) - 1:
+            return True
+
+        return False
+
+    def _apply_semantic_replacement(
+        self,
+        query: str,
+        phrase: Optional[str],
+        mapping: Dict[str, Any],
+        exact_match: bool,
+        matched_words: Optional[set] = None
+    ) -> str:
+        """
+        Apply semantic phrase replacement to query.
+
+        Args:
+            query: Current query string
+            phrase: Exact phrase to replace (if exact_match=True)
+            mapping: Semantic mapping with field and value info
+            exact_match: Whether this is an exact or fuzzy match
+            matched_words: Words that were matched (for fuzzy matching)
+
+        Returns:
+            Query with semantic phrase replaced by explicit filter syntax
+        """
+        field = mapping['field']
+        filter_value = mapping['filter_value']
+        resource = mapping['resource']
+
+        if exact_match and phrase:
+            # Direct replacement of exact phrase
+            transformed = re.sub(
+                rf'\b{re.escape(phrase)}\b',
+                f'with {field} {filter_value}',
+                query,
+                flags=re.IGNORECASE
+            )
+            self.logger.debug(
+                f"Semantic phrase (exact): '{phrase}' → 'with {field} {filter_value}' "
+                f"for resource '{resource}'"
+            )
+        else:
+            # Fuzzy match: remove matched words and add explicit filter
+            transformed = query
+            if matched_words:
+                # Remove the matched semantic words but keep the structure
+                for word in matched_words:
+                    # Don't remove if it's part of the resource name
+                    if word.lower() not in resource.lower():
+                        # Remove word but be careful about common words
+                        transformed = re.sub(
+                            rf'\b{re.escape(word)}\b\s*',
+                            '',
+                            transformed,
+                            flags=re.IGNORECASE
+                        )
+
+                # Clean up double spaces and trailing 'in', 'with', etc.
+                transformed = re.sub(r'\s+', ' ', transformed)
+                transformed = re.sub(r'\s+(in|with|and|or)\s*$', '', transformed, flags=re.IGNORECASE)
+                transformed = transformed.strip()
+
+                # Append the explicit filter
+                if f'with {field}' not in transformed.lower():
+                    transformed = f"{transformed} with {field} {filter_value}"
+
+            self.logger.debug(
+                f"Semantic phrase (fuzzy): matched words {matched_words} → "
+                f"'with {field} {filter_value}' for resource '{resource}'"
+            )
 
         return transformed
 

@@ -326,13 +326,17 @@ class APIMatcher:
                     matched_resource_name, matched_endpoint = candidates[0]
 
             if not matched_endpoint:
-                # v0.3.42: Log available resources for debugging
+                # v0.3.44: Enhanced error handling with helpful suggestions
                 available_resources = list(resources.keys())
                 self.logger.warning(
                     f"No endpoint found for resource='{resource}', intent='{intent}'. "
                     f"Available resources: {available_resources[:10]}"
                 )
-                return APIError(constants.ERROR_NO_MATCHING_API.format(intent=intent, resource=resource))
+                # Generate helpful error message with suggestions
+                error_msg = self._generate_helpful_error(
+                    resource, intent, available_resources, resource_hints
+                )
+                return APIError(error_msg)
             
             # Validate if all required information is present
             validation_result = self._validate_required_fields(matched_endpoint, entities, intent)
@@ -611,6 +615,9 @@ class APIMatcher:
             operator = filter_val.get("operator", "equals") if isinstance(filter_val, dict) else "equals"
             field_hints = hints.get(field, {}) if isinstance(hints, dict) else {}
 
+            # v0.3.47: Track whether we applied a semantic filter mapping for THIS field
+            applied_semantic_mapping = False
+
             if isinstance(field_hints, dict) and field_hints:
                 allowed_values = field_hints.get("values", [])
                 synonyms = field_hints.get("synonyms", {})
@@ -645,21 +652,17 @@ class APIMatcher:
                                     )
                                     # Replace the field entirely with the new semantic filter
                                     validated[new_field] = {"operator": new_operator, "value": new_value}
-                                    # Skip adding the original field
+                                    # v0.3.47: Mark that we applied semantic mapping
+                                    applied_semantic_mapping = True
                                     break
                             else:
                                 # Simple value synonym
                                 value = syn_val
                             break
-                    else:
-                        # No synonym matched, continue with validation
-                        pass
 
-                    # If we applied a semantic filter mapping, skip to next filter
-                    if field not in [f for f in filters.keys()] or any(
-                        k != field and k in validated for k in validated.keys()
-                    ):
-                        continue
+                # v0.3.47: If we applied a semantic filter mapping, skip adding original field
+                if applied_semantic_mapping:
+                    continue
 
                 # Validate against allowed values (case-insensitive check for strings)
                 if allowed_values:
@@ -911,3 +914,84 @@ class APIMatcher:
             authentication_required=endpoint_data.get('authentication_required', True),
             warnings=warnings or []  # v0.3.37: Include filter warnings
         )
+
+    def _generate_helpful_error(
+        self,
+        resource: str,
+        intent: str,
+        available_resources: List[str],
+        resource_hints: Dict[str, Any]
+    ) -> str:
+        """
+        Generate a helpful error message when endpoint is not found (v0.3.44).
+
+        Instead of a generic error, suggests similar resources and provides
+        examples of valid queries.
+
+        Args:
+            resource: The resource that was not found
+            intent: User's intent
+            available_resources: List of available resource names
+            resource_hints: Resource hints from schema
+
+        Returns:
+            Helpful error message string
+        """
+        resource_lower = (resource or '').lower()
+
+        # Find similar resources (substring match or Levenshtein-like)
+        similar = []
+        for r in available_resources:
+            r_lower = r.lower()
+            # Check substring match
+            if resource_lower in r_lower or r_lower in resource_lower:
+                similar.append(r)
+                continue
+            # Check word overlap
+            resource_words = set(resource_lower.replace('-', '_').replace('_', ' ').split())
+            r_words = set(r_lower.replace('-', '_').replace('_', ' ').split())
+            if resource_words & r_words:
+                similar.append(r)
+
+        # Also check resource_hints synonyms for similar resources
+        for hint_resource, hints in resource_hints.items():
+            if not isinstance(hints, dict):
+                continue
+            synonyms = hints.get('__resource_synonyms__', [])
+            if not isinstance(synonyms, (list, tuple)):
+                synonyms = [synonyms]
+            for syn in synonyms:
+                syn_lower = str(syn).lower()
+                if resource_lower in syn_lower or syn_lower in resource_lower:
+                    if hint_resource not in similar and hint_resource in available_resources:
+                        similar.append(hint_resource)
+                        break
+
+        # Build helpful message
+        msg_parts = [f"I couldn't find a '{resource}' endpoint in the API."]
+
+        if similar:
+            msg_parts.append(f"\nDid you mean: {', '.join(similar[:3])}?")
+
+        # Add examples of valid queries
+        msg_parts.append("\n\nAvailable resources you can query:")
+        for r in available_resources[:8]:
+            # Get synonyms for this resource to show example
+            hint = resource_hints.get(r, {})
+            synonyms = hint.get('__resource_synonyms__', [])
+            if synonyms and isinstance(synonyms, list):
+                example_term = synonyms[0] if synonyms else r
+            else:
+                example_term = r.replace('_', ' ').replace('-', ' ')
+            msg_parts.append(f"  • {r} - e.g., \"list {example_term}\"")
+
+        if len(available_resources) > 8:
+            msg_parts.append(f"  ...and {len(available_resources) - 8} more")
+
+        # Add tip about checking schema
+        msg_parts.append(
+            "\n\nTip: The resource may exist under a different name or "
+            "may need to be added to your API schema configuration."
+        )
+
+        return ''.join(msg_parts)
