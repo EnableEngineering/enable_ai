@@ -52,13 +52,74 @@ class APIMatcher:
                 self.logger.error(constants.ERROR_NO_RESOURCES_IN_SCHEMA)
                 return APIError(constants.ERROR_NO_RESOURCES_IN_SCHEMA)
 
-            # If the parser returned a generic/high-level resource (e.g. "inventory"),
-            # try to refine it to a more specific one using resource_hints and
-            # __resource_synonyms__ (e.g. "inventory-equipment" vs "inventory-consumables").
-            #
-            # This is fully config-driven: you control which child resources exist
-            # and which nouns map to them in config.json. We simply look for a
-            # child resource whose synonyms appear in the original input.
+            # v0.3.41: Use resource_hints to resolve resource name via synonyms
+            # This handles cases where parser returns "company" but schema has "companies"
+            # or parser returns "flash report" but schema has "flash-reports"
+            if resource and resource_hints:
+                parsed_res_l = resource.lower().replace('-', ' ').replace('_', ' ')
+                original_tokens = set(
+                    t for t in original_input.replace('/', ' ').replace('-', ' ').split() if t
+                )
+
+                # First, try to find exact match or synonym match for the parsed resource
+                best_match = None
+                best_score = 0
+
+                for rh_name, rh_data in resource_hints.items():
+                    rh_name_l = str(rh_name or "").lower()
+                    rh_name_normalized = rh_name_l.replace('-', '_')
+                    parsed_normalized = parsed_res_l.replace('-', '_').replace(' ', '_')
+
+                    # Check if this resource_hint matches the parsed resource
+                    score = 0
+
+                    # Exact match (with normalization)
+                    if rh_name_normalized == parsed_normalized:
+                        score = 100
+
+                    # Check __resource_synonyms__
+                    syns = rh_data.get("__resource_synonyms__") or []
+                    if not isinstance(syns, (list, tuple)):
+                        syns = [syns]
+
+                    for s in syns:
+                        s_norm = str(s).lower().replace('-', ' ').replace('_', ' ')
+                        if not s_norm:
+                            continue
+
+                        # Build variants (singular/plural)
+                        variants = {s_norm, s_norm.replace(' ', '_'), s_norm.replace(' ', '-')}
+                        if s_norm.endswith('s'):
+                            singular = s_norm[:-1]
+                            variants.add(singular)
+                            variants.add(singular.replace(' ', '_'))
+                        else:
+                            plural = s_norm + 's'
+                            variants.add(plural)
+                            variants.add(plural.replace(' ', '_'))
+
+                        # Check if parsed resource matches any variant
+                        if parsed_res_l in variants or parsed_normalized in variants:
+                            score = max(score, 90)
+
+                        # Check if variant appears in original input
+                        if any(v in original_tokens for v in variants):
+                            score = max(score, 80)
+
+                    if score > best_score:
+                        best_score = score
+                        best_match = rh_name
+
+                # If we found a better match, use it
+                if best_match and best_score >= 80:
+                    self.logger.info(
+                        f"Resolved resource '{resource}' to '{best_match}' "
+                        f"via __resource_synonyms__ (score={best_score})"
+                    )
+                    resource = best_match
+
+            # Also handle "namespace-child" style resources
+            # (e.g. "inventory" + "equipment" in query → "inventory-equipment")
             if resource and resource_hints and resources:
                 parsed_res_l = resource.lower()
                 original_tokens = set(
@@ -337,22 +398,40 @@ class APIMatcher:
                 value = filter_val
                 operator = 'equals'
 
-            # Validate and transform value using schema constraints
-            validated = self._validate_filter_values(
-                {field: {'operator': operator, 'value': value}},
-                resource,
-                resource_hints
-            )
-            if validated.get('filters', {}).get(field):
-                value = validated['filters'][field]['value']
-
-            # Map to actual query param name
-            param_name = self._find_best_param_match(field, available_params)
-            if param_name:
-                params[param_name] = value
+            # v0.3.41: Build the full param name WITH operator for Django-style lookups
+            # e.g., {current_quantity: {operator: "lt", value: 10}} → "current_quantity__lt=10"
+            if operator and operator != 'equals':
+                # Django lookup operators: lt, lte, gt, gte, contains, icontains, in, etc.
+                full_field = f"{field}__{operator}"
             else:
-                # Use field name as-is if no match found
-                params[field] = value
+                full_field = field
+
+            # Check if the full field (with operator) exists in available params
+            if full_field in available_params:
+                params[full_field] = value
+                self.logger.debug(f"Using exact param match: {full_field}={value}")
+            else:
+                # Try to find best match for base field
+                param_name = self._find_best_param_match(field, available_params)
+                if param_name:
+                    # If operator is not 'equals', try to append it
+                    if operator and operator != 'equals':
+                        param_with_op = f"{param_name}__{operator}"
+                        if param_with_op in available_params:
+                            params[param_with_op] = value
+                        else:
+                            # Fallback: use param with operator even if not in schema
+                            # (API might support it even if not documented)
+                            params[param_with_op] = value
+                            self.logger.debug(
+                                f"Using operator param (not in schema): {param_with_op}={value}"
+                            )
+                    else:
+                        params[param_name] = value
+                else:
+                    # Use field name as-is (with operator if applicable)
+                    params[full_field] = value
+                    self.logger.debug(f"Using filter as-is: {full_field}={value}")
 
         # 3. Handle field selection (if API supports it)
         requested_fields = parsed.get('fields', [])
