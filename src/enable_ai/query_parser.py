@@ -20,6 +20,7 @@ Features:
 """
 
 import json
+import re
 from typing import Dict, Any, Optional, List
 from datetime import datetime
 
@@ -101,19 +102,25 @@ class QueryParser:
         """
         if not natural_language_input or not natural_language_input.strip():
             return APIError("Empty input provided")
-        
+
         if not schema:
             return APIError("Schema is required for LLM parsing")
-        
+
         try:
+            # v0.3.43: Pre-process query to transform semantic phrases
+            # This handles phrases like "low in stock" → "stock_level low" BEFORE the LLM
+            processed_query = self._preprocess_semantic_phrases(natural_language_input, schema)
+            if processed_query != natural_language_input:
+                self.logger.info(f"Preprocessed query: '{natural_language_input}' → '{processed_query}'")
+
             # Check cache first (only if no user_context - personalized queries shouldn't be cached)
-            cache_key = self._get_cache_key(natural_language_input, schema)
+            cache_key = self._get_cache_key(processed_query, schema)
             if cache_key in self.cache and not user_context:
-                self.logger.info(f"Using cached parse result for: '{natural_language_input[:50]}...'")
+                self.logger.info(f"Using cached parse result for: '{processed_query[:50]}...'")
                 return self.cache[cache_key]
 
             # Build prompt with schema context and user context
-            prompt = self._build_prompt(natural_language_input, schema, user_context)
+            prompt = self._build_prompt(processed_query, schema, user_context)
             
             # Build messages list with conversation history for context (Issue #2 fix)
             messages = [{"role": "system", "content": self._get_system_prompt()}]
@@ -1085,9 +1092,111 @@ Return the complete parsed JSON with all filters merged and limit set when the u
                 raise ValueError("No content in LLM response")
     
     # ========================================================================
+    # SEMANTIC PHRASE PREPROCESSING (v0.3.43)
+    # ========================================================================
+
+    def _preprocess_semantic_phrases(self, query: str, schema: Dict[str, Any]) -> str:
+        """
+        Pre-process query to transform semantic phrases into explicit filter syntax.
+
+        This runs BEFORE the LLM sees the query, ensuring semantic phrases like
+        "low in stock" are transformed to "stock_level low" which the LLM can parse.
+
+        Examples:
+            "show me items low in stock" → "show me consumables with stock_level low"
+            "show low stock consumables" → "show consumables with stock_level low"
+            "list companies" → "list companies" (no change - handled by resource resolution)
+
+        Args:
+            query: Original user query
+            schema: Schema with resource_hints
+
+        Returns:
+            Transformed query or original if no transformations needed
+        """
+        resource_hints = schema.get('resource_hints', {})
+        if not resource_hints:
+            return query
+
+        query_lower = query.lower()
+        transformed = query
+
+        # Build a mapping of semantic phrases to their transformations
+        # Structure: {phrase: (resource, field, value)}
+        semantic_mappings = []
+
+        for resource_name, hints in resource_hints.items():
+            if not isinstance(hints, dict):
+                continue
+
+            # Get resource synonyms for replacement
+            resource_synonyms = hints.get('__resource_synonyms__', [])
+
+            # Check each field's synonyms
+            for field_name, field_hints in hints.items():
+                if field_name.startswith('__') or not isinstance(field_hints, dict):
+                    continue
+
+                synonyms = field_hints.get('synonyms', {})
+                if not isinstance(synonyms, dict):
+                    continue
+
+                for phrase, mapped_value in synonyms.items():
+                    phrase_lower = str(phrase).lower()
+                    # Only process multi-word semantic phrases
+                    if ' ' in phrase_lower or len(phrase_lower) > 5:
+                        semantic_mappings.append({
+                            'phrase': phrase_lower,
+                            'resource': resource_name,
+                            'resource_synonyms': resource_synonyms,
+                            'field': field_name,
+                            'value': phrase_lower.split()[0] if ' ' in phrase_lower else phrase_lower,
+                        })
+
+        # Sort by phrase length (longest first) to avoid partial replacements
+        semantic_mappings.sort(key=lambda x: len(x['phrase']), reverse=True)
+
+        # Apply transformations
+        for mapping in semantic_mappings:
+            phrase = mapping['phrase']
+            if phrase in query_lower:
+                resource = mapping['resource']
+                field = mapping['field']
+                value = mapping['value']
+
+                # Check if query mentions a generic term that should be replaced with resource
+                generic_terms = ['items', 'item', 'things', 'stuff', 'products']
+                for term in generic_terms:
+                    if term in query_lower:
+                        # Replace generic term with specific resource
+                        transformed = re.sub(
+                            rf'\b{term}s?\b',
+                            resource,
+                            transformed,
+                            flags=re.IGNORECASE
+                        )
+                        break
+
+                # Replace semantic phrase with explicit filter syntax
+                # "low in stock" → "with stock_level low"
+                transformed = re.sub(
+                    rf'\b{re.escape(phrase)}\b',
+                    f'with {field} {value}',
+                    transformed,
+                    flags=re.IGNORECASE
+                )
+
+                self.logger.debug(
+                    f"Semantic phrase transformation: '{phrase}' → '{field} {value}' "
+                    f"for resource '{resource}'"
+                )
+
+        return transformed
+
+    # ========================================================================
     # CACHING
     # ========================================================================
-    
+
     def _get_cache_key(self, query: str, schema: Dict[str, Any]) -> str:
         """Generate cache key for query + schema combination."""
         schema_type = schema.get('type', 'unknown')
