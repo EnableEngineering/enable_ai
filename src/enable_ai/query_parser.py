@@ -21,7 +21,7 @@ Features:
 
 import json
 import re
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Union
 from datetime import datetime
 
 from .types import APIError
@@ -59,7 +59,7 @@ class QueryParser:
         schema: Optional[Dict[str, Any]] = None,
         conversation_history: Optional[list] = None,
         user_context: Optional[Dict[str, Any]] = None  # v0.3.29: User identity for pronoun resolution
-    ) -> Dict[str, Any]:
+    ) -> Union[Dict[str, Any], APIError]:
         """
         Parse natural language input using LLM with schema context and conversation history.
 
@@ -421,8 +421,8 @@ Output: {
     "question_type": "list"
 }
 
-Example 7 - User pronoun resolution ("my reports"):
-Query: "what are the observations for my last report?"
+Example 7 - "Observations for my last report" (multi-step: get last report, then its observations):
+Query: "what are the observations for my last report?" or "observations for my last report"
 USER_CONTEXT: {"user_id": 456, "username": "jane@example.com", "role": "Technician"}
 Output: {
     "intent": "read",
@@ -433,8 +433,12 @@ Output: {
     },
     "sort": {"field": "created_at", "order": "desc"},
     "limit": 1,
-    "question_type": "details"
+    "question_type": "details",
+    "relationships": [
+        {"type": "child", "target_entity": "observations", "filters": {}}
+    ]
 }
+NOTE: Populate relationships so the planner generates step 1 (get report with technician=me, limit 1, sort desc) and step 2 (get observations for that report). Use the schema's child resource name for target_entity (e.g. "observations").
 
 Example 8 - Follow-up asking for details (IMPORTANT - user wants to see the items, not just count):
 Previous conversation: User asked "Show me new service orders assigned to me" → System responded "Found 9 items"
@@ -456,7 +460,28 @@ NOTE: The user is asking to SEE the actual items - set question_type="list" and 
 
 Return ONLY the JSON object, no explanations or markdown.
 """
-    
+
+    def _get_filterable_fields_from_hints(self, resource_hints: Dict[str, Any]) -> str:
+        """
+        Build a dynamic list of resource.field that have values/synonyms in resource_hints,
+        for injection into the parser prompt so the LLM knows which fields to map from user words.
+        """
+        parts = []
+        for res_name, res_hints in (resource_hints or {}).items():
+            if not isinstance(res_hints, dict):
+                continue
+            fields = []
+            for field_name, field_hints in res_hints.items():
+                if field_name.startswith("__"):
+                    continue
+                if isinstance(field_hints, dict) and (
+                    field_hints.get("values") or field_hints.get("synonyms")
+                ):
+                    fields.append(field_name)
+            if fields:
+                parts.append(f"{res_name}: {', '.join(fields)}")
+        return "; ".join(parts) if parts else "(see hints above for each resource)"
+
     def _build_prompt(
         self,
         query: str,
@@ -493,7 +518,18 @@ Return ONLY the JSON object, no explanations or markdown.
         if resource_hints:
             hints_section = "\nALLOWED VALUES AND SYNONYMS (use these exact values in filters; map user words via synonyms):\n"
             hints_section += json.dumps(resource_hints, indent=2)
-            hints_section += """
+
+            # Build dynamic list of filterable fields (resource.field with values/synonyms)
+            filterable_list = self._get_filterable_fields_from_hints(resource_hints)
+            filterable_instruction = (
+                f"   Filterable fields (use ONLY canonical values from the hints above): {filterable_list}\n"
+                "   Set filters by mapping the user's words to the canonical value using each field's \"values\" and \"synonyms\". Do not invent values."
+            )
+            # Placeholder for literal in prompt (avoid f-string interpreting {FIELD}, {operator}, {value}, VALUE)
+            _pattern_value = "VALUE"
+            _pattern_example = f"filters: {{FIELD: {{operator: \"equals\", value: {_pattern_value}}}}}"
+
+            hints_section += f"""
 
 CRITICAL - SEMANTIC PHRASE MAPPING (v0.3.42):
 When the user uses descriptive phrases, map them to the corresponding filter field and value:
@@ -506,17 +542,24 @@ When the user uses descriptive phrases, map them to the corresponding filter fie
 
 2. SEMANTIC FILTER PHRASES:
    Look for field "synonyms" in the hints above. When user says a synonym KEY, use that field with the KEY as value:
-   - "low in stock", "low stock", "running low" → filters: {"stock_level": {"operator": "equals", "value": "low"}}
-   - "out of stock", "empty" → filters: {"stock_level": {"operator": "equals", "value": "out of stock"}}
+   - "low in stock", "low stock", "running low" → filters: {{"stock_level": {{"operator": "equals", "value": "low"}}}}
+   - "out of stock", "empty" → filters: {{"stock_level": {{"operator": "equals", "value": "out of stock"}}}}
    - The backend will translate "low" to the actual API filter (e.g., current_quantity__lt=10)
 
-3. EXAMPLES (Note: query may be pre-processed to "with FIELD VALUE" format):
-   - "show me consumables with stock_level low" → resource: "consumables", filters: {"stock_level": {"operator": "equals", "value": "low"}}
-   - "list items low in stock" → resource: "consumables", filters: {"stock_level": {"operator": "equals", "value": "low"}}
+3. FILTERABLE FIELDS (schema-driven, from hints above):
+{filterable_instruction}
+
+4. "OBSERVATIONS FOR MY LAST REPORT" (single-step):
+   When the user asks for observations/details of their last/latest report, set resource to the PARENT resource (e.g. details-reports), add filters for "me" from USER_CONTEXT (e.g. technician=user_id), sort by created_at desc, limit 1. The observations are embedded in the report response — do NOT use relationships or add a second step. Just fetch the report with the right filters and the system will display all its fields including observations.
+
+5. EXAMPLES (Note: query may be pre-processed to "with FIELD VALUE" format):
+   - "show me consumables with stock_level low" → resource: "consumables", filters: {{"stock_level": {{"operator": "equals", "value": "low"}}}}
+   - "list items low in stock" → resource: "consumables", filters: {{"stock_level": {{"operator": "equals", "value": "low"}}}}
    - "show companies" → resource: "companies"
    - "list flash reports" → resource: "flash-reports"
+   - For any resource and filterable field listed in (3) above: when the user's words match a synonym or value for that field, set the filter using the canonical value from the hints (e.g. users.role, consumables.stock_level).
 
-When you see "with FIELD VALUE" patterns, extract as: filters: {FIELD: {operator: "equals", value: VALUE}}
+When you see "with FIELD VALUE" patterns, extract as: {_pattern_example}
 When the user says e.g. "pending" or "quoted", use the synonym or value above.
 Prefer the exact strings listed in "values" or given by "synonyms".
 """
@@ -905,7 +948,7 @@ Return the parsed JSON now:
         Returns:
             Dict with previous_resource, previous_intent, previous_query, previous_filters
         """
-        context = {
+        context: Dict[str, Any] = {
             "previous_resource": None,
             "previous_intent": None,
             "previous_query": None,
@@ -967,7 +1010,7 @@ Returns: previous_resource, previous_intent, previous_query, previous_filters, a
     
     def _parse_with_context_function(
         self,
-        messages: List[Dict[str, str]],
+        messages: List[Dict[str, Any]],
         schema: Dict[str, Any],
         conversation_history: list,
         user_context: Optional[Dict[str, Any]] = None  # v0.3.29: User identity
@@ -1233,6 +1276,13 @@ Return the complete parsed JSON with all filters merged and limit set when the u
                         query_words = set(transformed_lower.split())  # Update query_words!
                         applied_fields.add(field)
 
+        # STEP 4: Generic "low stock" phrase handling (API-agnostic, but schema-aware)
+        # This specifically fixes queries like:
+        #   - "show me items low in stock"
+        #   - "show low stock consumables"
+        # for any API schema that exposes a "stock_level" field in resource_hints.
+        transformed = self._inject_low_stock_filter(transformed, resource_hints)
+
         return transformed
 
     def _resolve_resource_synonyms(self, query: str, resource_hints: Dict[str, Any]) -> str:
@@ -1310,6 +1360,54 @@ Return the complete parsed JSON with all filters merged and limit set when the u
                 )
 
         return transformed
+
+    def _inject_low_stock_filter(self, query: str, resource_hints: Dict[str, Any]) -> str:
+        """
+        Inject an explicit stock_level=low filter for "low stock" style phrases.
+
+        This is API-agnostic but only activates when:
+        - The schema's resource_hints define a "stock_level" field for at least one resource
+        - The natural language query clearly expresses "low stock" semantics
+
+        Examples it helps with (without relying on LLM to infer the field name):
+            "show me items low in stock"    → "... with stock_level low"
+            "show low stock consumables"    → "... with stock_level low"
+        """
+        if not resource_hints:
+            return query
+
+        q_lower = query.lower()
+
+        # Only act when the API actually advertises a stock_level field in hints
+        has_stock_level = False
+        for _res_name, hints in resource_hints.items():
+            if isinstance(hints, dict) and "stock_level" in hints:
+                has_stock_level = True
+                break
+
+        if not has_stock_level:
+            return query
+
+        # Detect common "low stock" phrasings
+        low_stock_patterns = [
+            r"\blow in stock\b",
+            r"\blow stock\b",
+            r"\bstock is low\b",
+            r"\brunning low\b",
+        ]
+
+        if not any(re.search(p, q_lower) for p in low_stock_patterns):
+            return query
+
+        # If the query already explicitly mentions stock_level, don't duplicate it
+        if "stock_level" in q_lower:
+            return query
+
+        # If there's already an explicit "with ..." clause, append an additional filter;
+        # otherwise, introduce a new "with stock_level low" clause.
+        if " with " in q_lower:
+            return query + " and stock_level low"
+        return query + " with stock_level low"
 
     def _words_are_contextually_close(self, text: str, words: List[str], max_distance: int = 4) -> bool:
         """

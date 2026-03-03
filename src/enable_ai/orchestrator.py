@@ -16,7 +16,7 @@ from .api_client import APIClient
 from .config_loader import get_config
 from .types import MissingInformation, APIResponse, APIError
 from .workflow import build_api_workflow
-from .utils import setup_logger
+from .utils import setup_logger, get_role_phrase_map
 from .schema_validator import SchemaValidator
 from .progress_tracker import ProgressTracker, ProgressUpdate, ProgressStage
 from . import constants
@@ -704,6 +704,14 @@ class APIOrchestrator:
             config_hints = self.config.get('data_sources', {}).get('api', {}).get('resource_hints', {})
 
             if config_hints and not schema.get('resource_hints'):
+                # Warn if any value is not a dict (e.g. query_examples placed inside resource_hints by mistake)
+                for key, val in config_hints.items():
+                    if isinstance(val, list):
+                        self.logger.warning(
+                            "resource_hints.%s is a list; expected a dict. "
+                            "If this is query_examples, move it outside resource_hints.",
+                            key,
+                        )
                 # Inject resource_hints into a copy of the schema (don't mutate original)
                 schema = {**schema, 'resource_hints': config_hints}
                 self.logger.debug(f"Injected {len(config_hints)} resource_hints from config into schema")
@@ -740,7 +748,64 @@ class APIOrchestrator:
         
         if not parsed:
             raise ValueError("Could not parse query")
-        
+
+        # v0.3.49+: Semantic safeguards applied after parsing, before planning.
+        if isinstance(parsed, dict):
+            q_lower = (query or "").lower()
+
+            # Safeguard for "low stock" semantics.
+            #
+            # The LLM + parser should infer stock_level=low from phrases like
+            # "items low in stock". In practice this can fail. As a fallback:
+            # - Detect common "low stock" phrases in the raw query
+            # - Inject {"stock_level": {"operator": "equals", "value": "low"}} if missing
+            # - resource_hints synonyms then map "low" → the concrete API param (stock_level=low)
+            low_stock_patterns = (
+                "low in stock",
+                "low stock",
+                "stock is low",
+                "running low",
+                "need to refill",
+                "need refill",
+            )
+            if any(pat in q_lower for pat in low_stock_patterns):
+                filters = parsed.get("filters") or {}
+                if "stock_level" not in filters:
+                    filters["stock_level"] = {"operator": "equals", "value": "low"}
+                    parsed["filters"] = filters
+                    self.logger.info(
+                        "Injected semantic filter from query '%s': stock_level=low",
+                        query,
+                    )
+
+            # Safeguard for role filter on users resource.
+            #
+            # When the user asks for a specific user type, the LLM may omit the role
+            # filter. If the query mentions a role phrase and resource is users, inject
+            # the role from resource_hints.role.synonyms (config-driven) or constants.ROLE_QUERY_TO_VALUE.
+            resource_lower = (
+                (parsed.get("resource") or "")
+                .lower()
+                .replace("-", "_")
+                .replace(" ", "_")
+            )
+            if resource_lower in ("users", "user"):
+                filters = parsed.get("filters") or {}
+                if not any(k in filters for k in ("role", "role__name")):
+                    schema_hints = (schema or {}).get("resource_hints") or {}
+                    role_map = get_role_phrase_map(schema_hints, resource_lower)
+                    if not role_map:
+                        role_map = list(constants.ROLE_QUERY_TO_VALUE)
+                    for phrase, role_value in role_map:
+                        if phrase in q_lower:
+                            filters["role"] = {"operator": "equals", "value": role_value}
+                            parsed["filters"] = filters
+                            self.logger.info(
+                                "Injected role filter from query '%s': role=%s",
+                                query, role_value,
+                            )
+                            break
+
         return parsed
     
     def _create_plan(self, parsed: Dict[str, Any], schema: dict) -> Optional[Dict[str, Any]]:
@@ -1630,14 +1695,15 @@ class APIOrchestrator:
         
         # String or other types
         else:
-                return constants.ORCH_OPERATION_COMPLETED
+            return constants.ORCH_OPERATION_COMPLETED
     
     def _summarize_result_v2(
         self, 
         result: Dict[str, Any], 
         query: str,
         parsed: Dict[str, Any],
-        pagination_info: Dict[str, Any]
+        pagination_info: Dict[str, Any],
+        schema: Optional[dict] = None,
     ) -> str:
         """
         Enhanced summary with accurate count handling (v0.3.11).
@@ -1667,10 +1733,16 @@ class APIOrchestrator:
         has_more = pagination_info['has_more']
         
         # Get resource name
-        resource = parsed.get('resource', 'items').replace('_', ' ')
+        raw_resource = parsed.get('resource', 'items')
+        resource = raw_resource.replace('_', ' ')
         
         # Generate accurate summary based on counts (Issue #4 fix)
         if total == 0:
+            # When filters were applied, provide a more helpful empty-result
+            # message that suggests valid values from resource_hints (if any).
+            filters = parsed.get('filters', {}) or {}
+            if filters and schema is not None:
+                return self._format_empty_result_with_hints(raw_resource, filters, schema)
             return constants.ORCH_NO_RESOURCE_FOUND.format(resource=resource)
         elif total == 1:
             # Single item
@@ -1714,6 +1786,63 @@ class APIOrchestrator:
                     base_summary += f". {constants.ORCH_EXAMPLES.format(examples=examples_str)}"
         
         return base_summary
+
+    def _format_empty_result_with_hints(
+        self,
+        resource: str,
+        filters: Dict[str, Any],
+        schema: dict,
+    ) -> str:
+        """
+        Generate a helpful response when no results match the applied filters.
+
+        Uses resource_hints.values to suggest valid values for each filtered
+        field where such metadata is available.
+        """
+        # Human-readable resource name
+        resource_name = resource.replace("_", " ")
+
+        # Flatten filter structure {field: {"operator": ..., "value": ...}} → {field: value}
+        simple_filters: Dict[str, Any] = {}
+        for field, filter_obj in filters.items():
+            if isinstance(filter_obj, dict) and "value" in filter_obj:
+                simple_filters[field] = filter_obj.get("value")
+            else:
+                simple_filters[field] = filter_obj
+
+        # Base message with filter description
+        if simple_filters:
+            filter_str = ", ".join(f"{k}='{v}'" for k, v in simple_filters.items())
+            response = f"No {resource_name} found matching {filter_str}."
+        else:
+            response = f"No {resource_name} found."
+
+        # Look up valid values from resource_hints when available
+        resource_hints = (schema or {}).get("resource_hints", {}) or {}
+        hints_for_resource: Dict[str, Any] = {}
+
+        # Try a few common key variants to find the right resource entry
+        key_candidates = {
+            resource,
+            resource.replace(" ", "_"),
+            resource.replace(" ", "-"),
+        }
+        for key in key_candidates:
+            maybe_hints = resource_hints.get(key)
+            if isinstance(maybe_hints, dict):
+                hints_for_resource = maybe_hints
+                break
+
+        for field, _value in simple_filters.items():
+            field_hints = hints_for_resource.get(field)
+            if not isinstance(field_hints, dict):
+                continue
+            valid_values = field_hints.get("values")
+            if isinstance(valid_values, (list, tuple)) and valid_values:
+                values_str = ", ".join(str(v) for v in valid_values)
+                response += f"\n\nValid {field} values: {values_str}"
+
+        return response
     
     def _detect_resource_type(self, results: list) -> str:
         """

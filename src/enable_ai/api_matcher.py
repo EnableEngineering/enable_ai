@@ -1,6 +1,6 @@
 from typing import Dict, Any, Optional, List
 from .types import APIRequest, APIError, MissingInformation
-from .utils import setup_logger
+from .utils import setup_logger, get_role_phrase_map
 from . import constants
 
 
@@ -70,6 +70,8 @@ class APIMatcher:
                 best_score = 0
 
                 for rh_name, rh_data in resource_hints.items():
+                    if not isinstance(rh_data, dict):
+                        continue
                     rh_name_l = str(rh_name or "").lower()
                     rh_name_normalized = rh_name_l.replace('-', '_')
                     parsed_normalized = parsed_res_l.replace('-', '_').replace(' ', '_')
@@ -133,6 +135,8 @@ class APIMatcher:
                 best_hits = 0
 
                 for rh_name, rh_data in resource_hints.items():
+                    if not isinstance(rh_data, dict):
+                        continue
                     rh_name_l = str(rh_name or "").lower()
                     # Look for "namespace-child" style resources such as
                     # "inventory-equipment" when parsed_res_l == "inventory".
@@ -237,6 +241,8 @@ class APIMatcher:
                     # This keeps the matcher generic: you configure which nouns
                     # correspond to which resources/sub-resources in config.json.
                     for rh_name, rh_data in resource_hints.items():
+                        if not isinstance(rh_data, dict):
+                            continue
                         rh_name_l = str(rh_name or "").lower()
 
                         # If the parsed resource is present, prefer hints that
@@ -347,6 +353,12 @@ class APIMatcher:
             # v0.3.37: Collect filter warnings to pass to user
             filter_warnings = []
 
+            # v0.3.50: Run semantic safeguards even when filters is empty, so we inject
+            # role/stock_level when the query clearly asks for them (e.g. "customer type users").
+            filters = filters or {}
+            filters = self._ensure_low_stock_filter(filters, resource, original_input, resource_hints)
+            filters = self._ensure_role_filter(filters, resource, original_input, resource_hints)
+
             # Validate filter values against schema
             if filters:
                 validated = self._validate_filter_values(filters, resource, resource_hints)
@@ -372,6 +384,107 @@ class APIMatcher:
 
         except Exception as e:
             return APIError(f"API matching failed: {str(e)}")
+
+    def _ensure_low_stock_filter(
+        self,
+        filters: Dict[str, Any],
+        resource: str,
+        original_input: str,
+        resource_hints: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """
+        Ensure "low stock" style phrases apply a stock_level=low filter when possible.
+
+        This provides an API-agnostic safety net for queries like:
+            - "show me items low in stock"
+            - "show low stock consumables"
+
+        Behaviour:
+        - Only activates when:
+          * The schema's resource_hints define a "stock_level" field for the
+            current resource, and
+          * No explicit "stock_level" filter is already present.
+        - Adds a simple semantic filter:
+              stock_level = {"operator": "equals", "value": "low"}
+          The existing _validate_filter_values + build_query_params logic will
+          then map this to the actual API query parameter (e.g. ?stock_level=low
+          or a more complex Django-style lookup) and apply any synonyms mapping
+          configured in resource_hints.
+        """
+        # If we already have a stock_level filter, don't override it.
+        if "stock_level" in filters:
+            return filters
+
+        # Quick check: does the current resource advertise a stock_level field?
+        rh_for_resource = resource_hints.get(resource) or {}
+        if not isinstance(rh_for_resource, dict) or "stock_level" not in rh_for_resource:
+            return filters
+
+        text = (original_input or "").lower()
+        low_stock_patterns = (
+            "low in stock",
+            "low stock",
+            "stock is low",
+            "running low",
+        )
+        if not any(p in text for p in low_stock_patterns):
+            return filters
+
+        # Inject a semantic filter; the value "low" will be canonicalized and/or
+        # translated using resource_hints["stock_level"]["values"/"synonyms"]
+        # inside _validate_filter_values and then mapped to actual API params
+        # inside build_query_params.
+        new_filters = dict(filters)
+        new_filters["stock_level"] = {"operator": "equals", "value": "low"}
+        self.logger.info(
+            "Inferred semantic filter from 'low stock' phrase: stock_level=low "
+            f"for resource '{resource}'"
+        )
+        return new_filters
+
+    def _ensure_role_filter(
+        self,
+        filters: Dict[str, Any],
+        resource: str,
+        original_input: str,
+        resource_hints: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """
+        Ensure "users by role" phrases (technician, customer, client, admin, manager)
+        apply a role filter when resource is users and hints define role.
+
+        workflow/orchestrator path, we still inject the correct role when the
+        query clearly asks for a specific user type. Uses resource_hints.role.synonyms
+        when present (config-driven), else constants.ROLE_QUERY_TO_VALUE.
+        """
+        if any(k in filters for k in ("role", "role__name")):
+            return filters
+
+        resource_lower = (resource or "").lower().replace("-", "_")
+        if resource_lower not in ("users", "user"):
+            return filters
+
+        rh_for_resource = resource_hints.get(resource) or resource_hints.get(resource_lower) or {}
+        if not isinstance(rh_for_resource, dict) or "role" not in rh_for_resource:
+            return filters
+
+        # Config-driven: phrase → value from resource_hints.role.synonyms; else fallback
+        role_map = get_role_phrase_map(resource_hints, resource)
+        if not role_map:
+            role_map = list(constants.ROLE_QUERY_TO_VALUE)
+
+        text = (original_input or "").lower()
+        for phrase, role_value in role_map:
+            if phrase in text:
+                new_filters = dict(filters)
+                new_filters["role"] = {"operator": "equals", "value": role_value}
+                self.logger.info(
+                    "Inferred role filter from query phrase: role=%s for resource '%s'",
+                    role_value, resource,
+                )
+                return new_filters
+
+        return filters
 
     def build_query_params(
         self,
@@ -705,7 +818,7 @@ class APIMatcher:
         path_params = self._get_path_params(endpoint_data)
         for param_name, param_info in path_params.items():
             param_desc = param_info if isinstance(param_info, str) else param_info.get('description', param_name)
-            if 'required' in param_desc.lower() or method in ['GET', 'PUT', 'PATCH', 'DELETE']:
+            if 'required' in str(param_desc).lower() or method in ['GET', 'PUT', 'PATCH', 'DELETE']:
                 # Path parameters in these methods are typically required
                 if param_name not in entities:
                     missing_fields.append(param_name)
@@ -716,7 +829,7 @@ class APIMatcher:
             query_params = self._get_query_params(endpoint_data)
             for param_name, param_info in query_params.items():
                 param_desc = param_info if isinstance(param_info, str) else param_info.get('description', param_name)
-                if 'required' in param_desc.lower():
+                if 'required' in str(param_desc).lower():
                     if param_name not in entities:
                         missing_fields.append(param_name)
                         missing_descriptions.append(self._generate_question_for_field(param_name, param_desc))
@@ -727,7 +840,7 @@ class APIMatcher:
             if isinstance(request_body, dict):
                 for field_name, field_info in request_body.items():
                     field_desc = field_info if isinstance(field_info, str) else field_info.get('description', field_name)
-                    if 'required' in field_desc.lower():
+                    if 'required' in str(field_desc).lower():
                         if field_name not in entities:
                             missing_fields.append(field_name)
                             missing_descriptions.append(self._generate_question_for_field(field_name, field_desc))

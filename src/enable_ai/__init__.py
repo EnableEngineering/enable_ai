@@ -48,7 +48,7 @@ Usage:
 Version: 0.3.47
 """
 
-__version__ = "0.3.47"
+__version__ = "0.3.52"
 
 from .query_parser import QueryParser
 from .api_matcher import APIMatcher

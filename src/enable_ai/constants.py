@@ -60,7 +60,9 @@ CHART_MAX_ITEMS = 20
 # LLM max_tokens for format/summary (response_formatter)
 MAX_TOKENS_CONCISE = 50
 MAX_TOKENS_SUMMARY = 150
-MAX_TOKENS_DETAILED = 500
+# 500 was too low for 25-row tables (25 × ~50 tokens/row ≈ 1250+ tokens)
+# so we allow a more realistic detailed budget here.
+MAX_TOKENS_DETAILED = 4000
 
 # HTTP and schema fetch timeout (seconds) (api_client, orchestrator, schema_loader)
 REQUEST_TIMEOUT = _env_int("ENABLE_AI_REQUEST_TIMEOUT", 30)
@@ -378,6 +380,20 @@ DJANGO_LOOKUP_SUFFIXES = (
     '__gte', '__lte', '__gt', '__lt'
 )
 
+# Semantic role injection for "users" resource (v0.3.50)
+# When the query mentions one of these phrases and resource is users, inject role filter.
+# Order matters: longer/more specific phrases first to avoid "customer" matching "admin".
+ROLE_QUERY_TO_VALUE = (
+    ("technician", "Technician"),
+    ("tech", "Technician"),
+    ("customer type", "Client"),
+    ("customer", "Client"),
+    ("client", "Client"),
+    ("administrator", "Admin"),
+    ("admin", "Admin"),
+    ("manager", "Manager"),
+)
+
 
 # =============================================================================
 # PAGINATION INFO (response formatting)
@@ -393,3 +409,6 @@ EMPTY_RESPONSE_MESSAGE = "No {resource} found matching your criteria."
 EMPTY_RESPONSE_FILTERS_APPLIED = "Filters applied:"
 EMPTY_RESPONSE_SUGGESTION = "Try broadening your search or using different filters."
 EMPTY_RESPONSE_VALID_VALUES_HINT = "Valid values for '{field}': {values}"
+
+# When filter_warnings are present (filter may not be supported by API)
+FILTER_WARNING_NOTE = "Results might not be filtered as requested if the API does not support these filters."

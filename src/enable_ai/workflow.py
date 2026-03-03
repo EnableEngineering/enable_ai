@@ -2,12 +2,12 @@ from typing import Any, Dict, Optional, TypedDict, List
 import re
 import json
 
-from langgraph.graph import StateGraph, END
+from langgraph.graph import StateGraph, END  # type: ignore[import]
 
 from .types import APIError
 from .execution_planner import ExecutionPlanner
 from .intent_classifier import IntentClassifier
-from .utils import setup_logger, get_openai_client, CREATIVE_TEMP
+from .utils import setup_logger, get_openai_client, CREATIVE_TEMP, get_role_phrase_map
 from .progress_tracker import ProgressStage
 from .response_formatter import ResponseFormatter
 from .tracing import QueryTracer, get_tracer_store, create_tracer
@@ -40,7 +40,9 @@ def _is_follow_up_query(query: str) -> bool:
 
     # Patterns that indicate follow-up
     follow_up_patterns = [
-        'next', 'more', 'previous', 'first', 'last',
+        # Removed bare 'last' to avoid treating temporal phrases like
+        # "my last report" or "last week" as follow-ups.
+        'next', 'more', 'previous', 'first',
         'show me more', 'show more', 'continue',
         'which are those', 'what are those', 'which ones',
         'show them', 'list them', 'the same',
@@ -52,7 +54,9 @@ def _is_follow_up_query(query: str) -> bool:
         if pattern in query_lower:
             return True
 
-    # Check for "next N" or "first N" patterns
+    # Check for "next N" or "first/last N" patterns where N is explicit.
+    # Require a number (or its word form) to avoid matching phrases like
+    # "my last report", which should be interpreted as a standalone query.
     if re.search(r'\b(next|first|last|show me)\s+\d+\b', query_lower):
         return True
 
@@ -415,7 +419,7 @@ def _resolve_step_dependencies(
             replacement = json.dumps(var_value)
         except TypeError:
             replacement = json.dumps(str(var_value))
-        step_json = re.sub(pattern, replacement, step_json)
+        step_json = re.sub(pattern, lambda m, r=replacement: r, step_json)
 
     return json.loads(step_json)
 
@@ -487,6 +491,10 @@ class APIQueryState(TypedDict, total=False):
     is_follow_up: bool
     filter_warnings: List[str]  # v0.3.37: Warnings about unmatched filters
 
+    # Intent classification (fast rule-based pre-parse)
+    classification_confidence: float
+    skip_llm_parse: bool
+
 
 def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[Dict[str, Any]] = None) -> "StateGraph":
     """
@@ -548,15 +556,18 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
             tracker.update(ProgressStage.PARSING_QUERY, constants.PROGRESS_PARSING_QUERY)
 
         # v0.3.37: Detect follow-up queries
-        is_follow_up = _is_follow_up_query(state["query"])
+        query_text = state.get("query") or ""
+        is_follow_up = _is_follow_up_query(query_text)
         last_metadata = state.get("last_result_metadata")
 
         try:
+            active_schema = state.get("active_schema") or {}
+            conversation_history = state.get("conversation_history") or []
             parsed = processor._understand_query(
-                state["query"],
-                state["active_schema"],
+                query_text,
+                active_schema,
                 state.get("context"),
-                state.get("conversation_history", []),
+                conversation_history,
                 state.get("user_context"),  # v0.3.29: pass user context for pronoun resolution
             )
 
@@ -652,14 +663,14 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
                     }
                 }
 
-            parsed = state["parsed"]
+            parsed = state.get("parsed", {})
             
             # Check if we need to merge with previous query filters (v0.3.9, enhanced v0.3.12)
-            if parsed.get("merge_with_previous") and state.get("conversation_history"):
+            conversation_history = state.get("conversation_history") or []
+            if parsed.get("merge_with_previous") and conversation_history:
                 logger.info("🔄 Merging filters from previous query (v0.3.12 enhanced)")
                 
                 # Extract previous filters from conversation history
-                conversation_history = state.get("conversation_history", [])
                 previous_filters = _extract_previous_filters(conversation_history)
                 
                 logger.info(f"   Previous filters extracted: {previous_filters}")
@@ -712,10 +723,50 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
             else:
                 logger.info(f"ℹ️  No filter merging needed (merge_with_previous={parsed.get('merge_with_previous')})")
             
-            execution_plan = planner.create_execution_plan(
-                parsed,
-                state["active_schema"]
+            active_schema = state.get("active_schema") or {}
+
+            # v0.3.49+: Semantic filter safeguards — run after classify/parse, before planning.
+            # This ensures semantic context (stock_level=low, role=Technician) is always
+            # injected regardless of whether the query was classified by rules or LLM.
+            _orig_query = (state.get("query") or "").lower()
+            _cur_filters = parsed.get("filters") or {}
+
+            # 1. Low-stock safeguard
+            _low_stock_patterns = (
+                "low in stock",
+                "low stock",
+                "stock is low",
+                "running low",
+                "need to refill",
+                "need refill",
             )
+            if any(pat in _orig_query for pat in _low_stock_patterns):
+                if "stock_level" not in _cur_filters:
+                    _cur_filters["stock_level"] = {"operator": "equals", "value": "low"}
+                    parsed["filters"] = _cur_filters
+                    logger.info("Injected semantic filter: stock_level=low (query=%r)", _orig_query[:80])
+
+            # 2. Role safeguard for users resource — when query mentions a role phrase,
+            #    inject that role filter if not already set. Use resource_hints.role.synonyms
+            #    when present (config-driven), else constants.ROLE_QUERY_TO_VALUE.
+            _resource_lower = (parsed.get("resource") or "").lower().replace("-", "_")
+            if _resource_lower in ("users", "user") and not any(
+                k in _cur_filters for k in ("role", "role__name")
+            ):
+                _role_map = get_role_phrase_map(active_schema.get("resource_hints") or {}, _resource_lower)
+                if not _role_map:
+                    _role_map = list(constants.ROLE_QUERY_TO_VALUE)
+                for phrase, role_value in _role_map:
+                    if phrase in _orig_query:
+                        _cur_filters["role"] = {"operator": "equals", "value": role_value}
+                        parsed["filters"] = _cur_filters
+                        logger.info(
+                            "Injected role filter: role=%s (phrase=%r, query=%r)",
+                            role_value, phrase, _orig_query[:80],
+                        )
+                        break
+
+            execution_plan = planner.create_execution_plan(parsed, active_schema)
             total_steps = len(execution_plan.get("steps", []))
             if tracker:
                 tracker.update(
@@ -768,7 +819,8 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
                     "result": {"data": None, "error": "No next page URL available"},
                     "error": "No next page URL available",
                 }
-            page_result = processor._fetch_next_page(url, state["active_schema"], state.get("access_token"))
+            active_schema = state.get("active_schema") or {}
+            page_result = processor._fetch_next_page(url, active_schema, state.get("access_token"))
             data = page_result.get("data") if not page_result.get("error") else None
             err = page_result.get("error")
             step_result = {
@@ -800,7 +852,8 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
         }
         
         # Create API request using the matcher
-        api_plan = processor._create_api_plan(resolved_step, state["active_schema"])
+        active_schema = state.get("active_schema") or {}
+        api_plan = processor._create_api_plan(resolved_step, active_schema)
         
         if not api_plan or api_plan.get("type") == "error":
             return {
@@ -810,9 +863,9 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
         # Execute the API call
         result = processor._execute_api(
             api_plan,
-            state["active_schema"],
+            active_schema,
             state.get("access_token"),
-            resolved_step
+            resolved_step,
         )
         data = result.get("data")
         # Pagination as a step: when step has fetch_all_pages, fetch next page(s) and merge.
@@ -821,7 +874,7 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
             pages = 1
             while data.get("next") and pages < constants.SAFETY_MAX_PAGES:
                 next_url = data.get("next")
-                page_result = processor._fetch_next_page(next_url, state["active_schema"], state.get("access_token"))
+                page_result = processor._fetch_next_page(next_url, active_schema, state.get("access_token"))
                 if page_result.get("error"):
                     break
                 next_data = page_result.get("data") or {}
@@ -873,7 +926,7 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
 
     def execute_plan(state: APIQueryState) -> Dict[str, Any]:
         """Legacy: not registered as a graph node. The graph uses execute_next_step for execution. Kept for reference only."""
-        plan = state["plan"]
+        plan = state.get("plan", {})
         if plan.get("type") != "api":
             return {
                 "result": {
@@ -894,12 +947,8 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
         logger.info(f"Display mode: {parsed.get('display_mode', 'summary')}")
         logger.info(f"Merge with previous: {parsed.get('merge_with_previous', False)}")
 
-        result = processor._execute_api(
-            plan,
-            state["active_schema"],
-            state.get("access_token"),
-            parsed,
-        )
+        active_schema = state.get("active_schema") or {}
+        result = processor._execute_api(plan, active_schema, state.get("access_token"), parsed)
         
         # Log the endpoint that was called
         if result:
@@ -938,12 +987,13 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
         )
 
         if is_unknown_intent:
-            # Return helpful response with suggestions
+            # Return the detailed matcher/orchestrator error as the main summary so the
+            # user sees available resources and suggestions instead of a generic message.
             return {
                 "response": {
                     "success": False,
                     "data": None,
-                    "summary": constants.UNKNOWN_INTENT_FULL,
+                    "summary": str(error),
                     "error": error,
                     "query": state.get("query"),
                     "total_steps": 0,
@@ -994,6 +1044,10 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
         # Check if multi-step
         is_multi_step = execution_plan.get("is_multi_step", False)
         
+        # Initialize pagination_info so it's always defined for trace logging and
+        # last_result_metadata, regardless of which branch we take below.
+        pagination_info: Dict[str, Any] = {}
+
         if is_multi_step:
             # Summarize multi-step execution
             all_data = [sr.get("result") for sr in step_results if sr.get("status") == "success"]
@@ -1004,11 +1058,17 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
                 summary = constants.SUMMARY_RETRIEVED_ALL_ITEMS_STEPS.format(count=len(all_data), steps=len(step_results))
                 logger.info(f"Multi-step display mode = full: returning all {len(all_data)} results")
             elif display_mode == "detailed":
-                summary = processor._summarize_multi_step_result(step_results, state["query"])
+                summary = processor._summarize_multi_step_result(
+                    step_results,
+                    state.get("query", ""),
+                )
                 logger.info(f"Multi-step display mode = detailed: detailed view")
             else:
                 # Summary mode: provide concise multi-step summary
-                summary = processor._summarize_multi_step_result(step_results, state["query"])
+                summary = processor._summarize_multi_step_result(
+                    step_results,
+                    state.get("query", ""),
+                )
                 logger.info(f"Multi-step display mode = summary: standard summary")
             
             # Attempt richer LLM-based formatting for multi-step results
@@ -1061,7 +1121,7 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
             if filter_warnings:
                 response["filter_warnings"] = filter_warnings
                 warning_text = "\n".join(f"⚠️ {w}" for w in filter_warnings)
-                response["summary"] = f"{warning_text}\n\n{summary}"
+                response["summary"] = f"{warning_text}\n\n{constants.FILTER_WARNING_NOTE}\n\n{summary}"
 
             if formatted is not None:
                 response["formatted"] = formatted
@@ -1084,7 +1144,8 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
             if display_mode == "full":
                 while isinstance(data, dict) and data.get("next") and pages_fetched < constants.SAFETY_MAX_PAGES:
                     next_url = data.get("next")
-                    page_result = processor._fetch_next_page(next_url, state["active_schema"], state.get("access_token"))
+                    active_schema = state.get("active_schema") or {}
+                    page_result = processor._fetch_next_page(next_url, active_schema, state.get("access_token"))
                     if page_result.get("error"):
                         logger.warning("Automatic pagination stopped: %s", page_result.get("error"))
                         break
@@ -1192,12 +1253,24 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
                 logger.info(f"Display mode = full: returning {len(final_data) if isinstance(final_data, list) else 'N/A'} items")
             elif display_mode == "detailed":
                 # Return full data with detailed summary
-                summary = processor._summarize_result_v2(result, state["query"], parsed, pagination_info)
+                summary = processor._summarize_result_v2(
+                    result,
+                    state.get("query", ""),
+                    parsed,
+                    pagination_info,
+                    schema=state.get("active_schema"),
+                )
                 final_data = data
                 logger.info(f"Display mode = detailed: returning detailed view")
             else:
                 # Default: summary mode (Issue #4: accurate summary)
-                summary = processor._summarize_result_v2(result, state["query"], parsed, pagination_info)
+                summary = processor._summarize_result_v2(
+                    result,
+                    state.get("query", ""),
+                    parsed,
+                    pagination_info,
+                    schema=state.get("active_schema"),
+                )
                 
                 # For summary mode, return structured data with pagination info (Issue #6)
                 if isinstance(data, dict) and 'results' in data:
@@ -1279,7 +1352,7 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
                 response["filter_warnings"] = filter_warnings
                 # Prepend warning to summary
                 warning_text = "\n".join(f"⚠️ {w}" for w in filter_warnings)
-                response["summary"] = f"{warning_text}\n\n{summary}"
+                response["summary"] = f"{warning_text}\n\n{constants.FILTER_WARNING_NOTE}\n\n{summary}"
 
             if formatted is not None:
                 response["formatted"] = formatted
@@ -1330,8 +1403,8 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
         4. If follow-up + no context: returns helpful error
         5. If not follow-up: continues to normal parsing
         """
-        query = state["query"]
-        conversation_history = state.get("conversation_history", [])
+        query = state.get("query") or ""
+        conversation_history = state.get("conversation_history") or []
         tracker = state.get("progress_tracker")
 
         # Check if this is a follow-up query
@@ -1366,10 +1439,11 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
                     if tracker:
                         tracker.update(ProgressStage.EXECUTING_API, "Fetching next page...")
 
+                    active_schema = state.get("active_schema") or {}
                     page_result = processor._fetch_next_page(
                         next_url,
-                        state["active_schema"],
-                        state.get("access_token")
+                        active_schema,
+                        state.get("access_token"),
                     )
 
                     if page_result.get("error"):
@@ -1596,7 +1670,8 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
 
         try:
             classifier = IntentClassifier(active_schema)
-            classification, confidence = classifier.classify(state["query"])
+            query_text = state.get("query") or ""
+            classification, confidence = classifier.classify(query_text)
 
             logger.debug(
                 f"Intent classification: confidence={confidence:.2f}, "

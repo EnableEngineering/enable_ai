@@ -10,11 +10,47 @@ Contains:
 import os
 import json
 import logging
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 from openai import OpenAI
 
 # Check for debug prompts environment variable
 DEBUG_OPENAI_PROMPTS = os.getenv('ENABLE_AI_DEBUG_PROMPTS', 'false').lower() == 'true'
+
+
+def get_role_phrase_map(
+    resource_hints: Dict[str, Any],
+    resource: str,
+) -> List[Tuple[str, str]]:
+    """
+    Build (phrase, canonical_value) list for role injection from resource_hints.
+
+    When a resource (e.g. "users") has a "role" field with "synonyms", returns
+    (synonym_key, canonical_value) pairs so that query phrases can be mapped to
+    API values. Longer phrases first to avoid "customer" matching before "customer type".
+    Falls back to empty list if no role synonyms are defined (caller uses constants).
+
+    Args:
+        resource_hints: Schema resource_hints (e.g. from active_schema).
+        resource: Resource name (e.g. "users").
+
+    Returns:
+        List of (phrase_lower, value) sorted by phrase length descending.
+    """
+    rh = resource_hints.get(resource) or resource_hints.get(
+        (resource or "").lower().replace("-", "_")
+    ) or {}
+    if not isinstance(rh, dict):
+        return []
+    role_hint = rh.get("role")
+    if not isinstance(role_hint, dict):
+        return []
+    synonyms = role_hint.get("synonyms") or {}
+    if not isinstance(synonyms, dict):
+        return []
+    pairs = [(str(k).lower().strip(), v) for k, v in synonyms.items() if k and v is not None]
+    # Longer phrases first so "customer type" is tried before "customer"
+    pairs.sort(key=lambda p: len(p[0]), reverse=True)
+    return pairs
 
 
 # ============================================================================
