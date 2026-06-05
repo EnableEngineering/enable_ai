@@ -871,8 +871,11 @@ class APIOrchestrator:
 
         # Merge filter values into entities so optional query params (e.g. status__name=Quoted)
         # are sent. The matcher builds query params from entities only; filters are not used.
+        from .query_execution import dedupe_fk_lookup_filters
+
+        filters = dedupe_fk_lookup_filters(parsed.get("filters") or {})
         merged = dict(parsed.get("entities") or {})
-        for key, val in (parsed.get("filters") or {}).items():
+        for key, val in filters.items():
             if isinstance(val, dict) and "value" in val:
                 merged[key] = val["value"]
             else:

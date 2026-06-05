@@ -2,6 +2,7 @@ from typing import Dict, Any, Optional, List
 from .types import APIRequest, APIError, MissingInformation
 from .utils import setup_logger
 from .query_execution import (
+    dedupe_fk_lookup_filters,
     format_sort_param,
     split_filters_for_endpoint,
 )
@@ -366,7 +367,7 @@ class APIMatcher:
             if filters:
                 validated = self._validate_filter_values(filters, resource, resource_hints)
                 if validated.get('filters'):
-                    filters = validated['filters']
+                    filters = dedupe_fk_lookup_filters(validated['filters'])
                 if validated.get('warnings'):
                     for warning in validated['warnings']:
                         self.logger.warning(warning)
@@ -920,11 +921,17 @@ class APIMatcher:
                         parsed_for_params['limit'] = parsed_input['limit']
                 params = self.build_query_params(endpoint_data, parsed_for_params, schema)
 
-            # Also add any direct entity matches to query params
+            # Also add direct entity matches not already set by build_query_params
             query_params = self._get_query_params(endpoint_data)
             for param_name in query_params.keys():
-                if param_name in entities and param_name not in params:
-                    params[param_name] = entities[param_name]
+                if param_name not in entities or param_name in params:
+                    continue
+                # Skip base FK when lookup param already set (status vs status__name)
+                if "__" not in param_name and any(
+                    k.startswith(f"{param_name}__") for k in params
+                ):
+                    continue
+                params[param_name] = entities[param_name]
         else:
             # For POST/PUT/PATCH, use request_body
             request_body = endpoint_data.get('request_body', {})

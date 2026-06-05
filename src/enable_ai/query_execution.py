@@ -93,6 +93,30 @@ def filter_matches_endpoint(field: str, available_params: Set[str]) -> bool:
     return any(p.startswith(base_field + "__") or p == base_field for p in available_params)
 
 
+def dedupe_fk_lookup_filters(filters: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Drop base FK fields when a Django lookup variant is present.
+
+    e.g. keep status__name=New, remove status=New (FK expects integer id).
+    """
+    if not filters:
+        return filters
+
+    bases_with_lookup = {
+        field.split("__", 1)[0]
+        for field in filters
+        if "__" in field
+    }
+    if not bases_with_lookup:
+        return filters
+
+    return {
+        field: value
+        for field, value in filters.items()
+        if field not in bases_with_lookup or "__" in field
+    }
+
+
 def split_filters_for_endpoint(
     filters: Dict[str, Any],
     endpoint_data: Dict[str, Any],

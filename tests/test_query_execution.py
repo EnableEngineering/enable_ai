@@ -1,6 +1,7 @@
 """Tests for query execution helpers."""
 
 from enable_ai.query_execution import (
+    dedupe_fk_lookup_filters,
     format_sort_param,
     merge_execution_context,
     split_filters_for_endpoint,
@@ -40,6 +41,18 @@ def test_enrich_step_from_parsed():
     assert step["resource"] == "details-reports"
     assert step["limit"] == 1
     assert step["sort"]["order"] == "desc"
+
+
+def test_dedupe_fk_lookup_filters():
+    filters = {
+        "status__name": {"operator": "equals", "value": "New"},
+        "status": {"operator": "equals", "value": "New"},
+        "technician": {"operator": "equals", "value": 17},
+    }
+    deduped = dedupe_fk_lookup_filters(filters)
+    assert "status__name" in deduped
+    assert "status" not in deduped
+    assert deduped["technician"]["value"] == 17
 
 
 def test_split_filters_for_endpoint():
