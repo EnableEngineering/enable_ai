@@ -7,11 +7,10 @@ No extra LLM calls — uses SchemaIntrospector and resource_hints already in the
 from typing import Any, Dict, List, Optional, Tuple
 
 from .schema_introspector import SchemaIntrospector
+from .user_context_resolver import PRONOUN_MARKERS, resolve_user_context_in_parsed
 from .utils import setup_logger
 
 logger = setup_logger("enable_ai.param_validator")
-
-PRONOUN_MARKERS = ("assigned to me", " my ", " me ", "mine", " my,", "for me")
 
 
 def _resolve_resource(parsed: Dict[str, Any], schema: Dict[str, Any]) -> str:
@@ -94,6 +93,10 @@ def validate_parsed(
                 repaired_filters[field] = fval
             warnings.extend(vr.warnings or [])
         result["filters"] = repaired_filters
+
+    # Resolve __current_user_id__ and similar placeholders from user_context
+    if user_context:
+        result = resolve_user_context_in_parsed(result, user_context, query)
 
     # Pronouns without user context → ask for clarification
     q_lower = (query or "").lower()

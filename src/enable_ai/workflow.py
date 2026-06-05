@@ -20,6 +20,7 @@ from .follow_up_suggestions import (
 from .query_execution import merge_execution_context
 from .semantic_filters import apply_semantic_filters
 from .response_envelope import enrich_api_response
+from .user_context_resolver import resolve_user_context_in_parsed
 from . import constants
 
 # Module-level logger
@@ -719,9 +720,15 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
                 logger.info(f"ℹ️  No filter merging needed (merge_with_previous={parsed.get('merge_with_previous')})")
             
             active_schema = state.get("active_schema") or {}
+            query_text = state.get("query") or ""
+
+            # Resolve __current_user_id__ etc. before planning (covers classify shortcut path)
+            parsed = resolve_user_context_in_parsed(
+                parsed, state.get("user_context"), query_text,
+            )
 
             # Semantic filters (idempotent) — covers classify shortcut that skips LLM parse
-            parsed = apply_semantic_filters(parsed, state.get("query") or "", active_schema)
+            parsed = apply_semantic_filters(parsed, query_text, active_schema)
 
             execution_plan = planner.create_execution_plan(parsed, active_schema)
             total_steps = len(execution_plan.get("steps", []))

@@ -10,6 +10,7 @@ from typing import Dict, Any, Optional, List
 
 from .utils import get_openai_client, setup_logger, DETERMINISTIC_TEMP
 from .query_execution import enrich_step_from_parsed, merge_execution_context
+from .user_context_resolver import is_user_id_placeholder, is_company_id_placeholder
 
 
 class ExecutionPlanner:
@@ -120,6 +121,10 @@ class ExecutionPlanner:
 
             # Skip if already numeric (ID)
             if isinstance(value, int) or (isinstance(value, str) and value.isdigit()):
+                continue
+
+            # Skip user/company context placeholders — resolved before planning
+            if is_user_id_placeholder(value) or is_company_id_placeholder(value):
                 continue
 
             # Skip if it's a known enum field (has values in resource_hints)
