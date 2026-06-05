@@ -58,7 +58,8 @@ class QueryParser:
         natural_language_input: str,
         schema: Optional[Dict[str, Any]] = None,
         conversation_history: Optional[list] = None,
-        user_context: Optional[Dict[str, Any]] = None  # v0.3.29: User identity for pronoun resolution
+        user_context: Optional[Dict[str, Any]] = None,  # v0.3.29: User identity for pronoun resolution
+        classification_hint: Optional[Dict[str, Any]] = None,
     ) -> Union[Dict[str, Any], APIError]:
         """
         Parse natural language input using LLM with schema context and conversation history.
@@ -107,20 +108,19 @@ class QueryParser:
             return APIError("Schema is required for LLM parsing")
 
         try:
-            # v0.3.43: Pre-process query to transform semantic phrases
-            # This handles phrases like "low in stock" → "stock_level low" BEFORE the LLM
-            processed_query = self._preprocess_semantic_phrases(natural_language_input, schema)
-            if processed_query != natural_language_input:
-                self.logger.info(f"Preprocessed query: '{natural_language_input}' → '{processed_query}'")
+            # LLM-first: synonyms live in resource_hints inside the prompt.
+            # Post-parse semantic_filters remains the safety net (no query rewriting).
 
             # Check cache first (only if no user_context - personalized queries shouldn't be cached)
-            cache_key = self._get_cache_key(processed_query, schema)
-            if cache_key in self.cache and not user_context:
-                self.logger.info(f"Using cached parse result for: '{processed_query[:50]}...'")
+            cache_key = self._get_cache_key(natural_language_input, schema)
+            if cache_key in self.cache and not user_context and not conversation_history:
+                self.logger.info(f"Using cached parse result for: '{natural_language_input[:50]}...'")
                 return self.cache[cache_key]
 
             # Build prompt with schema context and user context
-            prompt = self._build_prompt(processed_query, schema, user_context)
+            prompt = self._build_prompt(
+                natural_language_input, schema, user_context, classification_hint,
+            )
             
             # Build messages list with conversation history for context (Issue #2 fix)
             messages = [{"role": "system", "content": self._get_system_prompt()}]
@@ -500,7 +500,8 @@ Return ONLY the JSON object, no explanations or markdown.
         self,
         query: str,
         schema: Dict[str, Any],
-        user_context: Optional[Dict[str, Any]] = None  # v0.3.29: User identity
+        user_context: Optional[Dict[str, Any]] = None,  # v0.3.29: User identity
+        classification_hint: Optional[Dict[str, Any]] = None,
     ) -> str:
         """
         Build user prompt with schema context, query, and user context.
@@ -566,7 +567,7 @@ When the user uses descriptive phrases, map them to the corresponding filter fie
 4. "OBSERVATIONS FOR MY LAST REPORT" (single-step):
    When the user asks for observations/details of their last/latest report, set resource to the PARENT resource (e.g. details-reports), add filters for "me" from USER_CONTEXT (e.g. technician=user_id), sort by created_at desc, limit 1. The observations are embedded in the report response — do NOT use relationships or add a second step. Just fetch the report with the right filters and the system will display all its fields including observations.
 
-5. EXAMPLES (Note: query may be pre-processed to "with FIELD VALUE" format):
+5. EXAMPLES:
    - "show me consumables with stock_level low" → resource: "consumables", filters: {{"stock_level": {{"operator": "equals", "value": "low"}}}}
    - "list items low in stock" → resource: "consumables", filters: {{"stock_level": {{"operator": "equals", "value": "low"}}}}
    - "show companies" → resource: "companies"
@@ -576,6 +577,14 @@ When the user uses descriptive phrases, map them to the corresponding filter fie
 When you see "with FIELD VALUE" patterns, extract as: {_pattern_example}
 When the user says e.g. "pending" or "quoted", use the synonym or value above.
 Prefer the exact strings listed in "values" or given by "synonyms".
+"""
+
+        classification_section = ""
+        if classification_hint:
+            classification_section = f"""
+CLASSIFICATION_HINT (optional rule-based guess — verify against the query and schema; LLM decision wins):
+{json.dumps(classification_hint, indent=2)}
+Use this only as a starting hint. Override when the query, follow-up context, or synonyms imply a different resource/filters.
 """
 
         # v0.3.29: User context section for pronoun resolution
@@ -596,7 +605,7 @@ IMPORTANT: When the query contains "me", "my", "mine", "assigned to me", "my rep
 "{query}"
 
 TODAY'S DATE: {today}
-{user_context_section}
+{classification_section}{user_context_section}
 AVAILABLE SCHEMA:
 
 Resources/Tables:

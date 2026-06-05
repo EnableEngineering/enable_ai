@@ -746,7 +746,8 @@ class APIOrchestrator:
         schema: dict,
         context: Optional[Any] = None,
         conversation_history: Optional[list] = None,
-        user_context: Optional[Dict[str, Any]] = None  # v0.3.29: User identity
+        user_context: Optional[Dict[str, Any]] = None,  # v0.3.29: User identity
+        classification_hint: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Step 2: Intent analysis and query parsing (QueryParser = intent analyser).
@@ -765,7 +766,8 @@ class APIOrchestrator:
             query,
             schema,
             conversation_history=conversation_history,
-            user_context=user_context  # v0.3.29: pass user context for pronoun resolution
+            user_context=user_context,  # v0.3.29: pass user context for pronoun resolution
+            classification_hint=classification_hint,
         )
         
         if not parsed:

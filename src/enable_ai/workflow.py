@@ -362,9 +362,9 @@ class APIQueryState(TypedDict, total=False):
     is_follow_up: bool
     filter_warnings: List[str]  # v0.3.37: Warnings about unmatched filters
 
-    # Intent classification (fast rule-based pre-parse)
+    # Intent classification hint (rule-based pre-parse; LLM always parses)
     classification_confidence: float
-    skip_llm_parse: bool
+    classification_hint: Optional[dict]
 
 
 def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[Dict[str, Any]] = None) -> "StateGraph":
@@ -448,6 +448,7 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
                 state.get("context"),
                 conversation_history,
                 state.get("user_context"),  # v0.3.29: pass user context for pronoun resolution
+                classification_hint=state.get("classification_hint"),
             )
 
             # v0.3.37: Log to tracer
@@ -1622,18 +1623,13 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
 
     def classify_intent(state: APIQueryState) -> Dict[str, Any]:
         """
-        Fast rule-based intent classification (no LLM).
+        Rule-based pre-classification hint for the LLM parser (never skips LLM).
 
-        This node attempts to classify the query using rules before calling
-        the LLM-based parser. If classification confidence is high enough,
-        we can skip the LLM parser entirely, reducing cost and latency.
-
-        Returns:
-            Dict with optional 'parsed' (if high confidence) and 'classification_confidence'
+        Returns optional classification_hint — the LLM parse step always runs.
         """
         active_schema = state.get("active_schema")
         if not active_schema:
-            return {"classification_confidence": 0.0}
+            return {"classification_confidence": 0.0, "classification_hint": None}
 
         try:
             classifier = IntentClassifier(active_schema)
@@ -1641,36 +1637,25 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
             classification, confidence = classifier.classify(query_text)
 
             logger.debug(
-                f"Intent classification: confidence={confidence:.2f}, "
+                f"Intent classification hint: confidence={confidence:.2f}, "
                 f"resource={classification.resource if classification else 'None'}"
             )
 
-            if classification and confidence >= constants.CLASSIFIER_MEDIUM_CONFIDENCE:
+            hint = None
+            if classification and confidence >= constants.CLASSIFIER_LOW_CONFIDENCE:
+                hint = {**classification.to_dict(), "confidence": confidence}
                 logger.info(
-                    f"Fast classification succeeded: {classification.intent} on "
-                    f"{classification.resource} (confidence={confidence:.2f})"
+                    "Classification hint for LLM: %s on %s (confidence=%.2f)",
+                    classification.intent,
+                    classification.resource,
+                    confidence,
                 )
-                return {
-                    "parsed": classification.to_dict(),
-                    "classification_confidence": confidence,
-                    "skip_llm_parse": True,
-                }
 
-            return {"classification_confidence": confidence}
+            return {"classification_confidence": confidence, "classification_hint": hint}
 
         except Exception as e:
-            logger.warning(f"Intent classification failed: {e}")
-            return {"classification_confidence": 0.0}
-
-    def route_after_classification(state: APIQueryState) -> str:
-        """Route based on classification result."""
-        if state.get("is_follow_up"):
-            logger.info("Follow-up query — using LLM parse with conversation context")
-            return "parse"
-        if state.get("skip_llm_parse") and state.get("parsed"):
-            logger.info("Skipping LLM parse - using rule-based classification")
-            return "create_plan"
-        return "parse"
+            logger.warning(f"Intent classification failed: %s", e)
+            return {"classification_confidence": 0.0, "classification_hint": None}
 
     # Add nodes
     graph.add_node("load_schema", load_schema)
@@ -1705,14 +1690,7 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
             "end": END,  # Follow-up returned response directly
         },
     )
-    graph.add_conditional_edges(
-        "classify",
-        route_after_classification,
-        {
-            "parse": "parse",
-            "create_plan": "create_plan",
-        },
-    )
+    graph.add_edge("classify", "parse")
     graph.add_edge("parse", "create_plan")
     graph.add_conditional_edges(
         "create_plan",
