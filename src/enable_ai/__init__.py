@@ -44,11 +44,11 @@ Usage:
         session_id="abc123"
     )
     # Result will filter by technician=123 automatically
-
-Version: 0.3.47
 """
 
-__version__ = "0.3.52"
+from ._version import get_version
+
+__version__ = get_version()
 
 from .query_parser import QueryParser
 from .api_matcher import APIMatcher
