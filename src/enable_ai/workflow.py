@@ -21,7 +21,7 @@ from .follow_up_detection import (
     apply_follow_up_context,
     classify_follow_up,
     extract_last_result_metadata,
-    has_prior_context,
+    should_merge_previous_filters,
 )
 from .query_execution import merge_execution_context
 from .semantic_filters import apply_semantic_filters
@@ -565,16 +565,10 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
             conversation_history = state.get("conversation_history") or []
             query_text = state.get("query") or ""
             follow_up_classification = state.get("follow_up_classification") or {}
-            should_merge = (
-                parsed.get("merge_with_previous")
-                or state.get("is_follow_up")
-                or follow_up_classification.get("merge_with_previous")
-                or (
-                    follow_up_classification.get("is_follow_up")
-                    and has_prior_context(conversation_history)
-                )
+            should_merge = should_merge_previous_filters(
+                parsed, follow_up_classification, conversation_history,
             )
-            if should_merge and conversation_history:
+            if should_merge:
                 logger.info("🔄 Merging filters from previous query (v0.3.12 enhanced)")
                 
                 # Extract previous filters from conversation history

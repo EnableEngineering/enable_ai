@@ -203,6 +203,7 @@ Your task: Understand the user's intent and extract structured information so th
 - Decide whether the user is starting a new request, continuing or refining the previous one (referring to prior results), asking for a count/total, asking for the next page of results, or changing how results are shown.
 - When the user's intent clearly refers to or continues the previous turn (e.g. "them", "those", "the same", "more", "next page", "and which company?", refining or filtering prior results), call get_query_context() to retrieve previous_resource and previous_filters, then use that resource and merge filters. Set merge_with_previous=true.
 - Follow-up refinements like "and assigned to which company?" after asking about service orders mean: stay on service-orders, keep previous filters, set question_type="details" — do NOT list all companies.
+- Reset queries like "show all service orders" or "list all users" start fresh: set merge_with_previous=false and do NOT carry over previous filters even if conversation history exists.
 - When the user is asking for the next page of a prior list (e.g. more results, next page), use context's next_url and set use_next_page=true and next_page_url from context.
 - When the user is asking for a total or count (how many, number of, total), set question_type="count".
 - When the user wants a small sample of prior results (e.g. "a few", "some"), set a small limit and question_type="list" so they see items, not only a count.

@@ -6,6 +6,7 @@ from enable_ai.follow_up_detection import (
     clear_classification_cache,
     is_follow_up_query,
     get_follow_up_type,
+    should_merge_previous_filters,
 )
 
 HISTORY = [
@@ -40,6 +41,15 @@ STANDALONE_CLASSIFICATION = {
     "keep_previous_resource": False,
     "question_type_override": None,
     "display_mode_override": None,
+}
+
+RESET_CLASSIFICATION = {
+    "is_follow_up": False,
+    "follow_up_type": "reset",
+    "merge_with_previous": False,
+    "keep_previous_resource": False,
+    "question_type_override": None,
+    "display_mode_override": "full",
 }
 
 PAGINATION_CLASSIFICATION = {
@@ -90,6 +100,38 @@ def test_apply_follow_up_context_keeps_service_orders(mock_client):
     assert fixed["filters"]["status__name"]["value"] == "New"
     assert fixed["merge_with_previous"] is True
     assert fixed["question_type"] == "details"
+
+
+def test_should_merge_on_refinement():
+    parsed = {"merge_with_previous": True, "filters": {}}
+    assert should_merge_previous_filters(parsed, REFINEMENT_CLASSIFICATION, HISTORY) is True
+
+
+def test_should_not_merge_on_reset_query():
+    parsed = {
+        "intent": "read",
+        "resource": "service-orders",
+        "merge_with_previous": True,  # parser mistakenly set this
+        "filters": {},
+    }
+    assert should_merge_previous_filters(parsed, RESET_CLASSIFICATION, HISTORY) is False
+
+
+def test_apply_reset_clears_merge_flag():
+    parsed = {
+        "intent": "read",
+        "resource": "service-orders",
+        "filters": {"status__name": {"operator": "equals", "value": "New"}},
+        "merge_with_previous": True,
+    }
+    result = apply_follow_up_context(
+        parsed,
+        "show all service orders",
+        HISTORY,
+        classification=RESET_CLASSIFICATION,
+    )
+    assert result["merge_with_previous"] is False
+    assert result["filters"] == parsed["filters"]  # no inherited filters
 
 
 @patch("enable_ai.follow_up_detection.get_openai_client")
