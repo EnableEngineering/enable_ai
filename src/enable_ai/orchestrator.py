@@ -24,6 +24,7 @@ from .post_filter import apply_client_side_filters
 from .semantic_filters import apply_semantic_filters
 from .param_validator import validate_parsed
 from .response_envelope import enrich_api_response
+from .follow_up_detection import build_session_metadata
 from . import constants
 
 
@@ -618,11 +619,7 @@ class APIOrchestrator:
                 if filters:
                     assistant_message += f"\n[Filters: {json.dumps(filters)}]"
                 
-                # Add assistant message with metadata (include next_url for "show me more")
-                meta = {'resource': resource, 'intent': intent, 'filters': filters}
-                next_url = (response.get('pagination') or {}).get('next_url')
-                if next_url:
-                    meta['next_url'] = next_url
+                meta = build_session_metadata(parsed, response)
                 self.conversation_store.add_message(
                     session_id, 
                     'assistant', 
@@ -748,6 +745,7 @@ class APIOrchestrator:
         conversation_history: Optional[list] = None,
         user_context: Optional[Dict[str, Any]] = None,  # v0.3.29: User identity
         classification_hint: Optional[Dict[str, Any]] = None,
+        follow_up_classification: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Step 2: Intent analysis and query parsing (QueryParser = intent analyser).
@@ -768,6 +766,7 @@ class APIOrchestrator:
             conversation_history=conversation_history,
             user_context=user_context,  # v0.3.29: pass user context for pronoun resolution
             classification_hint=classification_hint,
+            follow_up_classification=follow_up_classification,
         )
         
         if not parsed:

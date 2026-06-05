@@ -60,6 +60,7 @@ class QueryParser:
         conversation_history: Optional[list] = None,
         user_context: Optional[Dict[str, Any]] = None,  # v0.3.29: User identity for pronoun resolution
         classification_hint: Optional[Dict[str, Any]] = None,
+        follow_up_classification: Optional[Dict[str, Any]] = None,
     ) -> Union[Dict[str, Any], APIError]:
         """
         Parse natural language input using LLM with schema context and conversation history.
@@ -138,18 +139,31 @@ class QueryParser:
             self.logger.info(f"Parsing query: '{natural_language_input}'")
             
             if conversation_history:
-                from .follow_up_detection import classify_follow_up
+                from .follow_up_detection import NO_MERGE_TYPES, classify_follow_up
 
-                if classify_follow_up(natural_language_input, conversation_history).get("is_follow_up"):
+                follow_up_clf = follow_up_classification
+                if follow_up_clf is None:
+                    follow_up_clf = classify_follow_up(
+                        natural_language_input, conversation_history,
+                    )
+                follow_up_type = follow_up_clf.get("follow_up_type")
+                has_referent = bool(follow_up_clf.get("referent"))
+
+                if follow_up_type in NO_MERGE_TYPES:
+                    self.logger.info(
+                        "Reset/standalone query — parsing without session merge: %r",
+                        natural_language_input[:80],
+                    )
+                    parsed = self._parse_without_session_merge(messages, follow_up_clf)
+                elif follow_up_clf.get("is_follow_up") or has_referent:
                     self.logger.info(
                         "Follow-up detected — forcing context merge for: %r",
                         natural_language_input[:80],
                     )
                     parsed = self._parse_with_forced_context(
-                        messages, schema, conversation_history, user_context,
+                        messages, schema, conversation_history, user_context, follow_up_clf,
                     )
                 else:
-                    # Use function calling; LLM may request context via tool
                     parsed = self._parse_with_context_function(
                         messages, schema, conversation_history, user_context,
                     )
@@ -962,52 +976,59 @@ Return the parsed JSON now:
     def _extract_context_from_history(self, conversation_history: list) -> Dict[str, Any]:
         """
         Extract structured context from conversation history.
-        
-        Looks for [Context: intent operation on resource] markers in assistant messages.
-        Enhanced in v0.3.7 to extract filters for query merging.
-        
-        Args:
-            conversation_history: Conversation history with context markers
-            
-        Returns:
-            Dict with previous_resource, previous_intent, previous_query, previous_filters
+
+        Prefers assistant message metadata; falls back to [Context:] markers.
         """
+        from .follow_up_detection import extract_last_result_metadata
+
         context: Dict[str, Any] = {
             "previous_resource": None,
             "previous_intent": None,
             "previous_query": None,
             "previous_filters": None,
             "next_url": None,
+            "result_items": [],
+            "primary_item": None,
+            "count": None,
         }
-        
-        # Look through conversation history in reverse (most recent first)
+
+        meta = extract_last_result_metadata(conversation_history)
+        if meta:
+            context.update({
+                "previous_resource": meta.get("resource"),
+                "previous_intent": meta.get("intent"),
+                "previous_filters": meta.get("filters"),
+                "next_url": meta.get("next_url"),
+                "result_items": meta.get("result_items") or [],
+                "primary_item": meta.get("primary_item"),
+                "count": meta.get("count"),
+            })
+
         for msg in reversed(conversation_history):
             if msg.get('role') == 'assistant':
                 content = msg.get('content', '')
-                # Look for [Context: intent operation on resource]
                 if '[Context:' in content:
-                    import re
                     metadata = msg.get('metadata') or {}
                     if isinstance(metadata, dict) and metadata.get('next_url'):
                         context['next_url'] = metadata['next_url']
-                    match = re.search(r'\[Context: (\w+) operation on ([\w_]+)\]', content)
+                    match = re.search(r'\[Context: (\w+) operation on ([\w_-]+)\]', content)
                     if match:
-                        context['previous_intent'] = match.group(1)
-                        context['previous_resource'] = match.group(2)
-                        
-                        # Try to extract filters if present
-                        filters_match = re.search(r'\[Filters: (.*?)\]', content)
-                        if filters_match:
-                            try:
-                                import json
-                                context['previous_filters'] = json.loads(filters_match.group(1))
-                            except Exception:
-                                pass
+                        if not context['previous_intent']:
+                            context['previous_intent'] = match.group(1)
+                        if not context['previous_resource']:
+                            context['previous_resource'] = match.group(2)
+                        if context['previous_filters'] is None:
+                            filters_match = re.search(r'\[Filters: (.*?)\]', content)
+                            if filters_match:
+                                try:
+                                    context['previous_filters'] = json.loads(filters_match.group(1))
+                                except Exception:
+                                    pass
                         break
             elif msg.get('role') == 'user':
                 if context['previous_query'] is None:
                     context['previous_query'] = msg.get('content', '')
-        
+
         return context
     
     def _define_context_tool(self) -> Dict[str, Any]:
@@ -1159,20 +1180,47 @@ Return the complete parsed JSON with all filters merged and limit set when the u
             else:
                 raise ValueError("No content in LLM response")
 
+    def _parse_without_session_merge(
+        self,
+        messages: List[Dict[str, Any]],
+        classification: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Parse a reset/standalone query without inheriting previous session filters."""
+        follow_up_type = (classification or {}).get("follow_up_type", "reset")
+        messages.append({
+            "role": "user",
+            "content": f"""This is a FRESH query (follow_up_type={follow_up_type}) — NOT a follow-up.
+
+RULES:
+- Set merge_with_previous=false
+- Do NOT copy filters from conversation history or previous turns
+- Only include filters explicitly mentioned in the current user query
+- If the user says "show all" or "list all", return empty filters {{}}
+
+Return the complete parsed JSON.""",
+        })
+        return self.openai_client.parse_json_response(
+            messages=messages,
+            temperature=DETERMINISTIC_TEMP,
+        )
+
     def _parse_with_forced_context(
         self,
         messages: List[Dict[str, Any]],
         schema: Dict[str, Any],
         conversation_history: list,
         user_context: Optional[Dict[str, Any]] = None,
+        classification: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Parse a follow-up query with previous resource/filters injected (no tool-call hop)."""
         context = self._extract_context_from_history(conversation_history)
+        referent = (classification or {}).get("referent")
 
         self.logger.info(
-            "Forced follow-up context: resource=%s filters=%s",
+            "Forced follow-up context: resource=%s filters=%s referent=%s",
             context.get("previous_resource"),
             context.get("previous_filters"),
+            referent,
         )
 
         user_context_reminder = ""
@@ -1180,19 +1228,32 @@ Return the complete parsed JSON with all filters merged and limit set when the u
             user_context_reminder = f"""
 - Resolve "me"/"my" using user_id={user_context.get('user_id')} and company_id={user_context.get('company_id')}"""
 
+        referent_rules = ""
+        if referent and isinstance(referent, dict) and referent.get("id") is not None:
+            id_field = referent.get("id_field") or "id"
+            referent_rules = f"""
+- The user refers to a specific prior item via pronoun — resolved referent: {json.dumps(referent)}
+- Set filters.{id_field} = {referent.get('id')} (operator equals)
+- Set resource = {referent.get('resource') or 'previous_resource'}
+- Set question_type="details" and display_mode="detailed", limit=1
+- Set merge_with_previous=false
+- Do NOT list all related resources — fetch details of the referred item only"""
+
         messages.append({
             "role": "user",
             "content": f"""This is a FOLLOW-UP query that continues the previous turn.
 
 PREVIOUS CONTEXT:
 {json.dumps(context, indent=2)}
+{referent_rules}
 
 RULES:
-- Keep resource = previous_resource unless the user clearly changes topic
-- Merge previous_filters with any new conditions from the current query
-- Set merge_with_previous=true
+- Keep resource = previous_resource unless the user clearly changes topic or referent specifies resource
+- Merge previous_filters with any new conditions from the current query (unless referent rules apply)
+- Set merge_with_previous=true (unless referent rules apply — then false)
 - If the user asks about a field on those items (company, customer, technician, status, etc.), keep the SAME resource and fetch details — do NOT switch to listing all companies/users
-- For detail questions after a count, set question_type="details" and display_mode="detailed"{user_context_reminder}
+- For detail questions after a count, set question_type="details" and display_mode="detailed"
+- Use result_items / primary_item to resolve "it", "this", "that" pronouns to a specific record id{user_context_reminder}
 
 Return the complete parsed JSON.""",
         })

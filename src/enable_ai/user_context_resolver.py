@@ -111,11 +111,13 @@ def resolve_user_context_in_parsed(
     parsed: Dict[str, Any],
     user_context: Optional[Dict[str, Any]],
     query: str = "",
+    follow_up_classification: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Replace user/company placeholders with IDs from user_context.
 
     Also injects technician=user_id when the query uses pronouns but no user filter exists.
+    Skips injection on reset/standalone queries and item-referent follow-ups.
     """
     if not isinstance(parsed, dict) or not user_context:
         return parsed
@@ -123,6 +125,16 @@ def resolve_user_context_in_parsed(
     user_id = user_context.get("user_id")
     if user_id is None:
         return parsed
+
+    clf = follow_up_classification or {}
+    if clf.get("follow_up_type") in ("standalone", "reset"):
+        skip_injection = True
+    elif clf.get("referent"):
+        skip_injection = True
+    elif parsed.get("_referent"):
+        skip_injection = True
+    else:
+        skip_injection = False
 
     result = dict(parsed)
     filters = dict(result.get("filters") or {})
@@ -148,7 +160,7 @@ def resolve_user_context_in_parsed(
             )
 
     # Inject technician filter for pronoun queries when not already set
-    if _query_needs_user_filter(query):
+    if not skip_injection and _query_needs_user_filter(query):
         user_field = "technician"
         if user_field not in filters and user_field not in entities:
             filters[user_field] = {"operator": "equals", "value": user_id}

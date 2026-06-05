@@ -2,11 +2,15 @@ from unittest.mock import patch
 
 from enable_ai.follow_up_detection import (
     apply_follow_up_context,
+    apply_referent_context,
+    build_session_metadata,
     classify_follow_up,
     clear_classification_cache,
+    extract_result_items_from_data,
     is_follow_up_query,
     get_follow_up_type,
     should_merge_previous_filters,
+    strip_inherited_session_filters,
 )
 
 HISTORY = [
@@ -131,7 +135,80 @@ def test_apply_reset_clears_merge_flag():
         classification=RESET_CLASSIFICATION,
     )
     assert result["merge_with_previous"] is False
-    assert result["filters"] == parsed["filters"]  # no inherited filters
+    assert result["filters"] == {}
+
+
+def test_strip_inherited_session_filters_removes_prev_and_technician():
+    parsed = {
+        "intent": "read",
+        "resource": "service-orders",
+        "filters": {
+            "status__name": {"operator": "equals", "value": "New"},
+            "technician": {"operator": "equals", "value": 17},
+        },
+        "merge_with_previous": True,
+    }
+    history_with_tech = [
+        *HISTORY[:-1],
+        {
+            **HISTORY[-1],
+            "metadata": {
+                **HISTORY[-1]["metadata"],
+                "filters": {
+                    "status__name": {"operator": "equals", "value": "New"},
+                    "technician": {"operator": "equals", "value": 17},
+                },
+            },
+        },
+    ]
+    result = strip_inherited_session_filters(
+        parsed, history_with_tech, user_context={"user_id": 17},
+    )
+    assert result["filters"] == {}
+    assert result["merge_with_previous"] is False
+
+
+def test_apply_referent_context_sets_id_filter():
+    classification = {
+        "question_type_override": "details",
+        "display_mode_override": "detailed",
+        "referent": {
+            "resource": "service-orders",
+            "id": 28,
+            "id_field": "id",
+            "label": "SO-5",
+        },
+    }
+    parsed = {"intent": "read", "resource": "companies", "filters": {}}
+    result = apply_referent_context(parsed, classification)
+    assert result["resource"] == "service-orders"
+    assert result["filters"]["id"]["value"] == 28
+    assert result["question_type"] == "details"
+    assert result["limit"] == 1
+
+
+def test_extract_result_items_from_list_response():
+    data = {
+        "results": [
+            {"id": 28, "code": "SO-5", "company": {"id": 3, "name": "Bharat Engineering Works"}},
+        ]
+    }
+    items = extract_result_items_from_data(data)
+    assert len(items) == 1
+    assert items[0]["id"] == 28
+    assert items[0]["code"] == "SO-5"
+    assert items[0]["company_name"] == "Bharat Engineering Works"
+
+
+def test_build_session_metadata_includes_primary_item():
+    parsed = {"resource": "service-orders", "intent": "read", "filters": {}}
+    response = {
+        "data": {"results": [{"id": 28, "code": "SO-5"}]},
+        "pagination": {"total_count": 1, "has_more": False},
+    }
+    meta = build_session_metadata(parsed, response)
+    assert meta["primary_item"]["id"] == 28
+    assert meta["result_items"][0]["code"] == "SO-5"
 
 
 @patch("enable_ai.follow_up_detection.get_openai_client")

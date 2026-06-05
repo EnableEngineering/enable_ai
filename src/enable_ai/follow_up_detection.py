@@ -35,8 +35,79 @@ FOLLOW_UP_TYPES = (
 NO_MERGE_TYPES = frozenset({"standalone", "reset"})
 
 
+def extract_result_items_from_data(
+    data: Any,
+    max_items: int = 5,
+) -> List[Dict[str, Any]]:
+    """Extract slim item records from API response data for session context."""
+    if not data:
+        return []
+
+    if isinstance(data, dict) and "results" in data:
+        rows = data.get("results") or []
+    elif isinstance(data, dict) and "items" in data:
+        rows = data.get("items") or []
+    elif isinstance(data, list):
+        rows = data
+    elif isinstance(data, dict) and "id" in data:
+        rows = [data]
+    else:
+        return []
+
+    items: List[Dict[str, Any]] = []
+    for row in rows[:max_items]:
+        if not isinstance(row, dict) or row.get("id") is None:
+            continue
+        slim: Dict[str, Any] = {"id": row.get("id")}
+        for key in ("name", "code", "title", "number", "reference"):
+            if row.get(key) is not None:
+                slim[key] = row.get(key)
+        company = row.get("company")
+        if isinstance(company, dict):
+            if company.get("name"):
+                slim["company_name"] = company.get("name")
+            if company.get("id"):
+                slim["company_id"] = company.get("id")
+        elif row.get("company_name"):
+            slim["company_name"] = row.get("company_name")
+        items.append(slim)
+    return items
+
+
+def build_session_metadata(
+    parsed: Dict[str, Any],
+    response: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Build assistant message metadata for follow-up / pronoun resolution."""
+    pagination = response.get("pagination") or {}
+    data = response.get("data")
+    items = extract_result_items_from_data(data)
+    count = pagination.get("total_count")
+    if count is None and isinstance(data, dict):
+        count = data.get("count") or data.get("total_count")
+    if count is None and items:
+        count = len(items)
+
+    primary_item = None
+    if len(items) == 1:
+        primary_item = items[0]
+    elif count == 1 and items:
+        primary_item = items[0]
+
+    return {
+        "resource": parsed.get("resource"),
+        "intent": parsed.get("intent"),
+        "filters": parsed.get("filters", {}),
+        "next_url": pagination.get("next_url"),
+        "count": count,
+        "has_more": pagination.get("has_more", False),
+        "result_items": items,
+        "primary_item": primary_item,
+    }
+
+
 def extract_last_result_metadata(conversation_history: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Read resource/filters from the most recent assistant message metadata."""
+    """Read resource/filters/items from the most recent assistant message metadata."""
     if not conversation_history:
         return {}
 
@@ -52,6 +123,8 @@ def extract_last_result_metadata(conversation_history: List[Dict[str, Any]]) -> 
                 "next_url": metadata.get("next_url"),
                 "count": metadata.get("count"),
                 "has_more": metadata.get("has_more", False),
+                "result_items": metadata.get("result_items") or [],
+                "primary_item": metadata.get("primary_item"),
             }
     return {}
 
@@ -101,6 +174,7 @@ def classify_follow_up(
         "keep_previous_resource": False,
         "question_type_override": None,
         "display_mode_override": None,
+        "referent": None,
     }
 
     if not query or not query.strip():
@@ -118,6 +192,9 @@ def classify_follow_up(
 
 PREVIOUS RESULT METADATA (from last assistant turn):
 {json.dumps(prior_meta, indent=2) if prior_meta else "None — no prior structured context"}
+
+PREVIOUS RESULT ITEMS (use for "it"/"this"/"that" pronouns):
+{json.dumps(prior_meta.get("result_items") or prior_meta.get("primary_item") or [], indent=2)}
 
 RECENT CONVERSATION:
 {json.dumps(recent, indent=2) if recent else "None — first message in session"}
@@ -139,6 +216,7 @@ Decide:
    - standalone: new independent query (may be same or different resource)
 3. merge_with_previous=true ONLY for next_page, first_n, last_n, reference, refinement — NEVER for reset or standalone
 4. If refinement after a count, override question_type to "details" and display_mode to "detailed"
+5. If the query uses "it", "this", "that", "the one", etc. referring to a prior result item, set referent to that item from PREVIOUS RESULT ITEMS (id, resource)
 
 Return JSON only:
 {{
@@ -147,7 +225,8 @@ Return JSON only:
   "merge_with_previous": boolean,
   "keep_previous_resource": boolean,
   "question_type_override": "count" | "list" | "details" | null,
-  "display_mode_override": "summary" | "detailed" | "full" | null
+  "display_mode_override": "summary" | "detailed" | "full" | null,
+  "referent": null | {{"resource": "resource_name", "id": number, "id_field": "id", "label": "optional display id"}}
 }}"""
 
     try:
@@ -175,16 +254,30 @@ Return JSON only:
                 result["is_follow_up"] = False
                 result["merge_with_previous"] = False
                 result["keep_previous_resource"] = False
+            referent = result.get("referent")
+            if (
+                isinstance(referent, dict)
+                and referent.get("id") is not None
+            ):
+                result["is_follow_up"] = True
+                result["merge_with_previous"] = False
+                if result.get("follow_up_type") in NO_MERGE_TYPES:
+                    result["follow_up_type"] = "refinement"
+                if not result.get("question_type_override"):
+                    result["question_type_override"] = "details"
+                if not result.get("display_mode_override"):
+                    result["display_mode_override"] = "detailed"
     except Exception as exc:
         logger.warning("Follow-up LLM classification failed: %s — treating as standalone", exc)
         result = default
 
     logger.info(
-        "Follow-up classification: is_follow_up=%s type=%s merge=%s keep_resource=%s",
+        "Follow-up classification: is_follow_up=%s type=%s merge=%s keep_resource=%s referent=%s",
         result.get("is_follow_up"),
         result.get("follow_up_type"),
         result.get("merge_with_previous"),
         result.get("keep_previous_resource"),
+        (result.get("referent") or {}).get("id"),
     )
 
     _classification_cache[key] = result
@@ -202,6 +295,75 @@ def is_follow_up_query(
 def get_follow_up_type(query: str, conversation_history: Optional[List[Dict[str, Any]]] = None) -> str:
     """Return the LLM-classified follow-up type."""
     return classify_follow_up(query, conversation_history).get("follow_up_type", "standalone")
+
+
+def _filter_values_equal(a: Any, b: Any) -> bool:
+    """Compare filter values whether raw or {operator, value} dicts."""
+    val_a = a.get("value") if isinstance(a, dict) and "value" in a else a
+    val_b = b.get("value") if isinstance(b, dict) and "value" in b else b
+    return val_a == val_b
+
+
+def strip_inherited_session_filters(
+    parsed: Dict[str, Any],
+    conversation_history: Optional[List[Dict[str, Any]]],
+    user_context: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Remove filters copied from the previous turn (reset / fresh list queries)."""
+    result = dict(parsed)
+    meta = extract_last_result_metadata(conversation_history or [])
+    prev_filters = meta.get("filters") or {}
+    filters = dict(result.get("filters") or {})
+
+    for field, prev_val in prev_filters.items():
+        if field in filters and _filter_values_equal(filters[field], prev_val):
+            del filters[field]
+
+    user_id = (user_context or {}).get("user_id")
+    if user_id is not None and "technician" in filters:
+        tech_val = filters["technician"]
+        tech = tech_val.get("value") if isinstance(tech_val, dict) else tech_val
+        if tech == user_id:
+            del filters["technician"]
+
+    result["filters"] = filters
+    result["merge_with_previous"] = False
+    return result
+
+
+def apply_referent_context(
+    parsed: Dict[str, Any],
+    classification: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Apply LLM-resolved item referent (it/this/that) as an id filter + detail fetch."""
+    if not isinstance(parsed, dict) or not classification:
+        return parsed
+
+    referent = classification.get("referent")
+    if not referent or not isinstance(referent, dict) or referent.get("id") is None:
+        return parsed
+
+    result = dict(parsed)
+    id_field = referent.get("id_field") or "id"
+    result["filters"] = dict(result.get("filters") or {})
+    result["filters"][id_field] = {
+        "operator": "equals",
+        "value": referent["id"],
+    }
+    if referent.get("resource"):
+        result["resource"] = referent["resource"]
+    result["question_type"] = classification.get("question_type_override") or "details"
+    result["display_mode"] = classification.get("display_mode_override") or "detailed"
+    result["limit"] = 1
+    result["merge_with_previous"] = False
+    result["_referent"] = referent
+    logger.info(
+        "Applied referent context: resource=%s %s=%s",
+        result.get("resource"),
+        id_field,
+        referent["id"],
+    )
+    return result
 
 
 def should_merge_previous_filters(
@@ -240,6 +402,7 @@ def apply_follow_up_context(
     conversation_history: Optional[List[Dict[str, Any]]],
     is_follow_up: bool = False,
     classification: Optional[Dict[str, Any]] = None,
+    user_context: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Anchor parsed query to previous resource/filters when LLM says to keep context.
@@ -249,11 +412,13 @@ def apply_follow_up_context(
 
     clf = classification or classify_follow_up(query, conversation_history)
 
-    # Reset/standalone: fresh query — do not inherit previous filters
+    # Item pronoun referent (it/this/that) — fetch specific prior record
+    if clf.get("referent") and isinstance(clf.get("referent"), dict):
+        return apply_referent_context(parsed, clf)
+
+    # Reset/standalone: fresh query — strip inherited session filters
     if clf.get("follow_up_type") in NO_MERGE_TYPES:
-        result = dict(parsed)
-        result["merge_with_previous"] = False
-        return result
+        return strip_inherited_session_filters(parsed, conversation_history, user_context)
 
     if not clf.get("keep_previous_resource") and not clf.get("merge_with_previous"):
         return parsed

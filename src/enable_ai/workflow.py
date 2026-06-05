@@ -19,6 +19,7 @@ from .follow_up_suggestions import (
 )
 from .follow_up_detection import (
     apply_follow_up_context,
+    build_session_metadata,
     classify_follow_up,
     extract_last_result_metadata,
     should_merge_previous_filters,
@@ -449,6 +450,7 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
                 conversation_history,
                 state.get("user_context"),  # v0.3.29: pass user context for pronoun resolution
                 classification_hint=state.get("classification_hint"),
+                follow_up_classification=follow_up_classification,
             )
 
             # v0.3.37: Log to tracer
@@ -635,13 +637,17 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
                 conversation_history,
                 state.get("is_follow_up", False),
                 classification=follow_up_classification,
+                user_context=state.get("user_context"),
             )
 
             active_schema = state.get("active_schema") or {}
 
             # Resolve __current_user_id__ etc. before planning (covers classify shortcut path)
             parsed = resolve_user_context_in_parsed(
-                parsed, state.get("user_context"), query_text,
+                parsed,
+                state.get("user_context"),
+                query_text,
+                follow_up_classification=follow_up_classification,
             )
 
             # Semantic filters (idempotent) — covers classify shortcut that skips LLM parse
@@ -950,9 +956,12 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
         # Check if multi-step
         is_multi_step = execution_plan.get("is_multi_step", False)
         
-        # Initialize pagination_info so it's always defined for trace logging and
-        # last_result_metadata, regardless of which branch we take below.
+        # Initialize so trace logging and last_result_metadata always have values.
         pagination_info: Dict[str, Any] = {}
+        data: Any = None
+        final_data: Any = None
+        response: Dict[str, Any] = {}
+        summary = ""
 
         if is_multi_step:
             # Summarize multi-step execution
@@ -1148,7 +1157,13 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
                         "result": result,
                     },
                 )
-                return {"summary": summary, "response": response}
+                last_result_metadata = build_session_metadata(parsed, response)
+                return {
+                    "summary": summary,
+                    "response": response,
+                    "last_result_metadata": last_result_metadata,
+                    "parsed": parsed,
+                }
             
             # Non-count questions continue with normal logic
             if display_mode == "full":
@@ -1283,14 +1298,18 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
             if has_error:
                 response["error"] = result.get("error")
 
-        # v0.3.37: Store result metadata for follow-up queries
-        last_result_metadata = {
-            "resource": parsed.get("resource"),
-            "filters": parsed.get("filters", {}),
-            "count": pagination_info.get("total_count", 0) if 'pagination_info' in dir() else 0,
-            "has_more": pagination_info.get("has_more", False) if 'pagination_info' in dir() else False,
-            "next_url": pagination_info.get("next_url") if 'pagination_info' in dir() else None,
-        }
+        # v0.3.64: Store result metadata + items for pronoun resolution
+        if is_multi_step and step_results:
+            session_data = step_results[-1].get("result")
+        elif final_data is not None:
+            session_data = final_data
+        else:
+            session_data = data
+
+        last_result_metadata = build_session_metadata(
+            parsed,
+            {"data": session_data, "pagination": pagination_info},
+        )
 
         # v0.3.37: Log to tracer and save
         tracer = state.get("_tracer")
