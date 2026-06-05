@@ -858,7 +858,12 @@ class APIOrchestrator:
                 return name
         return constants.LIMIT_PARAM_NAMES[0]
 
-    def _create_api_plan(self, parsed: Dict[str, Any], schema: dict) -> Optional[Dict[str, Any]]:
+    def _create_api_plan(
+        self,
+        parsed: Dict[str, Any],
+        schema: dict,
+        user_context: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
         """
         Create API execution plan.
 
@@ -872,14 +877,24 @@ class APIOrchestrator:
         # are sent. The matcher builds query params from entities only; filters are not used.
         from .query_execution import dedupe_fk_lookup_filters
 
-        filters = dedupe_fk_lookup_filters(parsed.get("filters") or {})
-        merged = dict(parsed.get("entities") or {})
+        from .user_context_resolver import resolve_params_dict, resolve_user_context_in_parsed
+
+        step_parsed = parsed
+        if user_context:
+            step_parsed = resolve_user_context_in_parsed(
+                parsed,
+                user_context,
+                parsed.get("original_input") or "",
+            )
+
+        filters = dedupe_fk_lookup_filters(step_parsed.get("filters") or {})
+        merged = dict(step_parsed.get("entities") or {})
         for key, val in filters.items():
             if isinstance(val, dict) and "value" in val:
                 merged[key] = val["value"]
             else:
                 merged[key] = val
-        parsed_for_match = {**parsed, "entities": merged}
+        parsed_for_match = {**step_parsed, "entities": merged, "filters": filters}
 
         result = self.api_matcher.match_api(parsed_for_match, schema)
         
@@ -902,7 +917,7 @@ class APIOrchestrator:
         
         if isinstance(result, APIRequest):
             # Extract information from APIRequest object
-            params = dict(result.params) if result.params else {}
+            params = resolve_params_dict(result.params, user_context)
             # When user asks for a result cap, parsed has limit — map to API's param from schema (page_size, limit, etc.)
             limit = parsed.get("limit")
             if limit is not None:

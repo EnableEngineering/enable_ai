@@ -27,7 +27,7 @@ from .follow_up_detection import (
 from .query_execution import merge_execution_context
 from .semantic_filters import apply_semantic_filters
 from .response_envelope import enrich_api_response
-from .user_context_resolver import resolve_user_context_in_parsed
+from .user_context_resolver import resolve_params_dict, resolve_user_context_in_parsed
 from . import constants
 
 # Module-level logger
@@ -729,7 +729,16 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
         # Resolve dependencies - substitute variables from previous steps (uses planner's extract when present)
         resolved_step = _resolve_step_dependencies(current_step_def, step_results, all_steps=steps)
         resolved_step = merge_execution_context(resolved_step, state.get("parsed", {}))
-        
+
+        user_context = state.get("user_context")
+        if user_context:
+            resolved_step = resolve_user_context_in_parsed(
+                resolved_step,
+                user_context,
+                state.get("query") or "",
+                follow_up_classification=state.get("follow_up_classification"),
+            )
+
         # Convert step to API plan format
         plan = {
             "type": "api",
@@ -741,7 +750,11 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
         
         # Create API request using the matcher
         active_schema = state.get("active_schema") or {}
-        api_plan = processor._create_api_plan(resolved_step, active_schema)
+        api_plan = processor._create_api_plan(
+            resolved_step, active_schema, user_context=user_context,
+        )
+        if api_plan and api_plan.get("params") and user_context:
+            api_plan["params"] = resolve_params_dict(api_plan["params"], user_context)
         
         if api_plan and api_plan.get("type") == "missing_info":
             return {

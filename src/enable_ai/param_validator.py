@@ -76,6 +76,10 @@ def validate_parsed(
             warnings.append(f"Invalid limit {result['limit']!r}; removed")
             result.pop("limit", None)
 
+    # Resolve __current_user_id__ before schema validation (placeholders are not real values)
+    if user_context:
+        result = resolve_user_context_in_parsed(result, user_context, query)
+
     # Validate filter values via introspector
     resource = result.get("resource", "")
     if resource and result.get("filters"):
@@ -93,10 +97,6 @@ def validate_parsed(
                 repaired_filters[field] = fval
             warnings.extend(vr.warnings or [])
         result["filters"] = repaired_filters
-
-    # Resolve __current_user_id__ and similar placeholders from user_context
-    if user_context:
-        result = resolve_user_context_in_parsed(result, user_context, query)
 
     # Pronouns without user context → ask for clarification
     q_lower = (query or "").lower()

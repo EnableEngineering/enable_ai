@@ -1,6 +1,12 @@
-from enable_ai.execution_planner import ExecutionPlanner
-from enable_ai.user_context_resolver import resolve_user_context_in_parsed
 from unittest.mock import patch
+
+from enable_ai.execution_planner import ExecutionPlanner
+from enable_ai.user_context_resolver import (
+    normalize_user_context,
+    resolve_params_dict,
+    resolve_user_context_in_parsed,
+    resolve_user_context_placeholders,
+)
 
 
 def test_resolve_current_user_id_placeholder():
@@ -48,3 +54,24 @@ def test_no_fk_lookup_after_user_context_resolution():
     assert lookups == []
     assert plan["total_steps"] == 1
     assert plan["steps"][0]["filters"]["technician"]["value"] == 17
+
+
+def test_normalize_user_context_aliases():
+    ctx = normalize_user_context({"id": 17, "username": "tech@example.com"})
+    assert ctx["user_id"] == 17
+
+
+def test_resolve_params_dict_flat_placeholder():
+    params = {"technician": "__current_user_id__", "status__name": "New"}
+    resolved = resolve_params_dict(params, {"user_id": 17})
+    assert resolved["technician"] == 17
+    assert resolved["status__name"] == "New"
+
+
+def test_resolve_user_context_placeholders_alias():
+    parsed = {
+        "filters": {"technician": {"operator": "equals", "value": "__current_user_id__"}},
+    }
+    result = resolve_user_context_placeholders(parsed, {"id": 17})
+    assert result["filters"]["technician"]["value"] == 17
+
