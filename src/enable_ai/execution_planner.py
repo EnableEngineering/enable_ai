@@ -9,6 +9,7 @@ import json
 from typing import Dict, Any, Optional, List
 
 from .utils import get_openai_client, setup_logger, DETERMINISTIC_TEMP
+from .query_execution import enrich_step_from_parsed, merge_execution_context
 
 
 class ExecutionPlanner:
@@ -248,15 +249,15 @@ class ExecutionPlanner:
                 "value": f"{{{lookup['field']}_id}}"  # Will be substituted
             }
 
-        steps.append({
+        steps.append(merge_execution_context({
             "step_id": len(steps) + 1,
             "intent": parsed.get("intent", "read"),
             "resource": parsed.get("resource"),
             "entities": parsed.get("entities", {}),
             "filters": main_filters,
             "depends_on": list(range(1, len(steps) + 1)),
-            "description": f"Get {parsed.get('resource')} with resolved FK IDs"
-        })
+            "description": f"Get {parsed.get('resource')} with resolved FK IDs",
+        }, parsed))
 
         return {
             "steps": steps,
@@ -307,15 +308,15 @@ class ExecutionPlanner:
         intent = parsed_query.get('intent', 'read')
         resource = parsed_query.get('resource', '')
         
-        return {
+        return enrich_step_from_parsed({
             "step_id": 1,
             "intent": intent,
             "resource": resource,
             "entities": parsed_query.get('entities', {}),
             "filters": parsed_query.get('filters', {}),
             "depends_on": [],
-            "description": f"{intent.upper()} {resource}"
-        }
+            "description": f"{intent.upper()} {resource}",
+        }, parsed_query)
     
     def _plan_with_llm(
         self, 
@@ -348,6 +349,10 @@ class ExecutionPlanner:
             if "steps" not in plan:
                 raise ValueError("Plan missing 'steps' field")
             
+            plan["steps"] = [
+                enrich_step_from_parsed(step, parsed_query)
+                for step in plan.get("steps", [])
+            ]
             plan["is_multi_step"] = len(plan["steps"]) > 1
             plan["total_steps"] = len(plan["steps"])
             
@@ -388,12 +393,15 @@ OUTPUT FORMAT (JSON):
             "depends_on": [],
             "extract": {"variable_name": "$.json.path"},
             "description": "Human-readable step description",
-            "fetch_all_pages": false
+            "fetch_all_pages": false,
+            "sort": {"field": "created_at", "order": "desc"},
+            "limit": 10
         }
     ]
 }
 
 RULES:
+- Include sort and limit on steps when the user asks for ordering or a specific count (e.g. "last report" -> sort desc, limit 1)
 - step_id starts at 1 and increments
 - depends_on lists step_ids that must complete first
 - extract uses JSONPath to get data from the previous step's response; use {variable_name} in later steps

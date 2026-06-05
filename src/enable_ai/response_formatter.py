@@ -11,9 +11,10 @@ Supports:
 The LLM has full control over the response - no code-based overrides.
 """
 
-from typing import Dict, Any, List, Optional, Union, Literal
+from typing import Dict, Any, List, Optional, Union, Literal, cast
 import json
 from .utils import get_openai_client, setup_logger, DETERMINISTIC_TEMP
+from .follow_up_suggestions import generate_follow_up_queries
 from . import constants
 
 logger = setup_logger(__name__)
@@ -145,16 +146,26 @@ class ResponseFormatter:
             result["pagination"] = pagination
             return result
 
-        # Use intelligent LLM-driven formatting for all complex data
+        # Use intelligent LLM-driven formatting for all complex data.
+        # The LLM is responsible for understanding the user's intent
+        # (e.g. "give me their email ids") and choosing which fields
+        # to surface, while strictly following the constraints in the
+        # prompt (no invention, include all items, etc.).
         result = self._generate_intelligent_response(format_data, query, context, pagination)
 
-        # Append pagination info to summary
+        # Append pagination info to summary and attach follow-up query templates
         if pagination.get("has_more") or pagination.get("total", 0) > pagination.get("returned", 0):
             result["summary"] = self._append_pagination_info(
                 result.get("summary", ""),
                 pagination,
                 context
             )
+            pagination_info = {
+                "total_count": pagination.get("total", 0),
+                "actual_count": pagination.get("returned", 0),
+                "has_more": pagination.get("has_more", False),
+            }
+            result["follow_up_queries"] = generate_follow_up_queries(pagination_info, context)
 
         result["pagination"] = pagination
         return result
@@ -225,6 +236,10 @@ mention that the user can say "show more" or "next page" to see additional resul
         # Build the prompt
         prompt = f"""You are a helpful AI assistant. The user asked a question and I retrieved data from an API.
 Generate a natural, helpful response that answers the user's question.
+CRITICAL CONSTRAINT: The response MUST be derived STRICTLY from the API data provided below.
+You MUST NOT invent, guess, or fabricate any users, roles, names, ids, counts, or other values
+that are not present in the data. If a value is missing in the data, clearly say it is missing
+instead of making something up (e.g. "unnamed user (id=123)" if only an id is present).
 {pagination_info}
 
 USER'S QUESTION: "{query}"
@@ -234,26 +249,33 @@ DATA RETRIEVED ({data_count} item{"s" if data_count != 1 else ""} total):
 {"[... and " + str(remaining) + " more items not shown]" if remaining > 0 else ""}
 
 CRITICAL INSTRUCTIONS:
-1. **USE ALL THE DATA**: You MUST include ALL {data_count} items in your response, not just a subset.
+1. **USE ONLY THE DATA PROVIDED (NO INVENTION)**:
+   - Every user, role, id, status, or field you mention MUST come directly from the data shown below.
+   - Do NOT create placeholder labels like "User 3" or "Role 3" unless those exact strings appear in the data.
+   - If the data does not contain a value, say that it is not available instead of inventing it.
+
+2. **USE ALL THE DATA**: You MUST include ALL {data_count} items in your response, not just a subset.
    - If there are 3 users, list ALL 3 users
    - If there are 5 orders, show ALL 5 orders
    - NEVER say "Found X items" without listing them ALL (unless there are more than 15)
 
-2. **Understand what the user wants**: Are they asking for a count? A list? Details? Specific information?
+3. **Understand what the user wants**: Are they asking for a count? A list? Details? Specific information?
+   - If they ask for specific fields (e.g. email IDs, names, roles), extract EXACTLY those fields for EVERY item that has them.
+   - If some items do not have that field, say that it is missing instead of skipping them or making up a value.
 
-3. **Choose the best response format**:
+4. **Choose the best response format**:
    - **Text response**: For counts, summaries, single items, or when natural language is clearest
    - **Bullet list**: For 2-10 items where the user wants to see them (SHOW ALL)
    - **Markdown table**: For 5+ items with multiple fields worth comparing (SHOW ALL)
    - **Detailed breakdown**: For complex single items or when user asks for details
 
-4. **Be specific and helpful**:
+5. **Be specific and helpful (without inventing anything)**:
    - Include actual names, IDs, or identifiers from the data for EVERY item
    - If showing a list, show ALL the actual items (names, key details) - do not truncate
    - If it's a count question, give the count AND list what they are
    - Only truncate if there are more than 15 items
 
-5. **Response format**:
+6. **Response format**:
    Return a JSON object with exactly these fields:
    {{
      "format": "text" | "table" | "bullets" | "detailed",
@@ -390,7 +412,7 @@ REMEMBER: Include ALL {data_count} items in your response!
                     return False
             return True
         return False
-    
+
     def _analyze_data_structure(self, data: Any, context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         """Analyze data structure to inform formatting decisions."""
         analysis = {
@@ -570,10 +592,12 @@ Respond with only the format name, lowercase.
             
             format_choice = (content or "").strip().lower()
             valid_formats = self._get_valid_formats()
-            
+
             if format_choice in valid_formats:
-                logger.info(f"LLM selected format: {format_choice}")
-                return format_choice
+                # Cast is safe here because we validate against the allowed set first
+                typed_choice = cast(FormatType, format_choice)
+                logger.info(f"LLM selected format: {typed_choice}")
+                return typed_choice
             raise ValueError(
                 f"Format selection failed: LLM returned invalid format {format_choice!r} "
                 f"(expected one of {valid_formats}). Response was: {content[:100]!r}"
@@ -921,8 +945,8 @@ Summarize accurately from the data above only.
         elif list_format == "detailed":
             return self._format_detailed_with_hints(data, hints)
         else:
-            # Fall back to default formatting
-            return None
+            # Fall back to default formatting when hints don't apply
+            return ""
 
     def _format_table_with_hints(
         self,
@@ -1196,16 +1220,21 @@ Summarize accurately from the data above only.
                 summary += f"\n\n✅ Showing all {total} result(s)."
             return summary
 
-        # More data available - ALWAYS inform user
+        # More data available - ALWAYS inform user (aligned with follow_up_queries templates)
         if has_more or returned < total:
-            remaining = total - returned
             resource = context.get("resource", "items") if context else "items"
+            pagination_info = {
+                "total_count": total,
+                "actual_count": returned,
+                "has_more": has_more,
+            }
+            follow_ups = generate_follow_up_queries(pagination_info, context)
 
             summary += f"\n\n📊 **{constants.PAGINATION_INFO_TEMPLATE.format(shown=returned, total=total, resource=resource)}**"
-            summary += f"\n\n💡 **To see more:**"
-            summary += f"\n  • \"Show me next {min(remaining, 20) if remaining > 0 else 20}\" - see more results"
-            summary += f"\n  • \"Show all {resource}\" - see complete list"
-            summary += f"\n  • Add filters to narrow down: \"Show only active ones\""
+            if follow_ups:
+                summary += f"\n\n💡 **To see more:**"
+                for item in follow_ups:
+                    summary += f"\n  • \"{item['query']}\" - {item['label']}"
 
             if total > 100:
                 summary += f"\n  • Consider exporting for {total}+ records"

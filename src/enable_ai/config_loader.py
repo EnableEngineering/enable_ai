@@ -18,6 +18,8 @@ from typing import Dict, Any, Optional
 from pathlib import Path
 import sys
 
+from . import constants
+
 
 class ConfigLoader:
     """Loads and manages configuration settings."""
@@ -115,6 +117,7 @@ class ConfigLoader:
                 "custom_entities": {}
             },
             "query_understanding": {
+                "default_page_size": constants.DEFAULT_PAGE_SIZE,
                 "intent_classifier": {
                     "type": "keyword_based",
                     "confidence_threshold": 0.6
@@ -168,6 +171,20 @@ class ConfigLoader:
     def is_feature_enabled(self, feature_path: str) -> bool:
         """Check if a feature is enabled."""
         return self.get(feature_path, False)
+
+    def get_default_page_size(self) -> int:
+        """
+        Get default page_size for list queries when the user does not specify a limit.
+
+        Reads query_understanding.default_page_size from config.json, falling back to
+        constants.DEFAULT_PAGE_SIZE (overridable via ENABLE_AI_DEFAULT_PAGE_SIZE).
+        """
+        raw = self.get("query_understanding.default_page_size", constants.DEFAULT_PAGE_SIZE)
+        try:
+            size = int(raw)
+        except (TypeError, ValueError):
+            return constants.DEFAULT_PAGE_SIZE
+        return max(1, min(size, constants.PAGE_SIZE_CAP))
     
     def reload(self):
         """Reload configuration from file."""

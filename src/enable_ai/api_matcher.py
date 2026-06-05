@@ -1,6 +1,11 @@
 from typing import Dict, Any, Optional, List
 from .types import APIRequest, APIError, MissingInformation
-from .utils import setup_logger, get_role_phrase_map
+from .utils import setup_logger
+from .query_execution import (
+    format_sort_param,
+    split_filters_for_endpoint,
+)
+from .semantic_filters import inject_semantic_filters
 from . import constants
 
 
@@ -353,11 +358,9 @@ class APIMatcher:
             # v0.3.37: Collect filter warnings to pass to user
             filter_warnings = []
 
-            # v0.3.50: Run semantic safeguards even when filters is empty, so we inject
-            # role/stock_level when the query clearly asks for them (e.g. "customer type users").
-            filters = filters or {}
-            filters = self._ensure_low_stock_filter(filters, resource, original_input, resource_hints)
-            filters = self._ensure_role_filter(filters, resource, original_input, resource_hints)
+            filters = inject_semantic_filters(
+                filters or {}, resource, original_input, resource_hints,
+            )
 
             # Validate filter values against schema
             if filters:
@@ -369,9 +372,14 @@ class APIMatcher:
                         self.logger.warning(warning)
                         filter_warnings.append(warning)
 
-                # v0.3.37: Check for filters that don't match any endpoint params
-                unmatched = self._check_unmatched_filters(filters, matched_endpoint, resource)
-                filter_warnings.extend(unmatched)
+                # Split filters: server-side params vs client-side post-filter
+                server_filters, client_filters, split_warnings = split_filters_for_endpoint(
+                    filters, matched_endpoint
+                )
+                filter_warnings.extend(split_warnings)
+                filters = server_filters
+            else:
+                client_filters = {}
 
             # Build and return the API request with validated filters and warnings
             return self._build_api_request(
@@ -379,112 +387,13 @@ class APIMatcher:
                 filters=filters,
                 schema=api_schema,
                 resource=resource,
-                warnings=filter_warnings  # v0.3.37: Pass warnings through
+                warnings=filter_warnings,
+                parsed_input=parsed_input,
+                client_side_filters=client_filters,
             )
 
         except Exception as e:
             return APIError(f"API matching failed: {str(e)}")
-
-    def _ensure_low_stock_filter(
-        self,
-        filters: Dict[str, Any],
-        resource: str,
-        original_input: str,
-        resource_hints: Dict[str, Any],
-    ) -> Dict[str, Any]:
-        """
-        Ensure "low stock" style phrases apply a stock_level=low filter when possible.
-
-        This provides an API-agnostic safety net for queries like:
-            - "show me items low in stock"
-            - "show low stock consumables"
-
-        Behaviour:
-        - Only activates when:
-          * The schema's resource_hints define a "stock_level" field for the
-            current resource, and
-          * No explicit "stock_level" filter is already present.
-        - Adds a simple semantic filter:
-              stock_level = {"operator": "equals", "value": "low"}
-          The existing _validate_filter_values + build_query_params logic will
-          then map this to the actual API query parameter (e.g. ?stock_level=low
-          or a more complex Django-style lookup) and apply any synonyms mapping
-          configured in resource_hints.
-        """
-        # If we already have a stock_level filter, don't override it.
-        if "stock_level" in filters:
-            return filters
-
-        # Quick check: does the current resource advertise a stock_level field?
-        rh_for_resource = resource_hints.get(resource) or {}
-        if not isinstance(rh_for_resource, dict) or "stock_level" not in rh_for_resource:
-            return filters
-
-        text = (original_input or "").lower()
-        low_stock_patterns = (
-            "low in stock",
-            "low stock",
-            "stock is low",
-            "running low",
-        )
-        if not any(p in text for p in low_stock_patterns):
-            return filters
-
-        # Inject a semantic filter; the value "low" will be canonicalized and/or
-        # translated using resource_hints["stock_level"]["values"/"synonyms"]
-        # inside _validate_filter_values and then mapped to actual API params
-        # inside build_query_params.
-        new_filters = dict(filters)
-        new_filters["stock_level"] = {"operator": "equals", "value": "low"}
-        self.logger.info(
-            "Inferred semantic filter from 'low stock' phrase: stock_level=low "
-            f"for resource '{resource}'"
-        )
-        return new_filters
-
-    def _ensure_role_filter(
-        self,
-        filters: Dict[str, Any],
-        resource: str,
-        original_input: str,
-        resource_hints: Dict[str, Any],
-    ) -> Dict[str, Any]:
-        """
-        Ensure "users by role" phrases (technician, customer, client, admin, manager)
-        apply a role filter when resource is users and hints define role.
-
-        workflow/orchestrator path, we still inject the correct role when the
-        query clearly asks for a specific user type. Uses resource_hints.role.synonyms
-        when present (config-driven), else constants.ROLE_QUERY_TO_VALUE.
-        """
-        if any(k in filters for k in ("role", "role__name")):
-            return filters
-
-        resource_lower = (resource or "").lower().replace("-", "_")
-        if resource_lower not in ("users", "user"):
-            return filters
-
-        rh_for_resource = resource_hints.get(resource) or resource_hints.get(resource_lower) or {}
-        if not isinstance(rh_for_resource, dict) or "role" not in rh_for_resource:
-            return filters
-
-        # Config-driven: phrase → value from resource_hints.role.synonyms; else fallback
-        role_map = get_role_phrase_map(resource_hints, resource)
-        if not role_map:
-            role_map = list(constants.ROLE_QUERY_TO_VALUE)
-
-        text = (original_input or "").lower()
-        for phrase, role_value in role_map:
-            if phrase in text:
-                new_filters = dict(filters)
-                new_filters["role"] = {"operator": "equals", "value": role_value}
-                self.logger.info(
-                    "Inferred role filter from query phrase: role=%s for resource '%s'",
-                    role_value, resource,
-                )
-                return new_filters
-
-        return filters
 
     def build_query_params(
         self,
@@ -573,15 +482,15 @@ class APIMatcher:
         if requested_fields and 'fields' in available_params:
             params['fields'] = ','.join(requested_fields)
 
-        # 4. Handle sorting
-        sort = parsed.get('sort')
-        if sort:
+        # 4. Handle sorting (dict -> API ordering string, e.g. "-created_at")
+        sort_value = format_sort_param(parsed.get('sort'))
+        if sort_value:
             if 'ordering' in available_params:
-                params['ordering'] = sort
+                params['ordering'] = sort_value
             elif 'sort' in available_params:
-                params['sort'] = sort
+                params['sort'] = sort_value
             elif 'order_by' in available_params:
-                params['order_by'] = sort
+                params['order_by'] = sort_value
 
         # 5. Handle limit (don't add arbitrary limits - only if user specified)
         limit = parsed.get('limit')
@@ -967,7 +876,9 @@ class APIMatcher:
         filters: Optional[Dict[str, Any]] = None,
         schema: Optional[Dict[str, Any]] = None,
         resource: Optional[str] = None,
-        warnings: Optional[List[str]] = None  # v0.3.37: Filter warnings
+        warnings: Optional[List[str]] = None,
+        parsed_input: Optional[Dict[str, Any]] = None,
+        client_side_filters: Optional[Dict[str, Any]] = None,
     ) -> APIRequest:
         """
         Build APIRequest from matched endpoint and extracted entities/filters.
@@ -997,11 +908,16 @@ class APIMatcher:
 
         if method in ['GET', 'DELETE']:
             # For GET/DELETE, use build_query_params for server-side filtering
-            if filters and schema:
+            if schema:
                 parsed_for_params = {
-                    'filters': filters,
+                    'filters': filters or {},
                     'resource': resource or '',
                 }
+                if parsed_input:
+                    if parsed_input.get('sort'):
+                        parsed_for_params['sort'] = parsed_input['sort']
+                    if parsed_input.get('limit') is not None:
+                        parsed_for_params['limit'] = parsed_input['limit']
                 params = self.build_query_params(endpoint_data, parsed_for_params, schema)
 
             # Also add any direct entity matches to query params
@@ -1025,7 +941,8 @@ class APIMatcher:
             params=params,
             method=method,
             authentication_required=endpoint_data.get('authentication_required', True),
-            warnings=warnings or []  # v0.3.37: Include filter warnings
+            warnings=warnings or [],
+            client_side_filters=client_side_filters or {},
         )
 
     def _generate_helpful_error(

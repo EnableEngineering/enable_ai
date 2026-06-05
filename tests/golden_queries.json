@@ -1,0 +1,51 @@
+[
+  {
+    "id": "low_stock_consumables",
+    "query": "show low stock consumables",
+    "parsed": {"intent": "read", "resource": "inventory-consumables", "filters": {}},
+    "expect_filters": {"stock_level": "low"}
+  },
+  {
+    "id": "customer_type_users",
+    "query": "show customer type users",
+    "parsed": {"intent": "read", "resource": "users", "filters": {}},
+    "expect_filters": {"role": "Client"}
+  },
+  {
+    "id": "technician_users",
+    "query": "which technicians are available",
+    "parsed": {"intent": "read", "resource": "users", "filters": {}},
+    "expect_filters": {"role": "Technician"}
+  },
+  {
+    "id": "last_report_sort",
+    "query": "observations for my last report",
+    "parsed": {
+      "intent": "read",
+      "resource": "details-reports",
+      "sort": {"field": "created_at", "order": "desc"},
+      "limit": 1,
+      "filters": {}
+    },
+    "expect_limit": 1,
+    "expect_sort_order": "desc"
+  },
+  {
+    "id": "pronoun_no_context",
+    "query": "service orders assigned to me",
+    "parsed": {"intent": "read", "resource": "service-orders", "filters": {}},
+    "expect_clarification": true
+  },
+  {
+    "id": "resource_synonym",
+    "query": "list companies",
+    "parsed": {"intent": "read", "resource": "company", "filters": {}},
+    "expect_resource": "companies"
+  },
+  {
+    "id": "new_service_orders",
+    "query": "list new service orders",
+    "parsed": {"intent": "read", "resource": "service-orders", "filters": {}},
+    "expect_filters": {"status__name": "New"}
+  }
+]

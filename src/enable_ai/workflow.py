@@ -7,10 +7,19 @@ from langgraph.graph import StateGraph, END  # type: ignore[import]
 from .types import APIError
 from .execution_planner import ExecutionPlanner
 from .intent_classifier import IntentClassifier
-from .utils import setup_logger, get_openai_client, CREATIVE_TEMP, get_role_phrase_map
+from .utils import setup_logger, get_openai_client, CREATIVE_TEMP
 from .progress_tracker import ProgressStage
 from .response_formatter import ResponseFormatter
 from .tracing import QueryTracer, get_tracer_store, create_tracer
+from .follow_up_suggestions import (
+    enrich_response_with_follow_ups,
+    generate_follow_up_queries,
+    default_error_suggestions,
+    default_error_follow_up_queries,
+)
+from .query_execution import merge_execution_context
+from .semantic_filters import apply_semantic_filters
+from .response_envelope import enrich_api_response
 from . import constants
 
 # Module-level logger
@@ -254,40 +263,6 @@ def _analyze_pagination(data: Any) -> Dict[str, Any]:
     return info
 
 
-def _generate_suggestions(pagination_info: Dict[str, Any], parsed: Dict[str, Any], data: Any) -> List[str]:
-    """
-    Generate contextual suggestions based on result count (v0.3.11).
-    
-    Fixes Issue #7: Contextual help.
-    
-    Args:
-        pagination_info: Pagination analysis
-        parsed: Parsed query data
-        data: Response data
-        
-    Returns:
-        List of suggested next actions
-    """
-    suggestions = []
-    total = pagination_info['total_count']
-    has_more = pagination_info['has_more']
-    
-    if total == 0:
-        suggestions.append(constants.SUGGESTION_TRY_BROADER)
-    elif total == 1:
-        suggestions.append(constants.SUGGESTION_SHOW_DETAILS)
-    elif total <= 5:
-        suggestions.append(constants.SUGGESTION_SHOW_DETAILS_ITEM)
-    elif total <= constants.TABLE_ROW_SAMPLE:
-        suggestions.append(constants.SUGGESTION_FILTER_SPECIFIC)
-    elif total > constants.TABLE_ROW_SAMPLE:
-        suggestions.append(constants.SUGGESTION_NARROW_FILTERS)
-        if has_more:
-            suggestions.append(constants.SUGGESTION_SHOW_MORE)
-    
-    return suggestions[: constants.SUGGESTIONS_MAX]
-
-
 def _extract_previous_filters(conversation_history: list) -> Dict[str, Any]:
     """
     Extract previous filters from conversation history (v0.3.9).
@@ -519,7 +494,7 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
         if not active_schema:
             error_msg = constants.ERROR_NO_SCHEMA
             return {
-                "response": {
+                "response": enrich_response_with_follow_ups({
                     "success": False,
                     "data": None,
                     "summary": f"{constants.ERROR_PREFIX}{error_msg}",
@@ -527,14 +502,16 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
                     "query": state.get("query"),
                     "total_steps": 0,
                     "schema_type": "unknown",
-                }
+                    "suggested_actions": default_error_suggestions(),
+                    "follow_up_queries": default_error_follow_up_queries(),
+                }),
             }
 
         if active_schema.get("type") not in ["api", "api_schema"]:
             error_msg = constants.ERROR_ONLY_API_SCHEMAS
             return {
                 "active_schema": active_schema,
-                "response": {
+                "response": enrich_response_with_follow_ups({
                     "success": False,
                     "data": None,
                     "summary": f"{constants.ERROR_PREFIX}{error_msg}",
@@ -542,7 +519,9 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
                     "query": state.get("query"),
                     "total_steps": 0,
                     "schema_type": active_schema.get("type", "unknown"),
-                },
+                    "suggested_actions": default_error_suggestions(),
+                    "follow_up_queries": default_error_follow_up_queries(),
+                }),
             }
 
         return {"active_schema": active_schema}
@@ -664,6 +643,22 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
                 }
 
             parsed = state.get("parsed", {})
+
+            if parsed.get("_needs_clarification") or parsed.get("question_type") == "needs_clarification":
+                msg = parsed.get("_clarification_message") or (
+                    "I need more information to complete this query. "
+                    "Please be more specific about the resource, filters, or user context."
+                )
+                return {
+                    "response": enrich_response_with_follow_ups({
+                        "success": False,
+                        "needs_info": True,
+                        "message": msg,
+                        "query": state.get("query"),
+                        "suggested_actions": default_error_suggestions(),
+                        "follow_up_queries": default_error_follow_up_queries(),
+                    }),
+                }
             
             # Check if we need to merge with previous query filters (v0.3.9, enhanced v0.3.12)
             conversation_history = state.get("conversation_history") or []
@@ -725,46 +720,8 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
             
             active_schema = state.get("active_schema") or {}
 
-            # v0.3.49+: Semantic filter safeguards — run after classify/parse, before planning.
-            # This ensures semantic context (stock_level=low, role=Technician) is always
-            # injected regardless of whether the query was classified by rules or LLM.
-            _orig_query = (state.get("query") or "").lower()
-            _cur_filters = parsed.get("filters") or {}
-
-            # 1. Low-stock safeguard
-            _low_stock_patterns = (
-                "low in stock",
-                "low stock",
-                "stock is low",
-                "running low",
-                "need to refill",
-                "need refill",
-            )
-            if any(pat in _orig_query for pat in _low_stock_patterns):
-                if "stock_level" not in _cur_filters:
-                    _cur_filters["stock_level"] = {"operator": "equals", "value": "low"}
-                    parsed["filters"] = _cur_filters
-                    logger.info("Injected semantic filter: stock_level=low (query=%r)", _orig_query[:80])
-
-            # 2. Role safeguard for users resource — when query mentions a role phrase,
-            #    inject that role filter if not already set. Use resource_hints.role.synonyms
-            #    when present (config-driven), else constants.ROLE_QUERY_TO_VALUE.
-            _resource_lower = (parsed.get("resource") or "").lower().replace("-", "_")
-            if _resource_lower in ("users", "user") and not any(
-                k in _cur_filters for k in ("role", "role__name")
-            ):
-                _role_map = get_role_phrase_map(active_schema.get("resource_hints") or {}, _resource_lower)
-                if not _role_map:
-                    _role_map = list(constants.ROLE_QUERY_TO_VALUE)
-                for phrase, role_value in _role_map:
-                    if phrase in _orig_query:
-                        _cur_filters["role"] = {"operator": "equals", "value": role_value}
-                        parsed["filters"] = _cur_filters
-                        logger.info(
-                            "Injected role filter: role=%s (phrase=%r, query=%r)",
-                            role_value, phrase, _orig_query[:80],
-                        )
-                        break
+            # Semantic filters (idempotent) — covers classify shortcut that skips LLM parse
+            parsed = apply_semantic_filters(parsed, state.get("query") or "", active_schema)
 
             execution_plan = planner.create_execution_plan(parsed, active_schema)
             total_steps = len(execution_plan.get("steps", []))
@@ -841,6 +798,7 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
         
         # Resolve dependencies - substitute variables from previous steps (uses planner's extract when present)
         resolved_step = _resolve_step_dependencies(current_step_def, step_results, all_steps=steps)
+        resolved_step = merge_execution_context(resolved_step, state.get("parsed", {}))
         
         # Convert step to API plan format
         plan = {
@@ -855,6 +813,20 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
         active_schema = state.get("active_schema") or {}
         api_plan = processor._create_api_plan(resolved_step, active_schema)
         
+        if api_plan and api_plan.get("type") == "missing_info":
+            return {
+                "response": enrich_response_with_follow_ups({
+                    "success": False,
+                    "needs_info": True,
+                    "message": api_plan.get("message"),
+                    "missing_fields": api_plan.get("missing_fields"),
+                    "context": api_plan.get("context"),
+                    "query": state.get("query"),
+                    "suggested_actions": default_error_suggestions(),
+                    "follow_up_queries": default_error_follow_up_queries(),
+                }),
+            }
+
         if not api_plan or api_plan.get("type") == "error":
             return {
                 "error": f"Step {current_step_idx + 1} planning failed: {api_plan.get('error', 'Unknown error')}"
@@ -889,13 +861,18 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
                 logger.warning(constants.PAGINATION_STEP_SAFETY_CAP_WARNING.format(max_pages=constants.SAFETY_MAX_PAGES))
             result = {**result, "data": data}
         
-        # Store result
+        # Store result (include API call details for debugging/inspection)
         step_result = {
             "step_id": current_step_def.get("step_id"),
             "step_description": current_step_def.get("description"),
             "result": result.get("data"),
             "status": "success" if not result.get("error") else "failed",
-            "error": result.get("error")
+            "error": result.get("error"),
+            "api_call": {
+                "endpoint": api_plan.get("endpoint"),
+                "method": api_plan.get("method"),
+                "params": api_plan.get("params"),
+            },
         }
         
         step_results.append(step_result)
@@ -962,14 +939,16 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
         """Node duty: Return a structured response when required info is missing. No execution."""
         plan = state.get("plan", {})
         return {
-            "response": {
+            "response": enrich_response_with_follow_ups({
                 "success": False,
                 "needs_info": True,
                 "message": plan.get("message"),
                 "missing_fields": plan.get("missing_fields"),
                 "context": plan.get("context"),
                 "query": state.get("query"),
-            }
+                "suggested_actions": default_error_suggestions(),
+                "follow_up_queries": default_error_follow_up_queries(),
+            }),
         }
 
     def format_error(state: APIQueryState) -> Dict[str, Any]:
@@ -990,7 +969,7 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
             # Return the detailed matcher/orchestrator error as the main summary so the
             # user sees available resources and suggestions instead of a generic message.
             return {
-                "response": {
+                "response": enrich_response_with_follow_ups({
                     "success": False,
                     "data": None,
                     "summary": str(error),
@@ -1001,14 +980,15 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
                     "suggested_actions": [
                         "Try rephrasing your question",
                         "Ask about service orders, reports, inventory, or technicians",
-                        "Use specific resource names like 'service orders' or 'consumables'"
+                        "Use specific resource names like 'service orders' or 'consumables'",
                     ],
+                    "follow_up_queries": default_error_follow_up_queries(),
                     "is_unknown_intent": True,
-                }
+                }),
             }
 
         return {
-            "response": {
+            "response": enrich_response_with_follow_ups({
                 "success": False,
                 "data": None,
                 "summary": f"{constants.ERROR_PREFIX}{error}",
@@ -1016,7 +996,9 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
                 "query": state.get("query"),
                 "total_steps": 0,
                 "schema_type": state.get("active_schema", {}).get("type") if state.get("active_schema") else "unknown",
-            }
+                "suggested_actions": default_error_suggestions(),
+                "follow_up_queries": default_error_follow_up_queries(),
+            }),
         }
 
     def summarize(state: APIQueryState) -> Dict[str, Any]:
@@ -1099,12 +1081,17 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
             # v0.3.37: Get filter warnings for multi-step
             filter_warnings = state.get("filter_warnings", [])
 
-            response = {
+            # Derive pagination from final step for follow-up suggestions
+            last_step_data = step_results[-1].get("result") if step_results else None
+            pagination_info = _analyze_pagination(last_step_data) if last_step_data else {}
+
+            response = enrich_response_with_follow_ups({
                 "success": not has_error,
                 "data": all_data if len(all_data) > 1 else (all_data[0] if all_data else None),
                 "summary": summary,
                 "query": state.get("query"),
                 "display_mode": display_mode,  # v0.3.7
+                "pagination": pagination_info,
                 "execution_plan": [
                     {
                         "step": sr.get("step_id"),
@@ -1115,7 +1102,7 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
                 ],
                 "total_steps": len(step_results),
                 "schema_type": state.get("active_schema", {}).get("type"),
-            }
+            }, pagination_info, parsed, last_step_data)
 
             # v0.3.37: Add filter warnings to multi-step response
             if filter_warnings:
@@ -1212,7 +1199,7 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
                     "items": data.get('results', data) if isinstance(data, dict) and 'results' in data else (data if isinstance(data, list) else [])
                 }
                 
-                response = {
+                response = enrich_response_with_follow_ups({
                     "success": True,
                     "data": final_data,
                     "summary": summary,
@@ -1222,12 +1209,21 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
                     "pagination": pagination_info,
                     "total_steps": 1,
                     "schema_type": state.get("active_schema", {}).get("type"),
-                }
+                }, pagination_info, parsed, data)
                 
                 # Complete progress
                 if tracker:
                     tracker.update(ProgressStage.COMPLETED, f"Done! Found {total_count} items ✓")
-                
+
+                response = enrich_api_response(
+                    response,
+                    {
+                        "parsed": parsed,
+                        "step_results": step_results,
+                        "filter_warnings": state.get("filter_warnings", []),
+                        "result": result,
+                    },
+                )
                 return {"summary": summary, "response": response}
             
             # Non-count questions continue with normal logic
@@ -1335,17 +1331,16 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
             # v0.3.37: Add filter warnings if any
             filter_warnings = state.get("filter_warnings", [])
 
-            response = {
+            response = enrich_response_with_follow_ups({
                 "success": not has_error,
                 "data": final_data,
                 "summary": summary,
                 "query": state.get("query"),
                 "display_mode": display_mode,
                 "pagination": pagination_info,  # v0.3.11: Include pagination info (Issue #2)
-                "suggested_actions": _generate_suggestions(pagination_info, parsed, data),  # v0.3.11: Contextual help (Issue #7)
                 "total_steps": 1,
                 "schema_type": state.get("active_schema", {}).get("type"),
-            }
+            }, pagination_info, parsed, data)
 
             # v0.3.37: Add filter warnings to response
             if filter_warnings:
@@ -1390,7 +1385,17 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
             else:
                 tracker.update(ProgressStage.ERROR, constants.PROGRESS_ERROR_OCCURRED)
 
-        return {"summary": summary, "response": response, "last_result_metadata": last_result_metadata}
+        response = enrich_api_response(
+            response,
+            {
+                "parsed": parsed,
+                "step_results": step_results,
+                "filter_warnings": state.get("filter_warnings", []),
+                "result": result,
+            },
+        )
+
+        return {"summary": summary, "response": response, "last_result_metadata": last_result_metadata, "parsed": parsed}
 
     def handle_follow_up(state: APIQueryState) -> Dict[str, Any]:
         """
@@ -1449,12 +1454,14 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
                     if page_result.get("error"):
                         return {
                             "is_follow_up": True,
-                            "response": {
+                            "response": enrich_response_with_follow_ups({
                                 "success": False,
                                 "error": page_result["error"],
                                 "summary": f"Failed to fetch next page: {page_result['error']}",
                                 "query": query,
-                            }
+                                "suggested_actions": default_error_suggestions(),
+                                "follow_up_queries": default_error_follow_up_queries(),
+                            }),
                         }
 
                     # Store result for summarization
@@ -1520,12 +1527,14 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
                     logger.error(f"Failed to fetch next page: {e}")
                     return {
                         "is_follow_up": True,
-                        "response": {
+                        "response": enrich_response_with_follow_ups({
                             "success": False,
                             "error": str(e),
                             "summary": f"Failed to fetch next page: {e}",
                             "query": query,
-                        }
+                            "suggested_actions": default_error_suggestions(),
+                            "follow_up_queries": default_error_follow_up_queries(),
+                        }),
                     }
             else:
                 # No next_url - provide helpful message
@@ -1541,15 +1550,29 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
                         "Please start with a new query like 'list service orders' or 'show all users'."
                     )
 
+                no_more_pagination = {
+                    "total_count": last_metadata.get("count", 0),
+                    "actual_count": last_metadata.get("count", 0),
+                    "has_more": False,
+                }
+                follow_ups = generate_follow_up_queries(
+                    no_more_pagination,
+                    {"resource": last_metadata.get("resource", resource)},
+                )
                 return {
                     "is_follow_up": True,
-                    "response": {
+                    "response": enrich_response_with_follow_ups({
                         "success": True,
                         "data": None,
                         "summary": msg,
                         "query": query,
                         "total_steps": 0,
-                    }
+                        "suggested_actions": [
+                            f"Start fresh: list {resource}",
+                            "Try 'show me next 2' after a list query",
+                        ],
+                        "follow_up_queries": follow_ups or default_error_follow_up_queries(),
+                    }),
                 }
 
         elif follow_up_type in ("first_n", "last_n"):
@@ -1557,7 +1580,7 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
             if not last_metadata or not last_metadata.get("resource"):
                 return {
                     "is_follow_up": True,
-                    "response": {
+                    "response": enrich_response_with_follow_ups({
                         "success": True,
                         "data": None,
                         "summary": (
@@ -1567,7 +1590,9 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
                         ),
                         "query": query,
                         "total_steps": 0,
-                    }
+                        "suggested_actions": default_error_suggestions(),
+                        "follow_up_queries": default_error_follow_up_queries(),
+                    }),
                 }
 
             # Re-run the previous query with a limit
@@ -1589,7 +1614,7 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
             if not last_metadata or not last_metadata.get("resource"):
                 return {
                     "is_follow_up": True,
-                    "response": {
+                    "response": enrich_response_with_follow_ups({
                         "success": True,
                         "data": None,
                         "summary": (
@@ -1598,7 +1623,9 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
                         ),
                         "query": query,
                         "total_steps": 0,
-                    }
+                        "suggested_actions": default_error_suggestions(),
+                        "follow_up_queries": default_error_follow_up_queries(),
+                    }),
                 }
 
             # Continue to normal flow with context
@@ -1632,6 +1659,8 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
 
     def route_after_planning(state: APIQueryState) -> str:
         """Route after execution planning."""
+        if state.get("response"):
+            return "end"
         if state.get("error"):
             return "format_error"
         execution_plan = state.get("execution_plan", {})
@@ -1641,6 +1670,8 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
     
     def route_after_step(state: APIQueryState) -> str:
         """Route after executing a step - continue, summarize (with partial results), or format_error (all failed)."""
+        if state.get("response"):
+            return "end"
         execution_plan = state.get("execution_plan", {})
         current_step = state.get("current_step", 0)
         total_steps = len(execution_plan.get("steps", []))
@@ -1749,6 +1780,7 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
         {
             "format_error": "format_error",
             "execute_step": "execute_step",
+            "end": END,
         },
     )
     graph.add_conditional_edges(
@@ -1758,6 +1790,7 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
             "execute_step": "execute_step",  # Loop for sequential execution
             "summarize": "summarize",
             "format_error": "format_error",   # All steps failed
+            "end": END,
         },
     )
     graph.add_edge("summarize", END)

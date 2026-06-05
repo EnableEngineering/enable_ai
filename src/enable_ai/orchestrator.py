@@ -13,12 +13,17 @@ import sys
 from .query_parser import QueryParser
 from .api_matcher import APIMatcher
 from .api_client import APIClient
-from .config_loader import get_config
+from .config_loader import get_config, ConfigLoader
 from .types import MissingInformation, APIResponse, APIError
 from .workflow import build_api_workflow
-from .utils import setup_logger, get_role_phrase_map
+from .utils import setup_logger
 from .schema_validator import SchemaValidator
 from .progress_tracker import ProgressTracker, ProgressUpdate, ProgressStage
+from .schema_splitter import split_grouped_resources
+from .post_filter import apply_client_side_filters
+from .semantic_filters import apply_semantic_filters
+from .param_validator import validate_parsed
+from .response_envelope import enrich_api_response
 from . import constants
 
 
@@ -88,6 +93,8 @@ class APIOrchestrator:
             # Use default config loader
             self.config = get_config()
             self.config_dir = None
+
+        self.default_page_size = self._resolve_default_page_size()
         
         # Load schemas (config first, then override)
         self.schemas = self._load_schemas(schemas)
@@ -122,6 +129,19 @@ class APIOrchestrator:
         # Print initialization summary
         self._print_init_summary()
     
+    def _resolve_default_page_size(self) -> int:
+        """Resolve default page_size from config.json or constants."""
+        if self.config_dir is not None:
+            raw = self.config.get("query_understanding", {}).get(
+                "default_page_size", constants.DEFAULT_PAGE_SIZE
+            )
+            try:
+                size = int(raw)
+            except (TypeError, ValueError):
+                return constants.DEFAULT_PAGE_SIZE
+            return max(1, min(size, constants.PAGE_SIZE_CAP))
+        return ConfigLoader().get_default_page_size()
+
     def _load_config_from_path(self, config_path: str) -> Dict[str, Any]:
         """
         Load configuration from a specific file path.
@@ -610,7 +630,7 @@ class APIOrchestrator:
                     metadata=meta
                 )
             
-            return response
+            return enrich_api_response(response, state)
         except Exception as e:
             self.logger.error("process() failed: %s", e)
             return {"success": False, "error": str(e), "query": query}  # error string is dynamic
@@ -716,6 +736,8 @@ class APIOrchestrator:
                 schema = {**schema, 'resource_hints': config_hints}
                 self.logger.debug(f"Injected {len(config_hints)} resource_hints from config into schema")
 
+            schema = split_grouped_resources(schema)
+
         return schema
     
     def _understand_query(
@@ -749,62 +771,15 @@ class APIOrchestrator:
         if not parsed:
             raise ValueError("Could not parse query")
 
-        # v0.3.49+: Semantic safeguards applied after parsing, before planning.
-        if isinstance(parsed, dict):
-            q_lower = (query or "").lower()
-
-            # Safeguard for "low stock" semantics.
-            #
-            # The LLM + parser should infer stock_level=low from phrases like
-            # "items low in stock". In practice this can fail. As a fallback:
-            # - Detect common "low stock" phrases in the raw query
-            # - Inject {"stock_level": {"operator": "equals", "value": "low"}} if missing
-            # - resource_hints synonyms then map "low" → the concrete API param (stock_level=low)
-            low_stock_patterns = (
-                "low in stock",
-                "low stock",
-                "stock is low",
-                "running low",
-                "need to refill",
-                "need refill",
-            )
-            if any(pat in q_lower for pat in low_stock_patterns):
-                filters = parsed.get("filters") or {}
-                if "stock_level" not in filters:
-                    filters["stock_level"] = {"operator": "equals", "value": "low"}
-                    parsed["filters"] = filters
-                    self.logger.info(
-                        "Injected semantic filter from query '%s': stock_level=low",
-                        query,
-                    )
-
-            # Safeguard for role filter on users resource.
-            #
-            # When the user asks for a specific user type, the LLM may omit the role
-            # filter. If the query mentions a role phrase and resource is users, inject
-            # the role from resource_hints.role.synonyms (config-driven) or constants.ROLE_QUERY_TO_VALUE.
-            resource_lower = (
-                (parsed.get("resource") or "")
-                .lower()
-                .replace("-", "_")
-                .replace(" ", "_")
-            )
-            if resource_lower in ("users", "user"):
-                filters = parsed.get("filters") or {}
-                if not any(k in filters for k in ("role", "role__name")):
-                    schema_hints = (schema or {}).get("resource_hints") or {}
-                    role_map = get_role_phrase_map(schema_hints, resource_lower)
-                    if not role_map:
-                        role_map = list(constants.ROLE_QUERY_TO_VALUE)
-                    for phrase, role_value in role_map:
-                        if phrase in q_lower:
-                            filters["role"] = {"operator": "equals", "value": role_value}
-                            parsed["filters"] = filters
-                            self.logger.info(
-                                "Injected role filter from query '%s': role=%s",
-                                query, role_value,
-                            )
-                            break
+        parsed = apply_semantic_filters(parsed, query, schema)
+        parsed, validation_warnings, clarification = validate_parsed(
+            parsed, schema, query=query, user_context=user_context,
+        )
+        if validation_warnings:
+            parsed["_validation_warnings"] = validation_warnings
+        if clarification:
+            parsed["_needs_clarification"] = True
+            parsed["_clarification_message"] = clarification
 
         return parsed
     
@@ -934,6 +909,18 @@ class APIOrchestrator:
                     self.logger.info(f"Adding {param_name}={n} from parsed limit (schema-driven)")
                 except (TypeError, ValueError):
                     pass
+            elif (
+                parsed.get("question_type") != "count"
+                and parsed.get("display_mode") != "full"
+                and parsed.get("intent") == "read"
+            ):
+                param_name = self._get_limit_param_for_endpoint(schema, result.endpoint)
+                if not any(name in params for name in constants.LIMIT_PARAM_NAMES):
+                    n = self.default_page_size
+                    params[param_name] = n
+                    self.logger.info(
+                        f"Adding default {param_name}={n} from config (schema-driven)"
+                    )
             return {
                 "type": "api",
                 "endpoint": result.endpoint,
@@ -942,7 +929,9 @@ class APIOrchestrator:
                 "authentication_required": result.authentication_required,
                 "endpoint_name": "unknown",  # APIRequest doesn't have this
                 "module": "unknown",  # APIRequest doesn't have this
-                "schema_type": "api_schema"
+                "schema_type": "api_schema",
+                "warnings": result.warnings,
+                "client_side_filters": result.client_side_filters,
             }
         
         return None
@@ -1146,15 +1135,30 @@ class APIOrchestrator:
                     self.logger.info(f"Following navigation to: {followup_request.method} {followup_request.endpoint}")
                     response = self.client.call_api(followup_request)
                     api_request = followup_request  # For logging/return metadata
-        
+
+        data = response.data if isinstance(response, APIResponse) else None
+        warnings = list(plan.get("warnings") or getattr(api_request, "warnings", []) or [])
+        client_filters = plan.get("client_side_filters") or getattr(
+            api_request, "client_side_filters", None
+        ) or {}
+
+        if data is not None and client_filters:
+            data, removed = apply_client_side_filters(data, client_filters)
+            if removed:
+                warnings.append(
+                    f"Applied client-side filters ({removed} item(s) removed "
+                    f"because the API does not support: {', '.join(client_filters.keys())})"
+                )
+
         return {
-            "data": response.data if isinstance(response, APIResponse) else None,
+            "data": data,
             "status": response.status_code if isinstance(response, APIResponse) else None,
             "error": response.message if isinstance(response, APIError) else None,
             "endpoint": api_request.endpoint,
             "method": api_request.method,
             "params": api_request.params,
-            "warnings": getattr(api_request, 'warnings', []),  # v0.3.37: Filter warnings
+            "warnings": warnings,
+            "client_side_filters": client_filters,
         }
 
     def _fetch_next_page(self, next_url: str, schema: dict, access_token: Optional[str] = None) -> Dict[str, Any]:

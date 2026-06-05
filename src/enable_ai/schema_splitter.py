@@ -1,0 +1,155 @@
+"""
+Split grouped OpenAPI resources into individual resources for APIMatcher.
+
+OpenAPI conversion groups endpoints by first path segment (e.g. master-data, documents).
+Consumer config resource_hints often use individual names (companies, flash-reports).
+"""
+
+import copy
+from typing import Any, Dict, List, Optional
+
+from .utils import setup_logger
+
+logger = setup_logger("enable_ai.schema_splitter")
+
+# Default rules for common API layouts (overridable via schema.resource_split_rules)
+DEFAULT_SPLIT_RULES: Dict[str, Dict[str, str]] = {
+    "inventory": {
+        "inventory-equipment": "/equipment",
+        "inventory-consumables": "/consumables",
+    },
+    "master-data": {
+        "companies": "/companies",
+        "locations": "/locations",
+        "service-types": "/service-types",
+        "service-categories": "/service-categories",
+        "service-rate-cards": "/service-rate-cards",
+        "skills": "/skills",
+    },
+    "documents": {
+        "components": "/components",
+        "machines": "/machines",
+        "products": "/products",
+        "document-types": "/document-types",
+        "documents": "/documents/documents",
+    },
+    "service-orders": {
+        "flash-reports": "/flash-reports",
+        "details-reports": "/details-reports",
+    },
+}
+
+
+def _path_matches(path: str, pattern: str) -> bool:
+    return pattern.lower() in (path or "").lower()
+
+
+def _build_auto_split_rules(
+    resources: Dict[str, Any],
+    resource_hints: Dict[str, Any],
+) -> Dict[str, Dict[str, str]]:
+    """
+    Auto-detect split rules when resource_hints reference names missing from resources.
+    """
+    auto_rules: Dict[str, Dict[str, str]] = {}
+    missing_hints = [
+        name for name in resource_hints
+        if name not in resources and isinstance(resource_hints.get(name), dict)
+    ]
+
+    for hint_name in missing_hints:
+        segment = hint_name.replace("_", "-")
+        pattern = f"/{segment}"
+        for parent_name, parent_data in resources.items():
+            endpoints = parent_data.get("endpoints") or []
+            if any(_path_matches(ep.get("path", ""), pattern) for ep in endpoints):
+                auto_rules.setdefault(parent_name, {})[hint_name] = pattern
+                break
+
+    return auto_rules
+
+
+def split_grouped_resources(schema: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Split grouped resources into individual sub-resources.
+
+    Uses schema.resource_split_rules when present, else DEFAULT_SPLIT_RULES,
+    plus auto-detection from resource_hints.
+    """
+    if not schema or not schema.get("resources"):
+        return schema
+
+    schema = copy.deepcopy(schema)
+    resources = schema["resources"]
+    resource_hints = schema.get("resource_hints") or {}
+
+    explicit_rules = schema.get("resource_split_rules") or {}
+    split_rules = {**DEFAULT_SPLIT_RULES, **explicit_rules}
+    auto_rules = _build_auto_split_rules(resources, resource_hints)
+
+    for parent_name, sub_rules in auto_rules.items():
+        merged = dict(split_rules.get(parent_name, {}))
+        merged.update(sub_rules)
+        split_rules[parent_name] = merged
+
+    for parent_name, sub_resources in split_rules.items():
+        parent = resources.get(parent_name)
+        if not parent or not parent.get("endpoints"):
+            continue
+
+        parent_fields = parent.get("fields", [])
+        parent_display = parent.get("display_field")
+        created: List[str] = []
+
+        for sub_name, path_pattern in sub_resources.items():
+            if sub_name in resources and sub_name != parent_name:
+                continue
+
+            matching = [
+                ep for ep in parent.get("endpoints", [])
+                if _path_matches(ep.get("path", ""), path_pattern)
+            ]
+            if not matching:
+                continue
+
+            resources[sub_name] = {
+                "name": sub_name,
+                "description": sub_name.replace("-", " ").title(),
+                "endpoints": matching,
+                "fields": parent_fields,
+                "display_field": parent_display,
+            }
+            created.append(f"{sub_name}({len(matching)})")
+
+        if not created:
+            continue
+
+        matched_paths = set()
+        for sub_name in sub_resources:
+            if sub_name in resources:
+                for ep in resources[sub_name].get("endpoints", []):
+                    matched_paths.add(ep.get("path"))
+
+        remaining = [
+            ep for ep in parent.get("endpoints", [])
+            if ep.get("path") not in matched_paths
+        ]
+        parent_is_also_sub = parent_name in sub_resources
+
+        if remaining and not parent_is_also_sub:
+            resources[parent_name]["endpoints"] = remaining
+            logger.info(
+                "Split '%s' into %s (kept %d endpoints in parent)",
+                parent_name, ", ".join(created), len(remaining),
+            )
+        elif not remaining and not parent_is_also_sub:
+            del resources[parent_name]
+            logger.info("Split '%s' into %s", parent_name, ", ".join(created))
+        else:
+            logger.info(
+                "Split '%s' into %s (parent preserved — sub shares parent name)",
+                parent_name, ", ".join(created),
+            )
+
+    schema["resources"] = resources
+    return schema

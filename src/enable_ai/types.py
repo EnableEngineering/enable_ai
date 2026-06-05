@@ -9,13 +9,15 @@ class APIRequest:
         params: dict,
         method: str = 'GET',
         authentication_required: bool = True,
-        warnings: list = None  # v0.3.37: Filter warnings to show user
+        warnings: list = None,  # v0.3.37: Filter warnings to show user
+        client_side_filters: dict = None,  # Filters applied after API response
     ):
         self.endpoint = endpoint
         self.params = params
         self.method = method
         self.authentication_required = authentication_required
         self.warnings = warnings or []  # v0.3.37: Store filter validation warnings
+        self.client_side_filters = client_side_filters or {}
 
 class APIResponse:
     def __init__(self, status_code: int, data: dict):

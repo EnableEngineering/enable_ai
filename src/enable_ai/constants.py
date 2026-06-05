@@ -39,6 +39,9 @@ SAFETY_MAX_PAGES = _env_int("ENABLE_AI_SAFETY_MAX_PAGES", 500)
 # Max page_size when user says "list a few" / limit (orchestrator.py)
 PAGE_SIZE_CAP = _env_int("ENABLE_AI_PAGE_SIZE_CAP", 100)
 
+# Default page_size for list queries when user does not specify a limit (config.json / env)
+DEFAULT_PAGE_SIZE = _env_int("ENABLE_AI_DEFAULT_PAGE_SIZE", 25)
+
 # Known query/body param names for result limit (orchestrator picks from API schema; fallback if not in schema)
 LIMIT_PARAM_NAMES = ("page_size", "limit", "per_page", "pageSize", "size")
 
