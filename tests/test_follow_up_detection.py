@@ -1,5 +1,9 @@
+from unittest.mock import patch
+
 from enable_ai.follow_up_detection import (
     apply_follow_up_context,
+    classify_follow_up,
+    clear_classification_cache,
     is_follow_up_query,
     get_follow_up_type,
 )
@@ -20,17 +24,55 @@ HISTORY = [
     },
 ]
 
+REFINEMENT_CLASSIFICATION = {
+    "is_follow_up": True,
+    "follow_up_type": "refinement",
+    "merge_with_previous": True,
+    "keep_previous_resource": True,
+    "question_type_override": "details",
+    "display_mode_override": "detailed",
+}
 
-def test_refinement_follow_up_detected():
+STANDALONE_CLASSIFICATION = {
+    "is_follow_up": False,
+    "follow_up_type": "standalone",
+    "merge_with_previous": False,
+    "keep_previous_resource": False,
+    "question_type_override": None,
+    "display_mode_override": None,
+}
+
+PAGINATION_CLASSIFICATION = {
+    "is_follow_up": True,
+    "follow_up_type": "next_page",
+    "merge_with_previous": True,
+    "keep_previous_resource": True,
+    "question_type_override": None,
+    "display_mode_override": None,
+}
+
+
+@patch("enable_ai.follow_up_detection.get_openai_client")
+def test_refinement_follow_up_detected(mock_client):
+    clear_classification_cache()
+    mock_client.return_value.parse_json_response.return_value = REFINEMENT_CLASSIFICATION
+
     assert is_follow_up_query("and assigned to which company?", HISTORY) is True
-    assert get_follow_up_type("and assigned to which company?") == "refinement"
+    assert get_follow_up_type("and assigned to which company?", HISTORY) == "refinement"
 
 
-def test_standalone_company_query_not_follow_up():
+@patch("enable_ai.follow_up_detection.get_openai_client")
+def test_standalone_company_query_not_follow_up(mock_client):
+    clear_classification_cache()
+    mock_client.return_value.parse_json_response.return_value = STANDALONE_CLASSIFICATION
+
     assert is_follow_up_query("list all companies", []) is False
 
 
-def test_apply_follow_up_context_keeps_service_orders():
+@patch("enable_ai.follow_up_detection.get_openai_client")
+def test_apply_follow_up_context_keeps_service_orders(mock_client):
+    mock_client.return_value.parse_json_response.return_value = REFINEMENT_CLASSIFICATION
+
     wrong_parse = {
         "intent": "read",
         "resource": "companies",
@@ -42,6 +84,7 @@ def test_apply_follow_up_context_keeps_service_orders():
         "and assigned to which company?",
         HISTORY,
         is_follow_up=True,
+        classification=REFINEMENT_CLASSIFICATION,
     )
     assert fixed["resource"] == "service-orders"
     assert fixed["filters"]["status__name"]["value"] == "New"
@@ -49,5 +92,10 @@ def test_apply_follow_up_context_keeps_service_orders():
     assert fixed["question_type"] == "details"
 
 
-def test_pagination_still_detected_without_history():
+@patch("enable_ai.follow_up_detection.get_openai_client")
+def test_pagination_still_detected(mock_client):
+    clear_classification_cache()
+    mock_client.return_value.parse_json_response.return_value = PAGINATION_CLASSIFICATION
+
     assert is_follow_up_query("show me more", []) is True
+    assert classify_follow_up("show me more", [])["follow_up_type"] == "next_page"

@@ -19,10 +19,9 @@ from .follow_up_suggestions import (
 )
 from .follow_up_detection import (
     apply_follow_up_context,
+    classify_follow_up,
     extract_last_result_metadata,
-    get_follow_up_type,
     has_prior_context,
-    is_follow_up_query,
 )
 from .query_execution import merge_execution_context
 from .semantic_filters import apply_semantic_filters
@@ -434,7 +433,10 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
         # v0.3.37: Detect follow-up queries
         query_text = state.get("query") or ""
         conversation_history = state.get("conversation_history") or []
-        is_follow_up = is_follow_up_query(query_text, conversation_history)
+        follow_up_classification = state.get("follow_up_classification") or classify_follow_up(
+            query_text, conversation_history,
+        )
+        is_follow_up = follow_up_classification.get("is_follow_up", False)
         last_metadata = state.get("last_result_metadata")
 
         try:
@@ -561,11 +563,13 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
             # Check if we need to merge with previous query filters (v0.3.9, enhanced v0.3.12)
             conversation_history = state.get("conversation_history") or []
             query_text = state.get("query") or ""
+            follow_up_classification = state.get("follow_up_classification") or {}
             should_merge = (
                 parsed.get("merge_with_previous")
                 or state.get("is_follow_up")
+                or follow_up_classification.get("merge_with_previous")
                 or (
-                    is_follow_up_query(query_text, conversation_history)
+                    follow_up_classification.get("is_follow_up")
                     and has_prior_context(conversation_history)
                 )
             )
@@ -631,7 +635,11 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
 
             # Anchor follow-ups to previous resource/filters (safety net after LLM parse)
             parsed = apply_follow_up_context(
-                parsed, query_text, conversation_history, state.get("is_follow_up", False),
+                parsed,
+                query_text,
+                conversation_history,
+                state.get("is_follow_up", False),
+                classification=follow_up_classification,
             )
 
             active_schema = state.get("active_schema") or {}
@@ -1333,16 +1341,16 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
         conversation_history = state.get("conversation_history") or []
         tracker = state.get("progress_tracker")
 
-        # Check if this is a follow-up query (uses conversation history for refinements)
-        is_follow_up = is_follow_up_query(query, conversation_history)
+        # LLM classifies whether this query continues the previous turn
+        follow_up_classification = classify_follow_up(query, conversation_history)
+        is_follow_up = follow_up_classification.get("is_follow_up", False)
 
         if not is_follow_up:
-            # Not a follow-up, continue normal flow
-            return {"is_follow_up": False}
+            return {"is_follow_up": False, "follow_up_classification": follow_up_classification}
 
         # Extract metadata from previous results
         last_metadata = extract_last_result_metadata(conversation_history)
-        follow_up_type = get_follow_up_type(query)
+        follow_up_type = follow_up_classification.get("follow_up_type", "standalone")
         requested_limit = _extract_limit_from_query(query)
 
         logger.info(
@@ -1552,6 +1560,7 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
             # Continue to normal flow with context
             return {
                 "is_follow_up": True,
+                "follow_up_classification": follow_up_classification,
                 "last_result_metadata": last_metadata,
                 "context": {
                     "previous_resource": last_metadata.get("resource"),
@@ -1560,7 +1569,11 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
             }
 
         # Unknown follow-up type - continue normal flow
-        return {"is_follow_up": True, "last_result_metadata": last_metadata}
+        return {
+            "is_follow_up": True,
+            "follow_up_classification": follow_up_classification,
+            "last_result_metadata": last_metadata,
+        }
 
     def route_after_follow_up(state: APIQueryState) -> str:
         """Route after follow-up handling (v0.3.38)."""

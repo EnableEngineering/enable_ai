@@ -138,9 +138,9 @@ class QueryParser:
             self.logger.info(f"Parsing query: '{natural_language_input}'")
             
             if conversation_history:
-                from .follow_up_detection import is_follow_up_query
+                from .follow_up_detection import classify_follow_up
 
-                if is_follow_up_query(natural_language_input, conversation_history):
+                if classify_follow_up(natural_language_input, conversation_history).get("is_follow_up"):
                     self.logger.info(
                         "Follow-up detected — forcing context merge for: %r",
                         natural_language_input[:80],

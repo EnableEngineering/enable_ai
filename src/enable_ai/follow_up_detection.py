@@ -1,68 +1,33 @@
 """
-Detect conversational follow-up queries that continue a previous turn.
+LLM-based follow-up query detection and context anchoring.
 
-Follow-ups include pagination ("show me more"), references ("which are those"),
-and refinements ("and assigned to which company?").
+No hardcoded phrase lists — an LLM classifies whether the current query
+continues or refines the previous conversation turn.
 """
 
-import re
+import hashlib
+import json
 from typing import Any, Dict, List, Optional
 
-# Pagination / reference patterns (work even without parsing prior metadata)
-PAGINATION_PATTERNS = (
-    "next page",
-    "previous page",
-    "show me more",
-    "show more",
-    "continue",
-)
+from .utils import get_openai_client, setup_logger, DETERMINISTIC_TEMP
 
-REFERENCE_PATTERNS = (
-    "which are those",
-    "what are those",
-    "which ones",
-    "show them",
-    "list them",
-    "the same",
-    "of them",
-    "of those",
-    "from those",
-)
+logger = setup_logger("enable_ai.follow_up_detection")
 
-REFINEMENT_PATTERNS = (
-    "which company",
-    "what company",
-    "which customer",
-    "what customer",
-    "assigned to",
-    "belongs to",
-    "who is",
-    "who are",
-    "what is the",
-    "what are the",
-    "tell me more",
-    "more details",
-    "more about",
-    "details for",
-    "details of",
-    "what about the",
-    "for that one",
-    "for that",
-    "about it",
-    "about that",
-    "the company",
-    "the customer",
-    "the technician",
-    "the status",
-)
+# Cache classifications within a process to avoid duplicate LLM calls
+_classification_cache: Dict[str, Dict[str, Any]] = {}
 
-CONTINUATION_STARTERS = (
-    "and ",
-    "also ",
-    "what about ",
-    "how about ",
-    "ok and ",
-    "okay and ",
+
+def clear_classification_cache() -> None:
+    """Clear in-process classification cache (for tests)."""
+    _classification_cache.clear()
+
+FOLLOW_UP_TYPES = (
+    "standalone",
+    "next_page",
+    "first_n",
+    "last_n",
+    "reference",
+    "refinement",
 )
 
 
@@ -91,80 +56,144 @@ def has_prior_context(conversation_history: Optional[List[Dict[str, Any]]]) -> b
     return bool(extract_last_result_metadata(conversation_history or {}).get("resource"))
 
 
+def _cache_key(query: str, conversation_history: List[Dict[str, Any]]) -> str:
+    tail = conversation_history[-6:] if conversation_history else []
+    blob = json.dumps({"q": query.strip(), "h": tail}, sort_keys=True, default=str)
+    return hashlib.md5(blob.encode()).hexdigest()
+
+
+def _clean_history_for_prompt(conversation_history: List[Dict[str, Any]]) -> List[Dict[str, str]]:
+    """Strip internal markers; keep recent turns for the classifier."""
+    cleaned = []
+    for msg in conversation_history[-6:]:
+        content = msg.get("content", "")
+        if "\n[Context:" in content:
+            content = content.split("\n[Context:")[0].strip()
+        cleaned.append({"role": msg.get("role", "user"), "content": content})
+    return cleaned
+
+
+def classify_follow_up(
+    query: str,
+    conversation_history: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """
+    Use LLM to classify whether query is a follow-up and how to route it.
+
+    Returns:
+        {
+            "is_follow_up": bool,
+            "follow_up_type": standalone|next_page|first_n|last_n|reference|refinement,
+            "merge_with_previous": bool,
+            "keep_previous_resource": bool,
+            "question_type_override": str|None,
+            "display_mode_override": str|None,
+        }
+    """
+    default = {
+        "is_follow_up": False,
+        "follow_up_type": "standalone",
+        "merge_with_previous": False,
+        "keep_previous_resource": False,
+        "question_type_override": None,
+        "display_mode_override": None,
+    }
+
+    if not query or not query.strip():
+        return default
+
+    history = conversation_history or []
+    key = _cache_key(query, history)
+    if key in _classification_cache:
+        return _classification_cache[key]
+
+    prior_meta = extract_last_result_metadata(history)
+    recent = _clean_history_for_prompt(history)
+
+    prompt = f"""Classify the CURRENT user query in the context of this conversation.
+
+PREVIOUS RESULT METADATA (from last assistant turn):
+{json.dumps(prior_meta, indent=2) if prior_meta else "None — no prior structured context"}
+
+RECENT CONVERSATION:
+{json.dumps(recent, indent=2) if recent else "None — first message in session"}
+
+CURRENT QUERY:
+{query.strip()}
+
+Decide:
+1. Is the current query a FOLLOW-UP that continues or refines the previous turn?
+   - Follow-ups refer back to prior results, paginate them, or ask for more detail about them
+   - Standalone queries start a new topic or restate a full request independently
+2. If follow-up, what type?
+   - next_page: user wants more/paginated results from the prior list
+   - first_n / last_n: user wants a specific slice (first N, last N)
+   - reference: user refers to prior items ("those", "them") wanting to see them
+   - refinement: user asks a detail question about the prior result(s) without changing topic
+     (e.g. after a count, asking which company/customer/technician those items belong to)
+3. Should previous filters be merged? Should the same resource be kept?
+4. If refinement after a count, override question_type to "details" and display_mode to "detailed"
+
+Return JSON only:
+{{
+  "is_follow_up": boolean,
+  "follow_up_type": "standalone" | "next_page" | "first_n" | "last_n" | "reference" | "refinement",
+  "merge_with_previous": boolean,
+  "keep_previous_resource": boolean,
+  "question_type_override": "count" | "list" | "details" | null,
+  "display_mode_override": "summary" | "detailed" | "full" | null
+}}"""
+
+    try:
+        client = get_openai_client()
+        result = client.parse_json_response(
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You classify conversational follow-ups for an API query assistant. "
+                        "Return only valid JSON. No hardcoded assumptions about domain entities."
+                    ),
+                },
+                {"role": "user", "content": prompt},
+            ],
+            temperature=DETERMINISTIC_TEMP,
+        )
+        if not isinstance(result, dict):
+            result = default
+        else:
+            result = {**default, **result}
+            if result.get("follow_up_type") not in FOLLOW_UP_TYPES:
+                result["follow_up_type"] = "standalone"
+            if result["follow_up_type"] == "standalone":
+                result["is_follow_up"] = False
+    except Exception as exc:
+        logger.warning("Follow-up LLM classification failed: %s — treating as standalone", exc)
+        result = default
+
+    logger.info(
+        "Follow-up classification: is_follow_up=%s type=%s merge=%s keep_resource=%s",
+        result.get("is_follow_up"),
+        result.get("follow_up_type"),
+        result.get("merge_with_previous"),
+        result.get("keep_previous_resource"),
+    )
+
+    _classification_cache[key] = result
+    return result
+
+
 def is_follow_up_query(
     query: str,
     conversation_history: Optional[List[Dict[str, Any]]] = None,
 ) -> bool:
-    """
-    Return True when the query continues or refines a previous turn.
-
-    Pagination/reference patterns are detected without prior context.
-    Refinement/continuation patterns require conversation history.
-    """
-    if not query or not query.strip():
-        return False
-
-    query_lower = query.lower().strip()
-    history = conversation_history or []
-    has_context = has_prior_context(history)
-
-    # Pagination
-    if any(p in query_lower for p in PAGINATION_PATTERNS):
-        return True
-    for token in ("next", "more", "previous", "first"):
-        if token in query_lower:
-            return True
-    if re.search(r"\b(next|first|last|show me)\s+\d+\b", query_lower):
-        return True
-
-    # Explicit references to prior results
-    if any(p in query_lower for p in REFERENCE_PATTERNS):
-        return True
-
-    if not has_context:
-        return False
-
-    # Conversational continuations need prior context
-    if any(query_lower.startswith(s) for s in CONTINUATION_STARTERS):
-        return True
-
-    if any(p in query_lower for p in REFINEMENT_PATTERNS):
-        return True
-
-    # Short questions after a prior turn are usually follow-ups
-    if "?" in query_lower and len(query_lower.split()) <= 10:
-        return True
-
-    return False
+    """Return True when the LLM classifies the query as a follow-up."""
+    return classify_follow_up(query, conversation_history).get("is_follow_up", False)
 
 
-def get_follow_up_type(query: str) -> str:
-    """
-    Classify follow-up intent for routing.
-
-    Returns: next_page | first_n | last_n | reference | refinement | unknown
-    """
-    query_lower = (query or "").lower().strip()
-
-    if any(p in query_lower for p in ("next page", "next", "more", "continue", "show more")):
-        return "next_page"
-
-    if re.search(r"\b(first|show me first|the first)\s*\d*\b", query_lower):
-        return "first_n"
-
-    if re.search(r"\b(last|show me last|the last)\s*\d*\b", query_lower):
-        return "last_n"
-
-    if any(p in query_lower for p in ("those", "them", "these", "the same")):
-        return "reference"
-
-    if (
-        any(query_lower.startswith(s) for s in CONTINUATION_STARTERS)
-        or any(p in query_lower for p in REFINEMENT_PATTERNS)
-    ):
-        return "refinement"
-
-    return "unknown"
+def get_follow_up_type(query: str, conversation_history: Optional[List[Dict[str, Any]]] = None) -> str:
+    """Return the LLM-classified follow-up type."""
+    return classify_follow_up(query, conversation_history).get("follow_up_type", "standalone")
 
 
 def apply_follow_up_context(
@@ -172,23 +201,21 @@ def apply_follow_up_context(
     query: str,
     conversation_history: Optional[List[Dict[str, Any]]],
     is_follow_up: bool = False,
+    classification: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
-    When a follow-up is detected, anchor parsing to the previous resource/filters.
-
-    Prevents refinements like "and which company?" from switching to a different
-    resource (e.g. listing all companies).
+    Anchor parsed query to previous resource/filters when LLM says to keep context.
     """
     if not is_follow_up or not isinstance(parsed, dict):
+        return parsed
+
+    clf = classification or classify_follow_up(query, conversation_history)
+    if not clf.get("keep_previous_resource") and not clf.get("merge_with_previous"):
         return parsed
 
     meta = extract_last_result_metadata(conversation_history or [])
     prev_resource = meta.get("resource")
     if not prev_resource:
-        return parsed
-
-    follow_type = get_follow_up_type(query)
-    if follow_type not in ("refinement", "reference", "unknown"):
         return parsed
 
     result = dict(parsed)
@@ -202,10 +229,17 @@ def apply_follow_up_context(
         merged[key] = value
     result["filters"] = merged
 
-    if follow_type == "refinement":
-        result["question_type"] = "details"
-        result["display_mode"] = "detailed"
-        if meta.get("count") == 1 and not result.get("limit"):
-            result["limit"] = 1
+    q_override = clf.get("question_type_override")
+    d_override = clf.get("display_mode_override")
+    if q_override:
+        result["question_type"] = q_override
+    if d_override:
+        result["display_mode"] = d_override
+    elif clf.get("follow_up_type") == "refinement":
+        result["question_type"] = result.get("question_type") or "details"
+        result["display_mode"] = result.get("display_mode") or "detailed"
+
+    if meta.get("count") == 1 and not result.get("limit"):
+        result["limit"] = 1
 
     return result
