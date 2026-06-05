@@ -17,6 +17,13 @@ from .follow_up_suggestions import (
     default_error_suggestions,
     default_error_follow_up_queries,
 )
+from .follow_up_detection import (
+    apply_follow_up_context,
+    extract_last_result_metadata,
+    get_follow_up_type,
+    has_prior_context,
+    is_follow_up_query,
+)
 from .query_execution import merge_execution_context
 from .semantic_filters import apply_semantic_filters
 from .response_envelope import enrich_api_response
@@ -28,117 +35,6 @@ logger = setup_logger('enable_ai.workflow')
 
 # Global tracer store
 _tracer_store = get_tracer_store()
-
-
-def _is_follow_up_query(query: str) -> bool:
-    """
-    Detect if this is a follow-up query referring to previous results (v0.3.37).
-
-    Examples:
-        - "show me next 2" -> True
-        - "show me first 3" -> True
-        - "which are those?" -> True
-        - "list all users" -> False
-
-    Args:
-        query: User's query string
-
-    Returns:
-        True if query appears to be a follow-up
-    """
-    query_lower = query.lower().strip()
-
-    # Patterns that indicate follow-up
-    follow_up_patterns = [
-        # Removed bare 'last' to avoid treating temporal phrases like
-        # "my last report" or "last week" as follow-ups.
-        'next', 'more', 'previous', 'first',
-        'show me more', 'show more', 'continue',
-        'which are those', 'what are those', 'which ones',
-        'show them', 'list them', 'the same',
-        'of them', 'of those', 'from those',
-        'next page', 'previous page',
-    ]
-
-    for pattern in follow_up_patterns:
-        if pattern in query_lower:
-            return True
-
-    # Check for "next N" or "first/last N" patterns where N is explicit.
-    # Require a number (or its word form) to avoid matching phrases like
-    # "my last report", which should be interpreted as a standalone query.
-    if re.search(r'\b(next|first|last|show me)\s+\d+\b', query_lower):
-        return True
-
-    return False
-
-
-def _extract_last_result_metadata(conversation_history: list) -> dict:
-    """
-    Extract last_result_metadata from conversation history (v0.3.38).
-
-    The orchestrator stores metadata in assistant message metadata including:
-    - resource: The resource type that was queried
-    - intent: The operation type (read, etc.)
-    - filters: Filters that were applied
-    - next_url: URL for next page if paginated
-
-    Args:
-        conversation_history: List of conversation messages
-
-    Returns:
-        Dict with last result metadata or empty dict if not found
-    """
-    if not conversation_history:
-        return {}
-
-    # Look for the most recent assistant message with metadata
-    for msg in reversed(conversation_history):
-        if msg.get('role') == 'assistant':
-            metadata = msg.get('metadata', {})
-            if metadata and (metadata.get('resource') or metadata.get('next_url')):
-                return {
-                    'resource': metadata.get('resource'),
-                    'intent': metadata.get('intent'),
-                    'filters': metadata.get('filters', {}),
-                    'next_url': metadata.get('next_url'),
-                    'count': metadata.get('count'),
-                    'has_more': metadata.get('has_more', False),
-                }
-
-    return {}
-
-
-def _get_follow_up_type(query: str) -> str:
-    """
-    Determine the type of follow-up query (v0.3.38).
-
-    Returns:
-        - "next_page": User wants next page of results
-        - "first_n": User wants first N items
-        - "last_n": User wants last N items
-        - "reference": User is referring to previous results generically
-        - "unknown": Can't determine follow-up type
-    """
-    query_lower = query.lower().strip()
-
-    # Check for "next" patterns (pagination)
-    if any(p in query_lower for p in ['next page', 'next', 'more', 'continue', 'show more']):
-        return "next_page"
-
-    # Check for "first N" patterns
-    if re.search(r'\b(first|show me first|the first)\s*\d*\b', query_lower):
-        return "first_n"
-
-    # Check for "last N" patterns
-    if re.search(r'\b(last|show me last|the last)\s*\d*\b', query_lower):
-        return "last_n"
-
-    # Generic reference to previous results
-    if any(p in query_lower for p in ['those', 'them', 'these', 'the same']):
-        return "reference"
-
-    return "unknown"
 
 
 def _extract_limit_from_query(query: str) -> int:
@@ -537,7 +433,8 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
 
         # v0.3.37: Detect follow-up queries
         query_text = state.get("query") or ""
-        is_follow_up = _is_follow_up_query(query_text)
+        conversation_history = state.get("conversation_history") or []
+        is_follow_up = is_follow_up_query(query_text, conversation_history)
         last_metadata = state.get("last_result_metadata")
 
         try:
@@ -663,7 +560,16 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
             
             # Check if we need to merge with previous query filters (v0.3.9, enhanced v0.3.12)
             conversation_history = state.get("conversation_history") or []
-            if parsed.get("merge_with_previous") and conversation_history:
+            query_text = state.get("query") or ""
+            should_merge = (
+                parsed.get("merge_with_previous")
+                or state.get("is_follow_up")
+                or (
+                    is_follow_up_query(query_text, conversation_history)
+                    and has_prior_context(conversation_history)
+                )
+            )
+            if should_merge and conversation_history:
                 logger.info("🔄 Merging filters from previous query (v0.3.12 enhanced)")
                 
                 # Extract previous filters from conversation history
@@ -714,13 +620,21 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
                         if msg.get('role') == 'assistant':
                             logger.warning(f"   Last assistant message: {msg.get('content', '')[:200]}")
                             break
-            elif parsed.get("merge_with_previous"):
-                logger.warning("⚠️  merge_with_previous=true but no conversation_history available!")
+            elif should_merge:
+                logger.warning("⚠️  Follow-up merge requested but no conversation_history available!")
             else:
-                logger.info(f"ℹ️  No filter merging needed (merge_with_previous={parsed.get('merge_with_previous')})")
-            
+                logger.info(
+                    "ℹ️  No filter merging needed (merge_with_previous=%s, is_follow_up=%s)",
+                    parsed.get("merge_with_previous"),
+                    state.get("is_follow_up"),
+                )
+
+            # Anchor follow-ups to previous resource/filters (safety net after LLM parse)
+            parsed = apply_follow_up_context(
+                parsed, query_text, conversation_history, state.get("is_follow_up", False),
+            )
+
             active_schema = state.get("active_schema") or {}
-            query_text = state.get("query") or ""
 
             # Resolve __current_user_id__ etc. before planning (covers classify shortcut path)
             parsed = resolve_user_context_in_parsed(
@@ -1419,16 +1333,16 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
         conversation_history = state.get("conversation_history") or []
         tracker = state.get("progress_tracker")
 
-        # Check if this is a follow-up query
-        is_follow_up = _is_follow_up_query(query)
+        # Check if this is a follow-up query (uses conversation history for refinements)
+        is_follow_up = is_follow_up_query(query, conversation_history)
 
         if not is_follow_up:
             # Not a follow-up, continue normal flow
             return {"is_follow_up": False}
 
         # Extract metadata from previous results
-        last_metadata = _extract_last_result_metadata(conversation_history)
-        follow_up_type = _get_follow_up_type(query)
+        last_metadata = extract_last_result_metadata(conversation_history)
+        follow_up_type = get_follow_up_type(query)
         requested_limit = _extract_limit_from_query(query)
 
         logger.info(
@@ -1616,8 +1530,8 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
                 },
             }
 
-        elif follow_up_type == "reference":
-            # Generic reference like "show those" - needs previous context
+        elif follow_up_type in ("reference", "refinement"):
+            # Reference or refinement ("show those", "and which company?")
             if not last_metadata or not last_metadata.get("resource"):
                 return {
                     "is_follow_up": True,
@@ -1656,7 +1570,9 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
         # If we have result from follow-up (fetched next page), go to summarize
         if state.get("is_follow_up") and state.get("result"):
             return "summarize"
-        # Otherwise continue to classification
+        # Follow-ups need LLM parsing with conversation history — skip fast classifier
+        if state.get("is_follow_up"):
+            return "parse"
         return "classify"
 
     def route_after_schema(state: APIQueryState) -> str:
@@ -1735,6 +1651,9 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
 
     def route_after_classification(state: APIQueryState) -> str:
         """Route based on classification result."""
+        if state.get("is_follow_up"):
+            logger.info("Follow-up query — using LLM parse with conversation context")
+            return "parse"
         if state.get("skip_llm_parse") and state.get("parsed"):
             logger.info("Skipping LLM parse - using rule-based classification")
             return "create_plan"
@@ -1768,6 +1687,7 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
         route_after_follow_up,
         {
             "classify": "classify",
+            "parse": "parse",
             "summarize": "summarize",  # Follow-up already fetched data
             "end": END,  # Follow-up returned response directly
         },

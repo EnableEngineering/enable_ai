@@ -138,8 +138,21 @@ class QueryParser:
             self.logger.info(f"Parsing query: '{natural_language_input}'")
             
             if conversation_history:
-                # Use function calling to provide structured context
-                parsed = self._parse_with_context_function(messages, schema, conversation_history, user_context)
+                from .follow_up_detection import is_follow_up_query
+
+                if is_follow_up_query(natural_language_input, conversation_history):
+                    self.logger.info(
+                        "Follow-up detected — forcing context merge for: %r",
+                        natural_language_input[:80],
+                    )
+                    parsed = self._parse_with_forced_context(
+                        messages, schema, conversation_history, user_context,
+                    )
+                else:
+                    # Use function calling; LLM may request context via tool
+                    parsed = self._parse_with_context_function(
+                        messages, schema, conversation_history, user_context,
+                    )
             else:
                 # No conversation history - regular parsing
                 parsed = self.openai_client.parse_json_response(
@@ -188,7 +201,8 @@ Your task: Understand the user's intent and extract structured information so th
 
 **Intent and context**
 - Decide whether the user is starting a new request, continuing or refining the previous one (referring to prior results), asking for a count/total, asking for the next page of results, or changing how results are shown.
-- When the user's intent clearly refers to or continues the previous turn (e.g. "them", "those", "the same", "more", "next page", refining or filtering prior results), call get_query_context() to retrieve previous_resource and previous_filters, then use that resource and merge filters. Set merge_with_previous=true.
+- When the user's intent clearly refers to or continues the previous turn (e.g. "them", "those", "the same", "more", "next page", "and which company?", refining or filtering prior results), call get_query_context() to retrieve previous_resource and previous_filters, then use that resource and merge filters. Set merge_with_previous=true.
+- Follow-up refinements like "and assigned to which company?" after asking about service orders mean: stay on service-orders, keep previous filters, set question_type="details" — do NOT list all companies.
 - When the user is asking for the next page of a prior list (e.g. more results, next page), use context's next_url and set use_next_page=true and next_page_url from context.
 - When the user is asking for a total or count (how many, number of, total), set question_type="count".
 - When the user wants a small sample of prior results (e.g. "a few", "some"), set a small limit and question_type="list" so they see items, not only a count.
@@ -1134,7 +1148,50 @@ Return the complete parsed JSON with all filters merged and limit set when the u
                     )
             else:
                 raise ValueError("No content in LLM response")
-    
+
+    def _parse_with_forced_context(
+        self,
+        messages: List[Dict[str, Any]],
+        schema: Dict[str, Any],
+        conversation_history: list,
+        user_context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Parse a follow-up query with previous resource/filters injected (no tool-call hop)."""
+        context = self._extract_context_from_history(conversation_history)
+
+        self.logger.info(
+            "Forced follow-up context: resource=%s filters=%s",
+            context.get("previous_resource"),
+            context.get("previous_filters"),
+        )
+
+        user_context_reminder = ""
+        if user_context:
+            user_context_reminder = f"""
+- Resolve "me"/"my" using user_id={user_context.get('user_id')} and company_id={user_context.get('company_id')}"""
+
+        messages.append({
+            "role": "user",
+            "content": f"""This is a FOLLOW-UP query that continues the previous turn.
+
+PREVIOUS CONTEXT:
+{json.dumps(context, indent=2)}
+
+RULES:
+- Keep resource = previous_resource unless the user clearly changes topic
+- Merge previous_filters with any new conditions from the current query
+- Set merge_with_previous=true
+- If the user asks about a field on those items (company, customer, technician, status, etc.), keep the SAME resource and fetch details — do NOT switch to listing all companies/users
+- For detail questions after a count, set question_type="details" and display_mode="detailed"{user_context_reminder}
+
+Return the complete parsed JSON.""",
+        })
+
+        return self.openai_client.parse_json_response(
+            messages=messages,
+            temperature=DETERMINISTIC_TEMP,
+        )
+
     # ========================================================================
     # SEMANTIC PHRASE PREPROCESSING (v0.3.44 - Enhanced with fuzzy matching)
     # ========================================================================
