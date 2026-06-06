@@ -34,7 +34,11 @@ from .response_projector import (
 )
 from .query_execution import merge_execution_context
 from .semantic_filters import apply_semantic_filters
-from .hint_utils import expand_query_resources, strip_user_scoped_filters_on_breadth
+from .hint_utils import (
+    build_count_filter_description,
+    expand_query_resources,
+    strip_user_scoped_filters_on_breadth,
+)
 from .response_envelope import enrich_api_response
 from .user_context_resolver import (
     filters_for_display,
@@ -1405,23 +1409,15 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
             # v0.3.12: Special handling for COUNT questions
             if question_type == "count":
                 total_count = pagination_info['total_count']
-                resource = parsed.get('resource', 'items').replace('_', ' ')
-                
-                # Get filter details for context
-                filters = parsed.get('filters', {})
-                filter_desc = ""
-                
-                # Build filter description (e.g., "named BOROSCOPE in low-stock inventory")
-                filter_parts = []
-                if 'name' in filters:
-                    name_value = filters['name'].get('value', '')
-                    filter_parts.append(f"named {name_value}")
-                if 'status' in filters:
-                    status_value = filters['status'].get('value', '')
-                    filter_parts.append(f"{status_value}")
-                
-                if filter_parts:
-                    filter_desc = " ".join(filter_parts)
+                resource_key = parsed.get('resource', 'items')
+                resource = resource_key.replace('_', ' ')
+                active_schema = state.get("active_schema") or {}
+                resource_hints = active_schema.get("resource_hints") or {}
+
+                filters = filters_for_display(parsed)
+                filter_desc = build_count_filter_description(
+                    filters, resource_key, resource_hints,
+                )
                 
                 # Generate count-specific summary
                 if total_count == 0:

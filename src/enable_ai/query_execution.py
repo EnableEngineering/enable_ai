@@ -2,9 +2,13 @@
 Helpers for passing execution context (sort, limit, filters) through the pipeline.
 """
 
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from . import constants
+from .hint_utils import get_count_page_size
+from .utils import setup_logger
+
+logger = setup_logger("enable_ai.query_execution")
 
 # Fields that must flow from parsed query into each execution step
 EXECUTION_CONTEXT_FIELDS = (
@@ -167,6 +171,8 @@ def apply_limit_to_params(
     parsed: Dict[str, Any],
     endpoint_data: Dict[str, Any],
     default_page_size: int,
+    resource_hints: Optional[Dict[str, Any]] = None,
+    client_side_filters: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Apply user limit or default page_size to query params when appropriate."""
     params = dict(params)
@@ -182,6 +188,14 @@ def apply_limit_to_params(
                     break
         except (TypeError, ValueError):
             pass
+    elif parsed.get("question_type") == "count" and client_side_filters:
+        params = apply_count_pagination_params(
+            params,
+            parsed,
+            endpoint_data,
+            resource_hints or {},
+            client_side_filters,
+        )
     elif (
         parsed.get("question_type") != "count"
         and parsed.get("display_mode") != "full"
@@ -193,3 +207,66 @@ def apply_limit_to_params(
                 break
 
     return params
+
+
+def apply_count_pagination_params(
+    params: Dict[str, Any],
+    parsed: Dict[str, Any],
+    endpoint_data: Dict[str, Any],
+    resource_hints: Dict[str, Any],
+    client_side_filters: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Set page_size for count queries that post-filter client-side."""
+    if parsed.get("question_type") != "count" or not client_side_filters:
+        return params
+
+    resource = parsed.get("resource", "")
+    count_ps = get_count_page_size(resource, resource_hints) or constants.PAGE_SIZE_CAP
+    available = get_endpoint_query_param_names(endpoint_data)
+    params = dict(params)
+    for limit_param in constants.LIMIT_PARAM_NAMES:
+        if limit_param in params:
+            return params
+        if not available or limit_param in available:
+            params[limit_param] = count_ps
+            logger.info(
+                "Count + client-side filters: setting %s=%d",
+                limit_param, count_ps,
+            )
+            break
+    return params
+
+
+def fetch_all_paginated_results(
+    data: Any,
+    fetch_next_page: Callable[[str], Dict[str, Any]],
+    *,
+    max_pages: int = constants.SAFETY_MAX_PAGES,
+) -> Any:
+    """Merge all pages of a paginated API response into data.results."""
+    if not isinstance(data, dict) or "results" not in data or not data.get("next"):
+        return data
+
+    merged = dict(data)
+    merged_results = list(merged.get("results") or [])
+    pages = 1
+    while merged.get("next") and pages < max_pages:
+        page_result = fetch_next_page(merged["next"])
+        if page_result.get("error"):
+            logger.warning(
+                "Count pagination stopped: %s", page_result.get("error"),
+            )
+            break
+        next_data = page_result.get("data") or {}
+        if isinstance(next_data.get("results"), list):
+            merged_results.extend(next_data["results"])
+        merged["next"] = next_data.get("next")
+        merged["count"] = next_data.get("count", merged.get("count"))
+        pages += 1
+
+    merged["results"] = merged_results
+    if merged.get("next") and pages >= max_pages:
+        logger.warning(
+            constants.PAGINATION_SAFETY_CAP_WARNING.format(max_pages=max_pages),
+        )
+    return merged

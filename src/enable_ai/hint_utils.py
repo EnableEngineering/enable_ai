@@ -428,3 +428,173 @@ def apply_count_default_filters(
 
     result["filters"] = filters
     return result
+
+
+def get_count_page_size(resource: str, resource_hints: Dict[str, Any]) -> Optional[int]:
+    """Read __count_page_size__ from resource hints (capped at PAGE_SIZE_CAP)."""
+    from . import constants
+
+    hints = (resource_hints or {}).get(resource) or {}
+    if not isinstance(hints, dict):
+        return None
+    raw = hints.get("__count_page_size__")
+    if raw is None:
+        return None
+    try:
+        return min(int(raw), constants.PAGE_SIZE_CAP)
+    except (TypeError, ValueError):
+        return None
+
+
+def should_fetch_all_pages_for_count(
+    resource: str,
+    resource_hints: Dict[str, Any],
+    has_client_side_filters: bool,
+) -> bool:
+    """
+    Whether to paginate through all API pages before client-side count filtering.
+
+    Defaults to True when client-side filters are in play unless hints opt out.
+    """
+    hints = (resource_hints or {}).get(resource) or {}
+    if not isinstance(hints, dict):
+        return has_client_side_filters
+    if "__count_fetch_all_when_client_filters__" in hints:
+        return bool(hints["__count_fetch_all_when_client_filters__"])
+    return has_client_side_filters
+
+
+def build_count_filter_description(
+    filters: Dict[str, Any],
+    resource: str = "",
+    resource_hints: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Build human-readable filter context for count summaries."""
+    if not filters:
+        return ""
+
+    hints = (resource_hints or {}).get(resource) or {}
+    parts: List[str] = []
+
+    for field, fval in filters.items():
+        if field.startswith("_"):
+            continue
+        val = fval.get("value") if isinstance(fval, dict) else fval
+        op = fval.get("operator", "equals") if isinstance(fval, dict) else "equals"
+
+        if field == "name" and val is not None:
+            parts.append(f"named {val}")
+            continue
+        if field == "status" and val is not None:
+            parts.append(str(val))
+            continue
+        if field == "is_available":
+            if val is True:
+                parts.append("available")
+            elif val is False:
+                parts.append("unavailable")
+            continue
+
+        if val is None:
+            continue
+
+        display_val = str(val)
+        field_hints = hints.get(field) if isinstance(hints, dict) else None
+        if isinstance(field_hints, dict):
+            syns = field_hints.get("synonyms") or {}
+            for phrase, maps_to in syns.items():
+                if maps_to == val or str(maps_to).lower() == str(val).lower():
+                    display_val = str(phrase)
+                    break
+
+        if op in ("not_equals", "ne"):
+            parts.append(f"not {display_val}")
+        else:
+            parts.append(display_val)
+
+    return " ".join(parts)
+
+
+def get_count_page_size(resource: str, resource_hints: Dict[str, Any]) -> Optional[int]:
+    """Read __count_page_size__ from resource hints (capped at PAGE_SIZE_CAP)."""
+    from . import constants
+
+    hints = (resource_hints or {}).get(resource) or {}
+    if not isinstance(hints, dict):
+        return None
+    raw = hints.get("__count_page_size__")
+    if raw is None:
+        return None
+    try:
+        return min(int(raw), constants.PAGE_SIZE_CAP)
+    except (TypeError, ValueError):
+        return None
+
+
+def should_fetch_all_pages_for_count(
+    resource: str,
+    resource_hints: Dict[str, Any],
+    has_client_side_filters: bool,
+) -> bool:
+    """
+    Whether to paginate through all API pages before client-side count filtering.
+
+    Defaults to True when client-side filters are in play unless hints opt out.
+    """
+    hints = (resource_hints or {}).get(resource) or {}
+    if not isinstance(hints, dict):
+        return has_client_side_filters
+    if "__count_fetch_all_when_client_filters__" in hints:
+        return bool(hints["__count_fetch_all_when_client_filters__"])
+    return has_client_side_filters
+
+
+def build_count_filter_description(
+    filters: Dict[str, Any],
+    resource: str = "",
+    resource_hints: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Build human-readable filter context for count summaries."""
+    if not filters:
+        return ""
+
+    hints = (resource_hints or {}).get(resource) or {}
+    parts: List[str] = []
+
+    for field, fval in filters.items():
+        if field.startswith("_"):
+            continue
+        val = fval.get("value") if isinstance(fval, dict) else fval
+        op = fval.get("operator", "equals") if isinstance(fval, dict) else "equals"
+
+        if field == "name" and val is not None:
+            parts.append(f"named {val}")
+            continue
+        if field == "status" and val is not None:
+            parts.append(str(val))
+            continue
+        if field == "is_available":
+            if val is True:
+                parts.append("available")
+            elif val is False:
+                parts.append("unavailable")
+            continue
+
+        if val is None:
+            continue
+
+        display_val = str(val)
+        field_hints = hints.get(field) if isinstance(hints, dict) else None
+        if isinstance(field_hints, dict):
+            syns = field_hints.get("synonyms") or {}
+            for phrase, maps_to in syns.items():
+                if maps_to == val or str(maps_to).lower() == str(val).lower():
+                    display_val = str(phrase)
+                    break
+
+        if op in ("not_equals", "ne"):
+            parts.append(f"not {display_val}")
+        else:
+            parts.append(display_val)
+
+    return " ".join(parts)

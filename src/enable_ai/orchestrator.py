@@ -21,6 +21,8 @@ from .schema_validator import SchemaValidator
 from .progress_tracker import ProgressTracker, ProgressUpdate, ProgressStage
 from .schema_splitter import split_grouped_resources
 from .post_filter import apply_client_side_filters
+from .query_execution import apply_count_pagination_params, fetch_all_paginated_results
+from .hint_utils import should_fetch_all_pages_for_count
 from .semantic_filters import apply_semantic_filters
 from .param_validator import validate_parsed
 from .response_envelope import enrich_api_response
@@ -821,32 +823,40 @@ class APIOrchestrator:
     # PLAN CREATORS (Schema-Type Specific)
     # ========================================================================
 
+    def _find_endpoint_data(self, schema: dict, endpoint_path: str) -> Optional[dict]:
+        """Return endpoint definition dict for a matched path, if found."""
+        def _norm(p: str) -> str:
+            return (p or "").rstrip("/") or "/"
+
+        target = _norm(endpoint_path)
+        for _res_name, resource_data in (schema.get("resources") or {}).items():
+            for ep in resource_data.get("endpoints") or []:
+                path = ep.get("path") or ""
+                if _norm(path) == target:
+                    return ep
+                try:
+                    parts = re.split(r"(\{[^}]+\})", path)
+                    regex = "".join(
+                        "[^/]+" if re.match(r"^\{[^}]+\}$", p) else re.escape(p)
+                        for p in parts
+                    )
+                    regex = regex.rstrip("/") + "/?"
+                    if re.match(f"^{regex}$", target + "/"):
+                        return ep
+                except re.error:
+                    pass
+        return None
+
     def _get_limit_param_for_endpoint(self, schema: dict, endpoint_path: str) -> str:
         """
         Resolve the API's result-limit param name from the schema for the matched endpoint.
         Returns the first query param that matches known limit names (page_size, limit, etc.);
         if none in schema, falls back to constants.LIMIT_PARAM_NAMES[0] (page_size).
         """
-        def _norm(p: str) -> str:
-            return (p or "").rstrip("/") or "/"
-
-        target = _norm(endpoint_path)
         limit_names_lower = {n.lower() for n in constants.LIMIT_PARAM_NAMES}
-
-        for _res_name, resource_data in (schema.get("resources") or {}).items():
-            for ep in resource_data.get("endpoints") or []:
-                path = ep.get("path") or ""
-                if _norm(path) == target:
-                    return self._pick_limit_param_from_endpoint(ep, limit_names_lower)
-                # Match path with placeholders (e.g. /api/orders/{id}/) to request path
-                try:
-                    parts = re.split(r"(\{[^}]+\})", path)
-                    regex = "".join("[^/]+" if re.match(r"^\{[^}]+\}$", p) else re.escape(p) for p in parts)
-                    regex = regex.rstrip("/") + "/?"
-                    if re.match(f"^{regex}$", target + "/"):
-                        return self._pick_limit_param_from_endpoint(ep, limit_names_lower)
-                except re.error:
-                    pass
+        ep = self._find_endpoint_data(schema, endpoint_path)
+        if ep:
+            return self._pick_limit_param_from_endpoint(ep, limit_names_lower)
         return constants.LIMIT_PARAM_NAMES[0]  # page_size
 
     def _pick_limit_param_from_endpoint(self, endpoint_data: dict, limit_names_lower: set) -> str:
@@ -920,6 +930,9 @@ class APIOrchestrator:
         if isinstance(result, APIRequest):
             # Extract information from APIRequest object
             params = resolve_params_dict(result.params, user_context)
+            client_filters = result.client_side_filters or {}
+            resource_hints = schema.get("resource_hints") or {}
+            endpoint_data = self._find_endpoint_data(schema, result.endpoint)
             # When user asks for a result cap, parsed has limit — map to API's param from schema (page_size, limit, etc.)
             limit = parsed.get("limit")
             if limit is not None:
@@ -930,6 +943,14 @@ class APIOrchestrator:
                     self.logger.info(f"Adding {param_name}={n} from parsed limit (schema-driven)")
                 except (TypeError, ValueError):
                     pass
+            elif parsed.get("question_type") == "count" and client_filters:
+                params = apply_count_pagination_params(
+                    params,
+                    parsed,
+                    endpoint_data or {},
+                    resource_hints,
+                    client_filters,
+                )
             elif (
                 parsed.get("question_type") != "count"
                 and parsed.get("display_mode") != "full"
@@ -1164,6 +1185,16 @@ class APIOrchestrator:
         ) or {}
 
         if data is not None and client_filters:
+            resource = (parsed or {}).get("resource") or ""
+            resource_hints = schema.get("resource_hints") or {}
+            is_count = (parsed or {}).get("question_type") == "count"
+            if is_count and should_fetch_all_pages_for_count(
+                resource, resource_hints, bool(client_filters),
+            ):
+                data = fetch_all_paginated_results(
+                    data,
+                    lambda url: self._fetch_next_page(url, schema, access_token),
+                )
             data, removed = apply_client_side_filters(data, client_filters)
             if removed:
                 warnings.append(
