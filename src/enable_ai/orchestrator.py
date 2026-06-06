@@ -27,6 +27,7 @@ from .semantic_filters import apply_semantic_filters
 from .param_validator import validate_parsed
 from .response_envelope import enrich_api_response
 from .follow_up_detection import build_session_metadata
+from .compound_query import split_compound_questions
 from . import constants
 
 
@@ -440,6 +441,63 @@ class APIOrchestrator:
         if client_support:
             print(f"  - Client support: {', '.join(client_support)}", file=sys.stderr)
     
+    def _process_compound(
+        self,
+        sub_queries: List[str],
+        original_query: str,
+        access_token: Optional[str] = None,
+        context: Optional[Any] = None,
+        runtime_schema: Optional[dict] = None,
+        session_id: Optional[str] = None,
+        progress_callback: Optional[Callable] = None,
+        user_context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Execute each sub-question and merge summaries into one response."""
+        merged_context = dict(context or {})
+        merged_context["_skip_compound_split"] = True
+
+        results: List[Dict[str, Any]] = []
+        summaries: List[str] = []
+        for sub in sub_queries:
+            result = self.process(
+                sub,
+                access_token=access_token,
+                context=merged_context,
+                runtime_schema=runtime_schema,
+                session_id=None,
+                progress_callback=None,
+                user_context=user_context,
+            )
+            results.append(result)
+            if result.get("summary"):
+                summaries.append(result["summary"])
+
+        response: Dict[str, Any] = {
+            "success": all(r.get("success") for r in results),
+            "data": [r.get("data") for r in results],
+            "summary": "\n\n".join(summaries) if summaries else "Completed.",
+            "query": original_query,
+            "compound_results": results,
+            "schema_type": results[-1].get("schema_type") if results else None,
+        }
+        if not response["success"]:
+            response["errors"] = [r.get("error") for r in results if r.get("error")]
+
+        if session_id and response.get("success"):
+            self.conversation_store.add_message(session_id, "user", original_query)
+            meta = build_session_metadata(
+                results[-1].get("parsed") or {},
+                response,
+            )
+            self.conversation_store.add_message(
+                session_id,
+                "assistant",
+                response["summary"],
+                metadata=meta,
+            )
+
+        return response
+
     def process(
         self,
         query: str,
@@ -530,6 +588,21 @@ class APIOrchestrator:
             self.logger.info("Runtime schema detected as OpenAPI/Swagger – auto-converting to Enable AI format")
             runtime_schema = self._convert_openapi_to_enable_ai(runtime_schema)
         
+        # Compound questions: split and answer each sub-query in one turn
+        if not (isinstance(context, dict) and context.get("_skip_compound_split")):
+            sub_queries = split_compound_questions(query)
+            if len(sub_queries) > 1:
+                return self._process_compound(
+                    sub_queries,
+                    original_query=query,
+                    access_token=access_token,
+                    context=context,
+                    runtime_schema=runtime_schema,
+                    session_id=session_id,
+                    progress_callback=progress_callback,
+                    user_context=user_context,
+                )
+
         # Get conversation history if session_id provided (v0.3.13: using external store)
         conversation_history = []
         if session_id:

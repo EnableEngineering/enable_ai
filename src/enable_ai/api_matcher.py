@@ -44,6 +44,7 @@ class APIMatcher:
             entities = parsed_input.get('entities', {})
             filters = parsed_input.get('filters', {}) or {}
             original_input = (parsed_input.get('original_input') or "").lower()
+            question_type = (parsed_input.get('question_type') or '').lower()
             
             self.logger.debug(
                 f"Matching: intent={intent}, resource={resource}, "
@@ -324,6 +325,25 @@ class APIMatcher:
                     # Existing "list self" preference
                     if path_is_list_self(res_name, ep):
                         score += 5
+
+                    # Endpoint role routing (list vs summary/dashboard)
+                    from .hint_utils import get_endpoint_role
+                    role = get_endpoint_role(res_name, resource_hints)
+                    if role in ("summary", "dashboard", "metrics"):
+                        if question_type in ("count", "list"):
+                            score -= 30
+                        elif question_type in ("summary", "aggregate_metric"):
+                            score += 20
+                    elif role == "list":
+                        if question_type in ("count", "list"):
+                            score += 15
+                        elif question_type in ("summary", "aggregate_metric"):
+                            score -= 10
+                    elif question_type in ("count", "list"):
+                        if "dashboard" in path or path.rstrip("/").endswith("-dashboard"):
+                            score -= 25
+                        elif "/invoices" in path or path.rstrip("/").endswith("/invoices"):
+                            score += 10
 
                     return score
 

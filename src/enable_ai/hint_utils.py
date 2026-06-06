@@ -92,15 +92,128 @@ def get_extra_query_params(resource: str, resource_hints: Dict[str, Any]) -> Set
     return {str(p) for p in extra} if isinstance(extra, (list, tuple)) else set()
 
 
-def get_client_side_filter_fields(resource: str, resource_hints: Dict[str, Any]) -> Set[str]:
-    """Filters intentionally applied client-side (no warning)."""
+def get_extra_response_fields(resource: str, resource_hints: Dict[str, Any]) -> Set[str]:
+    """Response fields present at runtime but absent from OpenAPI (client-side filter/count)."""
     if not resource or not resource_hints:
         return set()
     hints = resource_hints.get(resource) or {}
     if not isinstance(hints, dict):
         return set()
-    fields = hints.get("__client_side_filters__") or []
+    fields = hints.get("__extra_response_fields__") or []
     return {str(f) for f in fields} if isinstance(fields, (list, tuple)) else set()
+
+
+def get_client_side_filter_fields(resource: str, resource_hints: Dict[str, Any]) -> Set[str]:
+    """Filters intentionally applied client-side (no warning)."""
+    fields = set(get_extra_response_fields(resource, resource_hints))
+    if not resource or not resource_hints:
+        return fields
+    hints = resource_hints.get(resource) or {}
+    if not isinstance(hints, dict):
+        return fields
+    declared = hints.get("__client_side_filters__") or []
+    if isinstance(declared, (list, tuple)):
+        fields.update(str(f) for f in declared)
+    return fields
+
+
+def get_response_count_fields(resource: str, resource_hints: Dict[str, Any]) -> List[str]:
+    """Fields to read numeric totals from singleton/dashboard responses."""
+    hints = (resource_hints or {}).get(resource) or {}
+    if not isinstance(hints, dict):
+        return []
+    fields = hints.get("__response_count_fields__") or []
+    return [str(f) for f in fields] if isinstance(fields, (list, tuple)) else []
+
+
+def get_response_summary_fields(
+    resource: str, resource_hints: Dict[str, Any],
+) -> Dict[str, str]:
+    """Map response field names to display labels for summary/dashboard payloads."""
+    hints = (resource_hints or {}).get(resource) or {}
+    if not isinstance(hints, dict):
+        return {}
+    fields = hints.get("__response_summary_fields__") or {}
+    if isinstance(fields, dict):
+        return {str(k): str(v) for k, v in fields.items()}
+    return {}
+
+
+def get_endpoint_role(resource: str, resource_hints: Dict[str, Any]) -> Optional[str]:
+    """Hint-declared endpoint role: list, summary, settings, etc."""
+    hints = (resource_hints or {}).get(resource) or {}
+    if not isinstance(hints, dict):
+        return None
+    role = hints.get("__endpoint_role__")
+    return str(role).lower() if role else None
+
+
+def _matching_term_lengths(query: str, resource_name: str, hints: Dict[str, Any]) -> List[int]:
+    """Return lengths of all resource terms that match the query."""
+    if not query:
+        return []
+    q = query.lower()
+    terms = [resource_name, resource_name.replace("-", " ")]
+    syns = hints.get("__resource_synonyms__") or []
+    if isinstance(syns, list):
+        terms.extend(str(s) for s in syns)
+    elif syns:
+        terms.append(str(syns))
+    return [
+        len(_normalize_term(t))
+        for t in terms
+        if t and _term_in_query(t, q)
+    ]
+
+
+def find_child_resource_over_aggregate(
+    query: str,
+    resource_hints: Dict[str, Any],
+    schema_resources: Set[str],
+) -> Optional[str]:
+    """
+    Prefer a specific aggregate child when the query names it explicitly.
+
+    E.g. "how many detailed reports?" → details-reports, not virtual reports aggregate.
+    """
+    if not query or not resource_hints:
+        return None
+
+    child_to_parent: Dict[str, str] = {}
+    for name, hints in resource_hints.items():
+        if not isinstance(hints, dict):
+            continue
+        agg = get_aggregate_resources(hints)
+        if agg:
+            for child in agg:
+                child_to_parent[child] = name
+
+    best_child: Optional[str] = None
+    best_child_len = 0
+    for child in schema_resources:
+        if child not in child_to_parent:
+            continue
+        child_hints = resource_hints.get(child) or {}
+        if not isinstance(child_hints, dict):
+            child_hints = {}
+        lengths = _matching_term_lengths(query, child, child_hints)
+        if lengths and max(lengths) > best_child_len:
+            best_child = child
+            best_child_len = max(lengths)
+
+    if not best_child:
+        return None
+
+    parent = child_to_parent[best_child]
+    parent_hints = resource_hints.get(parent) or {}
+    if not isinstance(parent_hints, dict):
+        parent_hints = {}
+    parent_lengths = _matching_term_lengths(query, parent, parent_hints)
+    parent_best = max(parent_lengths) if parent_lengths else 0
+
+    if best_child_len >= parent_best:
+        return best_child
+    return None
 
 
 def strip_user_scoped_filters_on_breadth(
@@ -183,13 +296,22 @@ def find_aggregate_resources_for_query(
         agg = get_aggregate_resources(hints)
         if not agg:
             continue
-        terms = [_normalize_term(name)] + [
-            _normalize_term(s) for s in (hints.get("__resource_synonyms__") or [])
-        ]
-        for term in terms:
-            if term and _term_in_query(term, q) and len(term) > best_len:
-                best = list(agg)
-                best_len = len(term)
+        lengths = _matching_term_lengths(query, name, hints)
+        if not lengths:
+            continue
+        term_len = max(lengths)
+        if term_len <= best_len:
+            continue
+        # Skip aggregate when a child matches with equal or greater specificity
+        child_lengths = []
+        for child in agg:
+            child_hints = resource_hints.get(child) or {}
+            if isinstance(child_hints, dict):
+                child_lengths.extend(_matching_term_lengths(query, child, child_hints))
+        if child_lengths and max(child_lengths) >= term_len:
+            continue
+        best = list(agg)
+        best_len = term_len
     return best
 
 
@@ -235,6 +357,12 @@ def expand_query_resources(
 
     existing = result.get("multiple_resources")
     if isinstance(existing, list) and len(existing) > 1:
+        return result
+
+    specific_child = find_child_resource_over_aggregate(query, hints, resources)
+    if specific_child:
+        result["resource"] = specific_child
+        result.pop("multiple_resources", None)
         return result
 
     agg = find_aggregate_resources_for_query(query, hints)
@@ -515,86 +643,47 @@ def build_count_filter_description(
     return " ".join(parts)
 
 
-def get_count_page_size(resource: str, resource_hints: Dict[str, Any]) -> Optional[int]:
-    """Read __count_page_size__ from resource hints (capped at PAGE_SIZE_CAP)."""
-    from . import constants
-
-    hints = (resource_hints or {}).get(resource) or {}
-    if not isinstance(hints, dict):
-        return None
-    raw = hints.get("__count_page_size__")
-    if raw is None:
-        return None
-    try:
-        return min(int(raw), constants.PAGE_SIZE_CAP)
-    except (TypeError, ValueError):
-        return None
-
-
-def should_fetch_all_pages_for_count(
+def is_summary_response(
+    data: Any,
     resource: str,
     resource_hints: Dict[str, Any],
-    has_client_side_filters: bool,
 ) -> bool:
-    """
-    Whether to paginate through all API pages before client-side count filtering.
+    """True when data is a singleton dashboard/metrics dict, not a list page."""
+    if not isinstance(data, dict) or "results" in data:
+        return False
+    summary_fields = get_response_summary_fields(resource, resource_hints)
+    count_fields = get_response_count_fields(resource, resource_hints)
+    keys = set(data.keys())
+    if summary_fields and keys.intersection(summary_fields.keys()):
+        return True
+    if count_fields and keys.intersection(count_fields):
+        return True
+    return False
 
-    Defaults to True when client-side filters are in play unless hints opt out.
-    """
-    hints = (resource_hints or {}).get(resource) or {}
-    if not isinstance(hints, dict):
-        return has_client_side_filters
-    if "__count_fetch_all_when_client_filters__" in hints:
-        return bool(hints["__count_fetch_all_when_client_filters__"])
-    return has_client_side_filters
 
-
-def build_count_filter_description(
-    filters: Dict[str, Any],
-    resource: str = "",
-    resource_hints: Optional[Dict[str, Any]] = None,
+def build_summary_response_text(
+    data: Dict[str, Any],
+    resource: str,
+    resource_hints: Dict[str, Any],
 ) -> str:
-    """Build human-readable filter context for count summaries."""
-    if not filters:
-        return ""
-
-    hints = (resource_hints or {}).get(resource) or {}
+    """Format dashboard/summary API payloads for user-facing text."""
+    summary_fields = get_response_summary_fields(resource, resource_hints)
     parts: List[str] = []
-
-    for field, fval in filters.items():
-        if field.startswith("_"):
+    for field, label in summary_fields.items():
+        if field not in data or data[field] is None:
             continue
-        val = fval.get("value") if isinstance(fval, dict) else fval
-        op = fval.get("operator", "equals") if isinstance(fval, dict) else "equals"
+        val = data[field]
+        if isinstance(val, float) and val == int(val):
+            val = int(val)
+        parts.append(f"{label} is {val}")
 
-        if field == "name" and val is not None:
-            parts.append(f"named {val}")
-            continue
-        if field == "status" and val is not None:
-            parts.append(str(val))
-            continue
-        if field == "is_available":
-            if val is True:
-                parts.append("available")
-            elif val is False:
-                parts.append("unavailable")
-            continue
+    if parts:
+        return ". ".join(parts) + "."
 
-        if val is None:
-            continue
+    count_fields = get_response_count_fields(resource, resource_hints)
+    for field in count_fields:
+        if field in data and data[field] is not None:
+            label = field.replace("_", " ")
+            return f"{label.title()} is {data[field]}."
 
-        display_val = str(val)
-        field_hints = hints.get(field) if isinstance(hints, dict) else None
-        if isinstance(field_hints, dict):
-            syns = field_hints.get("synonyms") or {}
-            for phrase, maps_to in syns.items():
-                if maps_to == val or str(maps_to).lower() == str(val).lower():
-                    display_val = str(phrase)
-                    break
-
-        if op in ("not_equals", "ne"):
-            parts.append(f"not {display_val}")
-        else:
-            parts.append(display_val)
-
-    return " ".join(parts)
+    return ""

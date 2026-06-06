@@ -38,6 +38,10 @@ DEFAULT_SPLIT_RULES: Dict[str, Dict[str, str]] = {
         "flash-reports": "/flash-reports",
         "details-reports": "/details-reports",
     },
+    "invoicing": {
+        "invoicing-invoices": "/invoices",
+        "invoicing-ar-summary": "/ar-dashboard",
+    },
 }
 
 
@@ -59,12 +63,27 @@ def _build_auto_split_rules(
     ]
 
     for hint_name in missing_hints:
-        segment = hint_name.replace("_", "-")
-        pattern = f"/{segment}"
+        hint_norm = hint_name.replace("_", "-")
+        parent_prefix = hint_norm.split("-")[0] if "-" in hint_norm else hint_norm
+        patterns = [f"/{hint_norm}"]
+        # invoicing-invoices → /invoices under parent invoicing
+        for parent_name, parent_data in resources.items():
+            parent_norm = parent_name.replace("_", "-")
+            if hint_norm.startswith(parent_norm + "-"):
+                suffix = hint_norm[len(parent_norm) + 1:]
+                if suffix:
+                    patterns.insert(0, f"/{suffix}")
+            elif parent_norm == parent_prefix:
+                remainder = hint_norm[len(parent_norm) + 1:] if hint_norm.startswith(parent_norm + "-") else ""
+                if remainder:
+                    patterns.insert(0, f"/{remainder}")
         for parent_name, parent_data in resources.items():
             endpoints = parent_data.get("endpoints") or []
-            if any(_path_matches(ep.get("path", ""), pattern) for ep in endpoints):
-                auto_rules.setdefault(parent_name, {})[hint_name] = pattern
+            for pattern in patterns:
+                if any(_path_matches(ep.get("path", ""), pattern) for ep in endpoints):
+                    auto_rules.setdefault(parent_name, {})[hint_name] = pattern
+                    break
+            if hint_name in auto_rules.get(parent_name, {}):
                 break
 
     return auto_rules

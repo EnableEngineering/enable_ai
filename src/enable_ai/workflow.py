@@ -1,4 +1,4 @@
-from typing import Any, Dict, Optional, TypedDict, List
+from typing import Any, Dict, Optional, TypedDict, List, Set
 import re
 import json
 
@@ -36,7 +36,10 @@ from .query_execution import merge_execution_context
 from .semantic_filters import apply_semantic_filters
 from .hint_utils import (
     build_count_filter_description,
+    build_summary_response_text,
     expand_query_resources,
+    get_response_count_fields,
+    is_summary_response,
     strip_user_scoped_filters_on_breadth,
 )
 from .response_envelope import enrich_api_response
@@ -129,11 +132,19 @@ def _unwrap_json_response(summary: str) -> str:
     return summary
 
 
-def _api_total_count(data: Any) -> Optional[int]:
+def _api_total_count(
+    data: Any,
+    extra_count_fields: Optional[List[str]] = None,
+) -> Optional[int]:
     """Read total record count from API response — never use page length as total."""
     if not isinstance(data, dict):
         return None
-    for key in ("count", "total_count", "total"):
+    keys = list(extra_count_fields or []) + ["count", "total_count", "total"]
+    seen: Set[str] = set()
+    for key in keys:
+        if key in seen:
+            continue
+        seen.add(key)
         val = data.get(key)
         if val is not None:
             try:
@@ -143,17 +154,25 @@ def _api_total_count(data: Any) -> Optional[int]:
     return None
 
 
-def _analyze_pagination(data: Any) -> Dict[str, Any]:
+def _analyze_pagination(
+    data: Any,
+    resource: str = "",
+    resource_hints: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     """
     Analyze API response to extract pagination information (v0.3.11).
 
     total_count always prefers the API count field; actual_count is page length only.
     """
+    hints = resource_hints or {}
+    extra_count_fields = get_response_count_fields(resource, hints) if resource else []
+
     info = {
         'total_count': 0,
         'actual_count': 0,
         'has_more': False,
         'is_paginated': False,
+        'is_summary': False,
         'next_url': None,
     }
 
@@ -161,7 +180,7 @@ def _analyze_pagination(data: Any) -> Dict[str, Any]:
         info['is_paginated'] = True
         results = data.get('results', [])
         info['actual_count'] = len(results) if isinstance(results, list) else 0
-        api_total = _api_total_count(data)
+        api_total = _api_total_count(data, extra_count_fields)
         if api_total is not None:
             info['total_count'] = api_total
         else:
@@ -173,9 +192,15 @@ def _analyze_pagination(data: Any) -> Dict[str, Any]:
         info['actual_count'] = len(data)
         info['total_count'] = len(data)
     elif isinstance(data, dict):
-        api_total = _api_total_count(data)
-        info['actual_count'] = 1
-        info['total_count'] = api_total if api_total is not None else 1
+        if is_summary_response(data, resource, hints):
+            info['is_summary'] = True
+            info['actual_count'] = 0
+            api_total = _api_total_count(data, extra_count_fields)
+            info['total_count'] = api_total if api_total is not None else 0
+        else:
+            api_total = _api_total_count(data, extra_count_fields)
+            info['actual_count'] = 1
+            info['total_count'] = api_total if api_total is not None else 1
     else:
         info['actual_count'] = 1
         info['total_count'] = 1
@@ -1385,7 +1410,10 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
                 if pages_fetched >= constants.SAFETY_MAX_PAGES and isinstance(data, dict) and data.get("next"):
                     logger.warning(constants.PAGINATION_SAFETY_CAP_WARNING.format(max_pages=constants.SAFETY_MAX_PAGES))
             # Analyze response to extract accurate counts (Issue #2-4)
-            pagination_info = _analyze_pagination(data)
+            active_schema = state.get("active_schema") or {}
+            resource_hints = active_schema.get("resource_hints") or {}
+            resource_key = parsed.get("resource", "")
+            pagination_info = _analyze_pagination(data, resource_key, resource_hints)
 
             # v0.3.72: Accumulate pages for session list_cache (chat windows without next_url)
             list_projection = None
@@ -1394,10 +1422,10 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
                     data = _accumulate_paginated_results(
                         data,
                         processor,
-                        state.get("active_schema") or {},
+                        active_schema,
                         state.get("access_token"),
                     )
-                    pagination_info = _analyze_pagination(data)
+                    pagination_info = _analyze_pagination(data, resource_key, resource_hints)
                 projector = ResponseProjector(state.get("active_schema") or {})
                 list_projection = projector.prepare_list_display(
                     data,
@@ -1406,13 +1434,58 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
                     chat_offset=0,
                 )
             
+            # Summary/dashboard responses (singleton metrics, not list pages)
+            if (
+                question_type in ("summary", "aggregate_metric")
+                or pagination_info.get("is_summary")
+                or (
+                    isinstance(data, dict)
+                    and is_summary_response(data, resource_key, resource_hints)
+                )
+            ):
+                summary = build_summary_response_text(
+                    data if isinstance(data, dict) else {},
+                    resource_key,
+                    resource_hints,
+                )
+                if not summary:
+                    summary = constants.SUMMARY_RETRIEVED_DATA
+                logger.info("Summary/dashboard response: %s", summary)
+                response = enrich_response_with_follow_ups({
+                    "success": True,
+                    "data": data,
+                    "summary": summary,
+                    "query": state.get("query"),
+                    "question_type": "summary",
+                    "display_mode": "summary",
+                    "pagination": pagination_info,
+                    "total_steps": 1,
+                    "schema_type": active_schema.get("type"),
+                }, pagination_info, parsed, data)
+                if tracker:
+                    tracker.update(ProgressStage.COMPLETED, "Done! ✓")
+                response = enrich_api_response(
+                    response,
+                    {
+                        "parsed": parsed,
+                        "step_results": step_results,
+                        "filter_warnings": state.get("filter_warnings", []),
+                        "result": result,
+                    },
+                )
+                last_result_metadata = build_session_metadata(parsed, response)
+                return {
+                    "summary": summary,
+                    "response": response,
+                    "last_result_metadata": last_result_metadata,
+                    "parsed": parsed,
+                }
+
             # v0.3.12: Special handling for COUNT questions
             if question_type == "count":
                 total_count = pagination_info['total_count']
                 resource_key = parsed.get('resource', 'items')
                 resource = resource_key.replace('_', ' ')
-                active_schema = state.get("active_schema") or {}
-                resource_hints = active_schema.get("resource_hints") or {}
 
                 filters = filters_for_display(parsed)
                 filter_desc = build_count_filter_description(
