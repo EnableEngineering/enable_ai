@@ -29,11 +29,12 @@ from .response_projector import (
     ResponseProjector,
     apply_chat_window,
     build_chat_summary,
+    extract_raw_items,
     format_projected_table,
 )
 from .query_execution import merge_execution_context
 from .semantic_filters import apply_semantic_filters
-from .hint_utils import strip_user_scoped_filters_on_breadth
+from .hint_utils import expand_query_resources, strip_user_scoped_filters_on_breadth
 from .response_envelope import enrich_api_response
 from .user_context_resolver import (
     filters_for_display,
@@ -729,6 +730,8 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
                 parsed, query_text, resource_hints,
             )
 
+            parsed = expand_query_resources(parsed, query_text, active_schema)
+
             execution_plan = planner.create_execution_plan(parsed, active_schema)
             total_steps = len(execution_plan.get("steps", []))
             if tracker:
@@ -1126,6 +1129,83 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
                             "last_result_metadata": last_result_metadata,
                             "parsed": parsed,
                         }
+
+            # Multi-resource list: merge results from aggregate children
+            if execution_plan.get("plan_type") == "multi_resource_list":
+                combined: List[Dict[str, Any]] = []
+                for sr in step_results:
+                    if sr.get("status") != "success":
+                        continue
+                    combined.extend(extract_raw_items(sr.get("result")))
+                active_schema = state.get("active_schema") or {}
+                aggregate_resource = parsed.get("resource", "items")
+                merged_data = {"results": combined, "count": len(combined)}
+                projector = ResponseProjector(active_schema)
+                list_projection = projector.prepare_list_display(
+                    merged_data,
+                    aggregate_resource,
+                    display_mode=display_mode,
+                    chat_offset=0,
+                )
+                resource_name = aggregate_resource
+                summary = ""
+                formatted = None
+                fmt_format = None
+                if list_projection.get("list_display_fields"):
+                    window = list_projection["window_items"]
+                    fields = list_projection["list_display_fields"]
+                    summary = build_chat_summary(
+                        window,
+                        fields,
+                        resource=resource_name,
+                        offset=list_projection["chat_offset"],
+                        window_size=list_projection["chat_window_size"],
+                        total_cached=list_projection["total_cached"],
+                        total_count=len(combined),
+                        has_more_in_chat=list_projection["has_more_in_chat"],
+                    )
+                    formatted = format_projected_table(window, fields, resource=resource_name)
+                    fmt_format = "table"
+                else:
+                    summary = constants.SUMMARY_RETRIEVED_ALL_LEN.format(count=len(combined))
+
+                pagination_info = {
+                    "total_count": len(combined),
+                    "actual_count": len(list_projection.get("window_items") or combined),
+                    "has_more": list_projection.get("has_more_in_chat", False),
+                }
+                response = enrich_response_with_follow_ups({
+                    "success": not has_error,
+                    "data": {"results": list_projection.get("window_items") or combined},
+                    "summary": summary,
+                    "query": state.get("query"),
+                    "display_mode": display_mode,
+                    "question_type": "list",
+                    "pagination": pagination_info,
+                    "total_steps": len(step_results),
+                    "schema_type": active_schema.get("type"),
+                }, pagination_info, parsed, merged_data)
+                if formatted:
+                    response["formatted"] = formatted
+                    response["format"] = fmt_format
+                response = enrich_api_response(
+                    response,
+                    {
+                        "parsed": parsed,
+                        "step_results": step_results,
+                        "filter_warnings": state.get("filter_warnings", []),
+                        "result": result,
+                    },
+                )
+                last_result_metadata = build_session_metadata(
+                    parsed, response, schema=active_schema, projection=list_projection,
+                )
+                return {
+                    "summary": summary,
+                    "response": response,
+                    "last_result_metadata": last_result_metadata,
+                    "parsed": parsed,
+                }
 
             # Multi-resource count: sum counts from each step
             if execution_plan.get("plan_type") == "multi_resource_count" and question_type == "count":

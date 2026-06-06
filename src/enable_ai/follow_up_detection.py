@@ -10,7 +10,7 @@ import json
 from typing import Any, Dict, List, Optional
 
 from . import constants
-from .hint_utils import get_user_scoped_fields
+from .hint_utils import expand_aggregate_follow_up, get_user_scoped_fields
 from .response_projector import (
     apply_chat_window,
     build_chat_summary,
@@ -135,6 +135,7 @@ def build_session_metadata(
         "list_display_fields": list_display_fields,
         "has_more_in_chat": has_more_in_chat,
         "total_cached": len(list_cache) if list_cache else (projection or {}).get("total_cached"),
+        "multiple_resources": parsed.get("multiple_resources"),
     }
 
 
@@ -165,6 +166,7 @@ def extract_last_result_metadata(conversation_history: List[Dict[str, Any]]) -> 
                 "list_display_fields": metadata.get("list_display_fields") or [],
                 "has_more_in_chat": metadata.get("has_more_in_chat", False),
                 "total_cached": metadata.get("total_cached"),
+                "multiple_resources": metadata.get("multiple_resources"),
             }
     return {}
 
@@ -559,11 +561,11 @@ def apply_follow_up_context(
         result["question_type"] = q_override
     if d_override:
         result["display_mode"] = d_override
-    elif clf.get("follow_up_type") == "refinement":
+    elif clf.get("follow_up_type") == "refinement" and not q_override:
         result["question_type"] = result.get("question_type") or "details"
         result["display_mode"] = result.get("display_mode") or "detailed"
 
     if meta.get("count") == 1 and not result.get("limit"):
         result["limit"] = 1
 
-    return result
+    return expand_aggregate_follow_up(result, meta, clf, resource_hints or {})

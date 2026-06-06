@@ -601,6 +601,11 @@ Filter structure pattern: {_pattern_example}
 Prefer exact strings from "values" or canonical targets from "synonyms".
 """
 
+        query_examples = schema.get("query_examples") or []
+        if query_examples:
+            hints_section += "\n\nDOMAIN QUERY EXAMPLES (follow these patterns for this API):\n"
+            hints_section += json.dumps(query_examples, indent=2)
+
         classification_section = ""
         if classification_hint:
             classification_section = f"""
@@ -1259,7 +1264,9 @@ RULES:
 - Merge previous_filters with any new conditions from the current query (unless referent rules apply)
 - Set merge_with_previous=true (unless referent rules apply — then false)
 - If the user asks about a field on those items, keep the SAME resource and fetch details — do NOT switch to listing an unrelated resource
-- For detail questions after a count, set question_type="details" and display_mode="detailed"
+- Enumeration after a count ("those", "them", "the list", "show me those") → question_type="list", display_mode="full" or "detailed", merge_with_previous=true
+- Field-specific detail on those items ("what is the stock level of those?") → question_type="details", display_mode="detailed"
+- Do NOT set question_type="details" for vague list requests after a count — use "list"
 - Use result_items / primary_item to resolve "it", "this", "that" pronouns to a specific record id{user_context_reminder}
 
 Return the complete parsed JSON.""",

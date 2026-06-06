@@ -8,6 +8,7 @@ Consumer config resource_hints often use individual names (companies, flash-repo
 import copy
 from typing import Any, Dict, List, Optional
 
+from .hint_utils import get_aggregate_resources
 from .utils import setup_logger
 
 logger = setup_logger("enable_ai.schema_splitter")
@@ -151,5 +152,37 @@ def split_grouped_resources(schema: Dict[str, Any]) -> Dict[str, Any]:
                 parent_name, ", ".join(created),
             )
 
+    schema["resources"] = resources
+    return _strip_virtual_aggregate_resources(schema)
+
+
+def _strip_virtual_aggregate_resources(schema: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Remove virtual aggregate parents from matchable resources.
+
+    Parents with __aggregate_resources__ (e.g. inventory) may keep utility
+    endpoints like /low-stock/ after split — they must not win over children.
+    """
+    if not schema or not schema.get("resources"):
+        return schema
+
+    resources = schema["resources"]
+    hints = schema.get("resource_hints") or {}
+    removed: List[str] = []
+
+    for name, hint_data in hints.items():
+        if not isinstance(hint_data, dict):
+            continue
+        if not get_aggregate_resources(hint_data):
+            continue
+        if name in resources:
+            del resources[name]
+            removed.append(name)
+
+    if removed:
+        logger.info(
+            "Stripped virtual aggregate resources from matcher: %s",
+            ", ".join(removed),
+        )
     schema["resources"] = resources
     return schema

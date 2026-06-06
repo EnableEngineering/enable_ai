@@ -143,6 +143,27 @@ def _term_in_query(term: str, query_lower: str) -> bool:
     return bool(re.search(rf"(?<!\w){re.escape(norm)}(?:s|es)?(?!\w)", query_lower))
 
 
+def get_aggregate_resources(hints: Dict[str, Any]) -> Optional[List[str]]:
+    """
+    Read child resource list from __aggregate_resources__ or legacy __aggregate__.
+    """
+    if not isinstance(hints, dict):
+        return None
+    for key in ("__aggregate_resources__", "__aggregate__"):
+        agg = hints.get(key)
+        if isinstance(agg, (list, tuple)) and len(agg) >= 2:
+            return list(agg)
+    return None
+
+
+def is_virtual_aggregate_resource(resource: str, resource_hints: Dict[str, Any]) -> bool:
+    """True when a hint key defines aggregate children (virtual parent resource)."""
+    if not resource or not resource_hints:
+        return False
+    hints = resource_hints.get(resource) or {}
+    return get_aggregate_resources(hints) is not None
+
+
 def find_aggregate_resources_for_query(
     query: str,
     resource_hints: Dict[str, Any],
@@ -159,8 +180,8 @@ def find_aggregate_resources_for_query(
     for name, hints in resource_hints.items():
         if not isinstance(hints, dict):
             continue
-        agg = hints.get("__aggregate_resources__")
-        if not isinstance(agg, (list, tuple)) or len(agg) < 2:
+        agg = get_aggregate_resources(hints)
+        if not agg:
             continue
         terms = [_normalize_term(name)] + [
             _normalize_term(s) for s in (hints.get("__resource_synonyms__") or [])
@@ -232,5 +253,67 @@ def expand_query_resources(
         result["multiple_resources"] = mentioned
         if not result.get("resource"):
             result["resource"] = mentioned[0]
+
+    return result
+
+
+def _is_aggregate_list_follow_up(
+    parsed: Dict[str, Any],
+    meta: Dict[str, Any],
+    classification: Optional[Dict[str, Any]],
+) -> bool:
+    """True when a follow-up should list all children of a virtual aggregate resource."""
+    clf = classification or {}
+    prev_qt = meta.get("question_type")
+    new_qt = clf.get("question_type_override") or parsed.get("question_type")
+
+    if clf.get("follow_up_type") == "reference":
+        return new_qt in (None, "list") or clf.get("question_type_override") == "list"
+
+    if prev_qt == "count" and new_qt == "list":
+        return True
+
+    if prev_qt == "count" and clf.get("is_follow_up") and clf.get("follow_up_type") in (
+        "reference", "refinement", "first_n",
+    ):
+        if clf.get("question_type_override") != "details":
+            return True
+
+    return bool(meta.get("multiple_resources") and new_qt == "list")
+
+
+def expand_aggregate_follow_up(
+    parsed: Dict[str, Any],
+    meta: Dict[str, Any],
+    classification: Optional[Dict[str, Any]],
+    resource_hints: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Expand vague deixis follow-ups ("show me those") after aggregate count queries.
+
+    Uses previous_resource __aggregate_resources__ or session multiple_resources.
+    """
+    if not isinstance(parsed, dict):
+        return parsed
+
+    result = dict(parsed)
+    if not _is_aggregate_list_follow_up(result, meta, classification):
+        return result
+
+    prev_multi = meta.get("multiple_resources")
+    if isinstance(prev_multi, list) and len(prev_multi) > 1:
+        result["multiple_resources"] = list(prev_multi)
+        result["resource"] = prev_multi[0]
+        return result
+
+    prev_resource = meta.get("resource") or result.get("resource")
+    if not prev_resource:
+        return result
+
+    hints = (resource_hints or {}).get(prev_resource) or {}
+    agg = get_aggregate_resources(hints)
+    if agg:
+        result["multiple_resources"] = agg
+        result["resource"] = agg[0]
 
     return result

@@ -91,6 +91,11 @@ class ExecutionPlanner:
         if multi_count:
             return multi_count
 
+        # Multi-resource list (aggregate follow-up: equipment + consumables)
+        multi_list = self._plan_multi_resource_list(parsed_query)
+        if multi_list:
+            return multi_list
+
         # Parent → child relationship (e.g. observations for my last report)
         rel_plan = self._plan_relationship_query(parsed_query, schema)
         if rel_plan:
@@ -344,6 +349,36 @@ class ExecutionPlanner:
             "is_multi_step": True,
             "total_steps": len(steps),
             "plan_type": "multi_resource_count",
+        }
+
+    def _plan_multi_resource_list(self, parsed_query: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Build parallel list steps for multiple_resources aggregate queries."""
+        multiple = parsed_query.get("multiple_resources", [])
+        if not isinstance(multiple, list) or len(multiple) < 2:
+            return None
+        if parsed_query.get("question_type") != "list":
+            return None
+
+        steps = []
+        for i, res in enumerate(multiple):
+            steps.append(enrich_step_from_parsed({
+                "step_id": i + 1,
+                "intent": parsed_query.get("intent", "read"),
+                "resource": res,
+                "entities": parsed_query.get("entities", {}),
+                "filters": parsed_query.get("filters", {}),
+                "depends_on": [],
+                "description": f"List {res}",
+                "question_type": "list",
+                "display_mode": parsed_query.get("display_mode", "summary"),
+            }, parsed_query))
+
+        self.logger.info("Multi-resource list plan: %s", multiple)
+        return {
+            "steps": steps,
+            "is_multi_step": True,
+            "total_steps": len(steps),
+            "plan_type": "multi_resource_list",
         }
 
     def _plan_relationship_query(
