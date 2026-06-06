@@ -213,8 +213,16 @@ class ResponseFormatter:
             remaining = data_count - sample_size
         else:
             data_count = 1
+            sample_size = 1
             data_preview = json.dumps(data, indent=2, default=str)[:5000]
             remaining = 0
+
+        logger.debug(
+            "Formatter LLM input: data_count=%s sample_size=%s preview_chars=%s",
+            data_count,
+            sample_size if isinstance(data, list) else 1,
+            len(data_preview),
+        )
 
         # Build pagination context for LLM
         pagination_info = ""
@@ -335,13 +343,25 @@ REMEMBER: Include ALL {data_count} items in your response!
                 chosen_format = "text"
                 response = response_text
 
-            logger.info(f"LLM chose format: {chosen_format}")
+            logger.info("LLM chose format: %s", chosen_format)
+
+            # Build table deterministically — LLM often truncates markdown tables in output
+            # Configurable via ENABLE_AI_LIST_FORMAT_TABLE (default 1 = always table for lists)
+            if constants.LIST_FORMAT_TABLE and isinstance(data, list) and len(data) > 1:
+                analysis = self._analyze_data_structure(data, context)
+                table_result = self._format_as_table(data, query, analysis)
+                return {
+                    "format": "table",
+                    "summary": response,
+                    "formatted": table_result["formatted"],
+                    "raw_data": data,
+                }
 
             return {
                 "format": chosen_format,
                 "summary": response,
                 "formatted": response,
-                "raw_data": data
+                "raw_data": data,
             }
 
         except Exception as e:

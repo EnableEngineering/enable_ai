@@ -96,7 +96,10 @@ LLM_DATA_PREVIEW_500 = 500
 LLM_DATA_PREVIEW_1000 = 1000
 LLM_DATA_PREVIEW_2000 = 2000
 TABLE_FIELD_PREVIEW = 50
-TABLE_ROW_SAMPLE = 20
+# Max rows in code-built markdown tables (LLM tables are replaced by _format_as_table)
+TABLE_ROW_SAMPLE = _env_int("ENABLE_AI_TABLE_ROW_SAMPLE", 50)
+# Use deterministic table format for list responses (1=always table for lists, 0=LLM chooses)
+LIST_FORMAT_TABLE = _env_int("ENABLE_AI_LIST_FORMAT_TABLE", 1)
 TABLE_FIELDS_MAX = 6
 ANALYSIS_FIELDS_MAX = 10
 GROUPED_ITEMS_SAMPLE = 3
@@ -262,39 +265,13 @@ API_REQUEST_TIMEOUT = "Request timed out"
 
 
 # =============================================================================
-# STRINGS – Unknown Intent Handling (v0.3.29)
+# STRINGS – Unknown Intent Handling (v0.3.29 → v0.3.68 schema-driven)
 # =============================================================================
 
-UNKNOWN_INTENT_INTRO = "I'm not sure I understand that query."
+# Generic intro when query cannot be understood — no hardcoded domain examples
+UNKNOWN_INTENT_INTRO = "I couldn't understand that query."
 
-UNKNOWN_INTENT_CAPABILITIES = """I can help you with:
-• **Service Orders** - status, assignments, scheduling
-• **Reports** - observations, flash reports, detailed reports
-• **Inventory** - low stock items, equipment status, consumables
-• **Technicians** - availability, skills, workload
-• **Companies** - customer information"""
-
-UNKNOWN_INTENT_EXAMPLES = """Try asking something like:
-- "Show me my assigned service orders"
-- "What's the status of SO-123?"
-- "Which items are low in stock?"
-- "Who is available right now?"
-- "What are the observations for my last report?"
-"""
-
-UNKNOWN_INTENT_REPHRASE = "Could you rephrase your question?"
-
-# Full unknown intent response template
-UNKNOWN_INTENT_FULL = f"""{UNKNOWN_INTENT_INTRO}
-
-{UNKNOWN_INTENT_CAPABILITIES}
-
-{UNKNOWN_INTENT_EXAMPLES}
-
-{UNKNOWN_INTENT_REPHRASE}
-"""
-
-# No matching resource found
+# No matching resource found — available resources filled dynamically from schema
 NO_MATCHING_RESOURCE = "I couldn't find a matching resource for '{resource}'. Available resources: {available}"
 
 # No results found (but query was understood)
@@ -383,19 +360,8 @@ DJANGO_LOOKUP_SUFFIXES = (
     '__gte', '__lte', '__gt', '__lt'
 )
 
-# Semantic role injection for "users" resource (v0.3.50)
-# When the query mentions one of these phrases and resource is users, inject role filter.
-# Order matters: longer/more specific phrases first to avoid "customer" matching "admin".
-ROLE_QUERY_TO_VALUE = (
-    ("technician", "Technician"),
-    ("tech", "Technician"),
-    ("customer type", "Client"),
-    ("customer", "Client"),
-    ("client", "Client"),
-    ("administrator", "Admin"),
-    ("admin", "Admin"),
-    ("manager", "Manager"),
-)
+# Semantic role injection moved to resource_hints (v0.3.68)
+# Configure users.role.synonyms in your schema's resource_hints instead of hardcoding here.
 
 
 # =============================================================================

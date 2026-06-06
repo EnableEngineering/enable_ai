@@ -112,21 +112,25 @@ def _unwrap_json_response(summary: str) -> str:
     return summary
 
 
+def _api_total_count(data: Any) -> Optional[int]:
+    """Read total record count from API response — never use page length as total."""
+    if not isinstance(data, dict):
+        return None
+    for key in ("count", "total_count", "total"):
+        val = data.get(key)
+        if val is not None:
+            try:
+                return int(val)
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
 def _analyze_pagination(data: Any) -> Dict[str, Any]:
     """
     Analyze API response to extract pagination information (v0.3.11).
-    
-    Fixes Issues #2-4: Accurate count calculation.
-    
-    Args:
-        data: API response data
-        
-    Returns:
-        Dict with:
-            - total_count: Total items available
-            - actual_count: Items in current response
-            - has_more: Whether more pages exist
-            - is_paginated: Whether response is paginated
+
+    total_count always prefers the API count field; actual_count is page length only.
     """
     info = {
         'total_count': 0,
@@ -135,28 +139,30 @@ def _analyze_pagination(data: Any) -> Dict[str, Any]:
         'is_paginated': False,
         'next_url': None,
     }
-    
-    # Check for paginated response (Django REST framework style)
+
     if isinstance(data, dict) and 'results' in data:
         info['is_paginated'] = True
-        info['total_count'] = data.get('count', 0)
         results = data.get('results', [])
-        info['actual_count'] = len(results)
+        info['actual_count'] = len(results) if isinstance(results, list) else 0
+        api_total = _api_total_count(data)
+        if api_total is not None:
+            info['total_count'] = api_total
+        else:
+            info['total_count'] = info['actual_count']
         info['has_more'] = data.get('next') is not None
         if data.get('next'):
             info['next_url'] = data.get('next')
-    # Simple list
     elif isinstance(data, list):
         info['actual_count'] = len(data)
         info['total_count'] = len(data)
-    # Single item
     elif isinstance(data, dict):
+        api_total = _api_total_count(data)
         info['actual_count'] = 1
-        info['total_count'] = 1
+        info['total_count'] = api_total if api_total is not None else 1
     else:
         info['actual_count'] = 1
         info['total_count'] = 1
-    
+
     return info
 
 
@@ -630,6 +636,9 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
                     state.get("is_follow_up"),
                 )
 
+            active_schema = state.get("active_schema") or {}
+            resource_hints = active_schema.get("resource_hints") or {}
+
             # Anchor follow-ups to previous resource/filters (safety net after LLM parse)
             parsed = apply_follow_up_context(
                 parsed,
@@ -638,9 +647,8 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
                 state.get("is_follow_up", False),
                 classification=follow_up_classification,
                 user_context=state.get("user_context"),
+                resource_hints=resource_hints,
             )
-
-            active_schema = state.get("active_schema") or {}
 
             # Resolve __current_user_id__ etc. before planning (covers classify shortcut path)
             parsed = resolve_user_context_in_parsed(
@@ -908,6 +916,9 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
             "not found" in str(error).lower()
         )
 
+        # v0.3.68: Pass schema for dynamic suggestions (no hardcoded domain examples)
+        active_schema = state.get("active_schema") or {}
+
         if is_unknown_intent:
             # Return the detailed matcher/orchestrator error as the main summary so the
             # user sees available resources and suggestions instead of a generic message.
@@ -919,13 +930,9 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
                     "error": error,
                     "query": state.get("query"),
                     "total_steps": 0,
-                    "schema_type": state.get("active_schema", {}).get("type") if state.get("active_schema") else "unknown",
-                    "suggested_actions": [
-                        "Try rephrasing your question",
-                        "Ask about service orders, reports, inventory, or technicians",
-                        "Use specific resource names like 'service orders' or 'consumables'",
-                    ],
-                    "follow_up_queries": default_error_follow_up_queries(),
+                    "schema_type": active_schema.get("type", "unknown"),
+                    "suggested_actions": default_error_suggestions(active_schema),
+                    "follow_up_queries": default_error_follow_up_queries(active_schema),
                     "is_unknown_intent": True,
                 }),
             }
@@ -938,9 +945,9 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
                 "error": error,
                 "query": state.get("query"),
                 "total_steps": 0,
-                "schema_type": state.get("active_schema", {}).get("type") if state.get("active_schema") else "unknown",
-                "suggested_actions": default_error_suggestions(),
-                "follow_up_queries": default_error_follow_up_queries(),
+                "schema_type": active_schema.get("type", "unknown"),
+                "suggested_actions": default_error_suggestions(active_schema),
+                "follow_up_queries": default_error_follow_up_queries(active_schema),
             }),
         }
 
@@ -1230,9 +1237,9 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
                     }
                 elif isinstance(data, list):
                     final_data = {
-                        "total_count": len(data),
-                        "shown_count": len(data),
-                        "has_more": False,
+                        "total_count": pagination_info["total_count"],
+                        "shown_count": pagination_info["actual_count"],
+                        "has_more": pagination_info["has_more"],
                         "results": data  # Return ALL items (Issue #3)
                     }
                 else:

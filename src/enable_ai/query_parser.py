@@ -174,8 +174,7 @@ class QueryParser:
                     temperature=DETERMINISTIC_TEMP
                 )
             
-            # Add metadata
-            parsed['original_input'] = natural_language_input
+            parsed['original_input'] = natural_language_input.strip()
             parsed['schema_type'] = schema.get('type')
             
             # Validate against schema
@@ -214,32 +213,25 @@ class QueryParser:
 Your task: Understand the user's intent and extract structured information so the system can execute the right operations.
 
 **Intent and context**
-- Decide whether the user is starting a new request, continuing or refining the previous one (referring to prior results), asking for a count/total, asking for the next page of results, or changing how results are shown.
-- When the user's intent clearly refers to or continues the previous turn (e.g. "them", "those", "the same", "more", "next page", "and which company?", refining or filtering prior results), call get_query_context() to retrieve previous_resource and previous_filters, then use that resource and merge filters. Set merge_with_previous=true.
-- Follow-up refinements like "and assigned to which company?" after asking about service orders mean: stay on service-orders, keep previous filters, set question_type="details" — do NOT list all companies.
-- Reset queries like "show all service orders" or "list all users" start fresh: set merge_with_previous=false and do NOT carry over previous filters even if conversation history exists.
-- When the user is asking for the next page of a prior list (e.g. more results, next page), use context's next_url and set use_next_page=true and next_page_url from context.
-- When the user is asking for a total or count (how many, number of, total), set question_type="count".
-- When the user wants a small sample of prior results (e.g. "a few", "some"), set a small limit and question_type="list" so they see items, not only a count.
+- Decide whether the user is starting a new request, continuing or refining the previous one, asking for a count/total, asking for the next page, or changing how results are shown.
+- When the query semantically continues the previous turn (refers to prior results, narrows them, paginates, or asks for more detail on the same scoped dataset), call get_query_context(), keep previous_resource, merge previous_filters, and set merge_with_previous=true.
+- When the user wants a fresh unfiltered query on a resource (breadth reset), set merge_with_previous=false and do not inherit previous filters.
+- When the user asks for the next page of a prior list, use context next_url with use_next_page=true.
+- When the user asks for a total or count, set question_type="count".
+- When the user wants to see items (not only a total), set question_type="list" or "details" with an appropriate limit.
 
-**IMPORTANT: Follow-up questions asking for details**
-- When the user asks "which are those?", "what are they?", "show me the list", "what are their names?", "list them", "show them", "which ones?", or similar questions that ask for details about previous results:
-  1. Call get_query_context() to get the previous resource and filters
-  2. Set question_type="list" or question_type="details" (NOT "count")
-  3. Set display_mode="detailed" or display_mode="full" so the system shows actual item details
-  4. Set merge_with_previous=true
-  5. Do NOT just return a count - the user wants to SEE the actual items
-- These follow-up questions mean: "Show me the actual items you just mentioned" - so ensure the response includes item names, IDs, or other identifying information.
+**Follow-up vs standalone (use conversation + schema, not phrase lists)**
+- If conversation history exists, read whether the current query continues the same resource and filter scope as the prior assistant turn.
+- Follow-ups that enumerate, subset, or ask details about prior results: question_type="list" or "details", NOT a fresh count of only the current API page.
+- Detail questions about a field on prior items: stay on the same resource, keep merged filters, question_type="details" — do not switch to listing an unrelated resource.
 
-**User Identity / Pronoun Resolution (IMPORTANT)**
-- When the user says "me", "my", "mine", "assigned to me", "my reports", "my orders", etc., they are referring to THEMSELVES.
-- If USER_CONTEXT is provided in the prompt, use the user_id from that context to resolve these pronouns.
-- Map pronouns to the appropriate filter field based on the resource:
-  - "service orders assigned to me" → filter by technician={user_id}
-  - "my reports" or "reports I created" → filter by technician={user_id} or created_by={user_id}
-  - "my company's orders" → filter by company={company_id}
-  - "customers in my company" → filter by company={company_id}
-- Always use the actual user_id/company_id values, never leave "me" or "my" as string values in filters.
+**Quoted words and domain phrasing**
+- Words in quotes ('new', "pending") are literal filter tokens — map them via ALLOWED VALUES AND SYNONYMS in the schema hints to the correct filter field and canonical value.
+- Map relational/domain wording (stage, state, status, phase, type, category) to the filter field defined in resource_hints for that resource — use schema hints, not assumptions.
+
+**User identity (USER_CONTEXT)**
+- Resolve first-person pronouns (me, my, mine, assigned to me) using USER_CONTEXT user_id / company_id on the user-scoped filter fields defined in the schema for that resource.
+- Use actual numeric IDs from USER_CONTEXT — never emit placeholder strings like current_user_id or __current_user_id__ in filters.
 
 **CRITICAL: NO HARDCODED DATA - ANTI-HALLUCINATION RULES**
 - NEVER generate example data, user lists, or sample responses
@@ -436,51 +428,50 @@ Output: {
     "question_type": "count"
 }
 
-Example 6 - User pronoun resolution ("assigned to me"):
-Query: "show me the new service orders assigned to me"
-USER_CONTEXT: {"user_id": 123, "username": "john@example.com", "role": "Technician"}
+Example 6 - User pronoun resolution ("assigned to me") — use __user_scoped_fields__ from resource_hints:
+Query: "show me the pending items assigned to me"
+USER_CONTEXT: {"user_id": 123, "username": "user@example.com"}
+Schema defines __user_scoped_fields__: ["assigned_to"] for this resource
 Output: {
     "intent": "read",
-    "resource": "service_orders",
-    "entities": {"technician": 123, "status": "New"},
+    "resource": "[RESOURCE_FROM_SCHEMA]",
+    "entities": {"assigned_to": 123, "status": "Pending"},
     "filters": {
-        "technician": {"operator": "equals", "value": 123},
-        "status__name": {"operator": "equals", "value": "New"}
+        "assigned_to": {"operator": "equals", "value": 123},
+        "status": {"operator": "equals", "value": "Pending"}
     },
     "question_type": "list"
 }
+NOTE: Use the actual user_id (123) from USER_CONTEXT on fields listed in __user_scoped_fields__ for that resource.
 
-Example 7 - "Observations for my last report" (multi-step: get last report, then its observations):
-Query: "what are the observations for my last report?" or "observations for my last report"
-USER_CONTEXT: {"user_id": 456, "username": "jane@example.com", "role": "Technician"}
+Example 7 - Child resource fetch (multi-step: get parent, then its children):
+Query: "what are the details for my last record?"
+USER_CONTEXT: {"user_id": 456}
 Output: {
     "intent": "read",
-    "resource": "details_reports",
-    "entities": {"technician": 456},
+    "resource": "[PARENT_RESOURCE_FROM_SCHEMA]",
+    "entities": {"owner": 456},
     "filters": {
-        "technician": {"operator": "equals", "value": 456}
+        "owner": {"operator": "equals", "value": 456}
     },
     "sort": {"field": "created_at", "order": "desc"},
     "limit": 1,
     "question_type": "details",
     "relationships": [
-        {"type": "child", "target_entity": "observations", "filters": {}}
+        {"type": "child", "target_entity": "[CHILD_RESOURCE_FROM_SCHEMA]", "filters": {}}
     ]
 }
-NOTE: Populate relationships so the planner generates step 1 (get report with technician=me, limit 1, sort desc) and step 2 (get observations for that report). Use the schema's child resource name for target_entity (e.g. "observations").
+NOTE: Use schema relationships to find child resource name. Use __user_scoped_fields__ to identify the owner filter field.
 
-Example 8 - Follow-up asking for details (IMPORTANT - user wants to see the items, not just count):
-Previous conversation: User asked "Show me new service orders assigned to me" → System responded "Found 9 items"
+Example 8 - Follow-up asking for details (user wants to see items, not just count):
+Previous conversation: User asked "Show me pending items assigned to me" → System responded "Found 9 items"
 Query: "which are those?" or "what are they?" or "show me the list"
-Context from get_query_context(): { "previous_resource": "service_orders", "previous_filters": {"technician": {"operator": "equals", "value": 123}, "status__name": {"operator": "equals", "value": "New"}} }
+Context from get_query_context(): { "previous_resource": "items", "previous_filters": {...} }
 Output: {
     "intent": "read",
-    "resource": "service_orders",
-    "entities": {"technician": 123, "status": "New"},
-    "filters": {
-        "technician": {"operator": "equals", "value": 123},
-        "status__name": {"operator": "equals", "value": "New"}
-    },
+    "resource": "[PREVIOUS_RESOURCE]",
+    "entities": {...},
+    "filters": { ...merged from previous... },
     "merge_with_previous": true,
     "question_type": "list",
     "display_mode": "detailed"
@@ -561,37 +552,18 @@ Return ONLY the JSON object, no explanations or markdown.
 
             hints_section += f"""
 
-CRITICAL - SEMANTIC PHRASE MAPPING (v0.3.42):
-When the user uses descriptive phrases, map them to the corresponding filter field and value:
+SCHEMA-DRIVEN FILTER MAPPING (required — no invented domain rules):
+1. RESOURCE: pick the resource whose __resource_synonyms__ or name best matches the query.
+2. FILTERS: for each filterable field listed below, if the query mentions a value or synonym from that field's "values"/"synonyms", set a filter using the canonical value from the hints.
+3. QUOTED TOKENS: treat quoted words as literal values and map via synonyms/values above.
+4. DOMAIN WORDS (stage/state/status/phase/type/category): map to whichever filter field the hints define for that resource — do not guess field names outside the hints.
+5. USER SCOPE: when USER_CONTEXT is present, resolve me/my/assigned-to-me on user-scoped fields indicated by the schema for this resource.
 
-1. RESOURCE SYNONYMS (__resource_synonyms__):
-   - "items", "supplies", "materials" → resource: "consumables"
-   - "company", "customer", "client" → resource: "companies"
-   - "flash report", "flash" → resource: "flash-reports"
-   - Use the resource name that has these words in its __resource_synonyms__ list
-
-2. SEMANTIC FILTER PHRASES:
-   Look for field "synonyms" in the hints above. When user says a synonym KEY, use that field with the KEY as value:
-   - "low in stock", "low stock", "running low" → filters: {{"stock_level": {{"operator": "equals", "value": "low"}}}}
-   - "out of stock", "empty" → filters: {{"stock_level": {{"operator": "equals", "value": "out of stock"}}}}
-   - The backend will translate "low" to the actual API filter (e.g., current_quantity__lt=10)
-
-3. FILTERABLE FIELDS (schema-driven, from hints above):
+Filterable fields for this schema:
 {filterable_instruction}
 
-4. "OBSERVATIONS FOR MY LAST REPORT" (single-step):
-   When the user asks for observations/details of their last/latest report, set resource to the PARENT resource (e.g. details-reports), add filters for "me" from USER_CONTEXT (e.g. technician=user_id), sort by created_at desc, limit 1. The observations are embedded in the report response — do NOT use relationships or add a second step. Just fetch the report with the right filters and the system will display all its fields including observations.
-
-5. EXAMPLES:
-   - "show me consumables with stock_level low" → resource: "consumables", filters: {{"stock_level": {{"operator": "equals", "value": "low"}}}}
-   - "list items low in stock" → resource: "consumables", filters: {{"stock_level": {{"operator": "equals", "value": "low"}}}}
-   - "show companies" → resource: "companies"
-   - "list flash reports" → resource: "flash-reports"
-   - For any resource and filterable field listed in (3) above: when the user's words match a synonym or value for that field, set the filter using the canonical value from the hints (e.g. users.role, consumables.stock_level).
-
-When you see "with FIELD VALUE" patterns, extract as: {_pattern_example}
-When the user says e.g. "pending" or "quoted", use the synonym or value above.
-Prefer the exact strings listed in "values" or given by "synonyms".
+Filter structure pattern: {_pattern_example}
+Prefer exact strings from "values" or canonical targets from "synonyms".
 """
 
         classification_section = ""
@@ -609,11 +581,11 @@ Use this only as a starting hint. Override when the query, follow-up context, or
 USER_CONTEXT (use this to resolve "me", "my", "mine", "assigned to me" pronouns):
 {json.dumps(user_context, indent=2)}
 
-IMPORTANT: When the query contains "me", "my", "mine", "assigned to me", "my reports", etc.:
-- Use user_id={user_context.get('user_id')} for technician/created_by/assigned_to filters
-- Use company_id={user_context.get('company_id')} for company filters
-- User's role is: {user_context.get('role', 'Unknown')}
-- NEVER leave "me" or "my" as string values in filters - always resolve to actual IDs
+IMPORTANT: Resolve first-person pronouns using USER_CONTEXT:
+- user_id={user_context.get('user_id')} on user-scoped filter fields defined in schema hints for this resource
+- company_id={user_context.get('company_id')} on company-scoped filter fields when applicable
+- role={user_context.get('role', 'Unknown')}
+- NEVER leave pronouns or placeholder strings as filter values — use numeric IDs from USER_CONTEXT
 """
 
         return f"""Parse this natural language query:
@@ -1130,14 +1102,14 @@ Returns: previous_resource, previous_intent, previous_query, previous_filters, a
             if context.get("next_url"):
                 next_url_instruction = "\n- If the user is asking for the next page of results, set use_next_page=true and next_page_url to the value from context (next_url)."
 
-            # v0.3.29: Add user context reminder for pronoun resolution
+            # v0.3.29: Add user context reminder for pronoun resolution (schema-driven)
             user_context_reminder = ""
             if user_context:
                 user_context_reminder = f"""
 - IMPORTANT: If the query contains "me", "my", "mine", "assigned to me", resolve these pronouns using:
-  - user_id={user_context.get('user_id')} for technician/created_by/assigned_to filters
-  - company_id={user_context.get('company_id')} for company filters
-  - NEVER leave "me"/"my" as string values - always use the actual IDs"""
+  - user_id={user_context.get('user_id')} for user-scoped filter fields defined in __user_scoped_fields__ for this resource
+  - company_id={user_context.get('company_id')} for company-scoped filter fields when applicable
+  - NEVER leave "me"/"my" as string values - always use the actual numeric IDs from USER_CONTEXT"""
 
             messages.append({
                 "role": "user",
@@ -1251,7 +1223,7 @@ RULES:
 - Keep resource = previous_resource unless the user clearly changes topic or referent specifies resource
 - Merge previous_filters with any new conditions from the current query (unless referent rules apply)
 - Set merge_with_previous=true (unless referent rules apply — then false)
-- If the user asks about a field on those items (company, customer, technician, status, etc.), keep the SAME resource and fetch details — do NOT switch to listing all companies/users
+- If the user asks about a field on those items, keep the SAME resource and fetch details — do NOT switch to listing an unrelated resource
 - For detail questions after a count, set question_type="details" and display_mode="detailed"
 - Use result_items / primary_item to resolve "it", "this", "that" pronouns to a specific record id{user_context_reminder}
 
@@ -1274,13 +1246,11 @@ Return the complete parsed JSON.""",
         v0.3.44 enhancements:
         - Fuzzy matching for semantic phrases (word overlap matching)
         - Always resolve resource synonyms (not just when semantic phrase found)
-        - Better handling of phrase variations ("low in stock" → "low stock")
+        - Better handling of phrase variations
 
-        Examples:
-            "show me items low in stock" → "show me consumables with stock_level low"
-            "show low stock consumables" → "show consumables with stock_level low"
-            "list items" → "list consumables"
-            "list flash reports" → "list flash-reports"
+        Examples (using schema-defined synonyms):
+            "show me [synonym]" → "show me [canonical_resource]" (via __resource_synonyms__)
+            "[phrase from synonyms]" → adds filter from resource_hints field synonyms
 
         Args:
             query: Original user query
@@ -1404,12 +1374,10 @@ Return the complete parsed JSON.""",
                         query_words = set(transformed_lower.split())  # Update query_words!
                         applied_fields.add(field)
 
-        # STEP 4: Generic "low stock" phrase handling (API-agnostic, but schema-aware)
-        # This specifically fixes queries like:
-        #   - "show me items low in stock"
-        #   - "show low stock consumables"
-        # for any API schema that exposes a "stock_level" field in resource_hints.
-        transformed = self._inject_low_stock_filter(transformed, resource_hints)
+        # STEP 4: Removed _inject_low_stock_filter (v0.3.68)
+        # Semantic phrase → filter mapping is now fully schema-driven via resource_hints
+        # synonyms and handled in semantic_filters.py. Configure patterns like:
+        #   stock_level: {synonyms: {"low in stock": "low", "running low": "low"}}
 
         return transformed
 
@@ -1419,10 +1387,9 @@ Return the complete parsed JSON.""",
 
         v0.3.44: This now runs unconditionally, not just when semantic phrases are found.
 
-        Examples:
-            "list items" → "list consumables"
-            "show flash reports" → "show flash-reports"
-            "list all companies" → "list all companies" (if companies is a valid resource)
+        Examples (using schema-defined __resource_synonyms__):
+            "list [synonym]" → "list [canonical_resource]"
+            "show [synonym]" → "show [canonical_resource]"
 
         Args:
             query: User query
@@ -1488,54 +1455,8 @@ Return the complete parsed JSON.""",
                 )
 
         return transformed
-
-    def _inject_low_stock_filter(self, query: str, resource_hints: Dict[str, Any]) -> str:
-        """
-        Inject an explicit stock_level=low filter for "low stock" style phrases.
-
-        This is API-agnostic but only activates when:
-        - The schema's resource_hints define a "stock_level" field for at least one resource
-        - The natural language query clearly expresses "low stock" semantics
-
-        Examples it helps with (without relying on LLM to infer the field name):
-            "show me items low in stock"    → "... with stock_level low"
-            "show low stock consumables"    → "... with stock_level low"
-        """
-        if not resource_hints:
-            return query
-
-        q_lower = query.lower()
-
-        # Only act when the API actually advertises a stock_level field in hints
-        has_stock_level = False
-        for _res_name, hints in resource_hints.items():
-            if isinstance(hints, dict) and "stock_level" in hints:
-                has_stock_level = True
-                break
-
-        if not has_stock_level:
-            return query
-
-        # Detect common "low stock" phrasings
-        low_stock_patterns = [
-            r"\blow in stock\b",
-            r"\blow stock\b",
-            r"\bstock is low\b",
-            r"\brunning low\b",
-        ]
-
-        if not any(re.search(p, q_lower) for p in low_stock_patterns):
-            return query
-
-        # If the query already explicitly mentions stock_level, don't duplicate it
-        if "stock_level" in q_lower:
-            return query
-
-        # If there's already an explicit "with ..." clause, append an additional filter;
-        # otherwise, introduce a new "with stock_level low" clause.
-        if " with " in q_lower:
-            return query + " and stock_level low"
-        return query + " with stock_level low"
+    # _inject_low_stock_filter removed in v0.3.68 — semantic phrase matching is now
+    # fully driven by resource_hints synonyms and handled in semantic_filters.py
 
     def _words_are_contextually_close(self, text: str, words: List[str], max_distance: int = 4) -> bool:
         """

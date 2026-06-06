@@ -112,19 +112,70 @@ def enrich_response_with_follow_ups(
     return response
 
 
-def default_error_suggestions() -> List[str]:
-    """Generic suggestions for error / missing-context responses."""
-    return [
-        "Try rephrasing your question",
-        "Ask about a specific resource like 'service orders' or 'users'",
-        "Use filters like 'show new service orders' or 'list active users'",
-    ]
+def _extract_resource_names(schema: Optional[Dict[str, Any]]) -> List[str]:
+    """Extract resource names from schema for dynamic suggestions."""
+    if not schema:
+        return []
+    resources: List[str] = []
+    # Try resource_hints keys first (most reliable)
+    hints = schema.get("resource_hints") or {}
+    for name in hints.keys():
+        if not name.startswith("__"):
+            resources.append(str(name).replace("-", " ").replace("_", " "))
+    # Fallback to paths if no hints
+    if not resources:
+        paths = schema.get("paths") or {}
+        for path in paths.keys():
+            parts = str(path).strip("/").split("/")
+            if parts and parts[0] and not parts[0].startswith("{"):
+                resources.append(parts[0].replace("-", " ").replace("_", " "))
+    # Dedupe and limit
+    seen: set = set()
+    unique: List[str] = []
+    for r in resources:
+        if r not in seen:
+            seen.add(r)
+            unique.append(r)
+    return unique[:10]
 
 
-def default_error_follow_up_queries() -> List[Dict[str, str]]:
-    """Generic follow-up query templates when there is no result context."""
-    return [
-        {"label": "List service orders", "query": "list service orders"},
-        {"label": "Show all users", "query": "show all users"},
-        {"label": "List documents", "query": "list all documents"},
-    ][: constants.SUGGESTIONS_MAX]
+def schema_based_error_suggestions(schema: Optional[Dict[str, Any]] = None) -> List[str]:
+    """
+    Generate error suggestions dynamically from schema resources.
+
+    No hardcoded domain examples — if schema unavailable, return generic message only.
+    """
+    suggestions = ["Try rephrasing your question"]
+    resources = _extract_resource_names(schema)
+    if resources:
+        sample = ", ".join(f"'{r}'" for r in resources[:3])
+        suggestions.append(f"Ask about a resource like {sample}")
+    return suggestions[: constants.SUGGESTIONS_MAX]
+
+
+def schema_based_follow_up_queries(schema: Optional[Dict[str, Any]] = None) -> List[Dict[str, str]]:
+    """
+    Generate follow-up query templates dynamically from schema resources.
+
+    No hardcoded domain examples — returns empty list if no schema available.
+    """
+    resources = _extract_resource_names(schema)
+    if not resources:
+        return []
+    queries: List[Dict[str, str]] = []
+    for resource in resources[: constants.SUGGESTIONS_MAX]:
+        queries.append({
+            "label": f"List {resource}",
+            "query": f"list {resource}",
+        })
+    return queries
+
+
+def default_error_suggestions(schema: Optional[Dict[str, Any]] = None) -> List[str]:
+    """Generic suggestions for error / missing-context responses (schema-aware)."""
+    return schema_based_error_suggestions(schema)
+
+
+def default_error_follow_up_queries(schema: Optional[Dict[str, Any]] = None) -> List[Dict[str, str]]:
+    """Generic follow-up query templates when there is no result context (schema-aware)."""
+    return schema_based_follow_up_queries(schema)

@@ -97,6 +97,8 @@ def build_session_metadata(
     return {
         "resource": parsed.get("resource"),
         "intent": parsed.get("intent"),
+        "question_type": parsed.get("question_type"),
+        "display_mode": parsed.get("display_mode"),
         "filters": parsed.get("filters", {}),
         "next_url": pagination.get("next_url"),
         "count": count,
@@ -123,6 +125,8 @@ def extract_last_result_metadata(conversation_history: List[Dict[str, Any]]) -> 
                 "next_url": metadata.get("next_url"),
                 "count": metadata.get("count"),
                 "has_more": metadata.get("has_more", False),
+                "question_type": metadata.get("question_type"),
+                "display_mode": metadata.get("display_mode"),
                 "result_items": metadata.get("result_items") or [],
                 "primary_item": metadata.get("primary_item"),
             }
@@ -207,16 +211,18 @@ Decide:
    - Follow-ups refer back to prior results, paginate them, or ask for more detail about them
    - Standalone/reset queries start fresh — do NOT inherit previous filters
 2. If follow-up, what type?
-   - reset: user wants a fresh unfiltered list (e.g. "show all service orders", "list all users") — clears prior filters
+   - reset: user wants a fresh unfiltered list on a resource — clears prior filters
    - next_page: user wants more/paginated results from the prior list
    - first_n / last_n: user wants a specific slice (first N, last N)
-   - reference: user refers to prior items ("those", "them") wanting to see them
-   - refinement: user asks a detail question about the prior result(s) without changing topic
-     (e.g. after a count, asking which company/customer/technician those items belong to)
+   - reference: user wants to see/enumerate items from the prior scoped result set
+   - refinement: user asks a detail or subset question about the prior result(s) without changing topic/resource
    - standalone: new independent query (may be same or different resource)
 3. merge_with_previous=true ONLY for next_page, first_n, last_n, reference, refinement — NEVER for reset or standalone
-4. If refinement after a count, override question_type to "details" and display_mode to "detailed"
-5. If the query uses "it", "this", "that", "the one", etc. referring to a prior result item, set referent to that item from PREVIOUS RESULT ITEMS (id, resource)
+4. Use prior question_type from PREVIOUS RESULT METADATA:
+   - After question_type=count: if the user now wants to see/name/subset those items, set question_type_override="list" (not a fresh page-only count)
+   - After question_type=list: pagination/subset/detail queries stay follow-ups with merge_with_previous=true when scope is unchanged
+5. If the query refers to a specific prior item via pronoun/deixis, set referent from PREVIOUS RESULT ITEMS (id, resource)
+6. Decide follow-up vs standalone from RECENT CONVERSATION meaning and prior resource/filters — do not match fixed phrase lists
 
 Return JSON only:
 {{
@@ -304,10 +310,22 @@ def _filter_values_equal(a: Any, b: Any) -> bool:
     return val_a == val_b
 
 
+def _get_user_scoped_fields(resource: str, resource_hints: Dict[str, Any]) -> List[str]:
+    """Get user-scoped field names from resource_hints.__user_scoped_fields__."""
+    if not resource or not resource_hints:
+        return []
+    hints = resource_hints.get(resource) or {}
+    if not isinstance(hints, dict):
+        return []
+    fields = hints.get("__user_scoped_fields__") or []
+    return list(fields) if isinstance(fields, (list, tuple)) else []
+
+
 def strip_inherited_session_filters(
     parsed: Dict[str, Any],
     conversation_history: Optional[List[Dict[str, Any]]],
     user_context: Optional[Dict[str, Any]] = None,
+    resource_hints: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Remove filters copied from the previous turn (reset / fresh list queries)."""
     result = dict(parsed)
@@ -319,12 +337,17 @@ def strip_inherited_session_filters(
         if field in filters and _filter_values_equal(filters[field], prev_val):
             del filters[field]
 
+    # Remove user-scoped filters that match current user (schema-driven, not hardcoded)
     user_id = (user_context or {}).get("user_id")
-    if user_id is not None and "technician" in filters:
-        tech_val = filters["technician"]
-        tech = tech_val.get("value") if isinstance(tech_val, dict) else tech_val
-        if tech == user_id:
-            del filters["technician"]
+    if user_id is not None and resource_hints:
+        resource = result.get("resource") or meta.get("resource") or ""
+        user_scoped_fields = _get_user_scoped_fields(resource, resource_hints)
+        for field in user_scoped_fields:
+            if field in filters:
+                field_val = filters[field]
+                val = field_val.get("value") if isinstance(field_val, dict) else field_val
+                if val == user_id:
+                    del filters[field]
 
     result["filters"] = filters
     result["merge_with_previous"] = False
@@ -403,6 +426,7 @@ def apply_follow_up_context(
     is_follow_up: bool = False,
     classification: Optional[Dict[str, Any]] = None,
     user_context: Optional[Dict[str, Any]] = None,
+    resource_hints: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Anchor parsed query to previous resource/filters when LLM says to keep context.
@@ -418,7 +442,9 @@ def apply_follow_up_context(
 
     # Reset/standalone: fresh query — strip inherited session filters
     if clf.get("follow_up_type") in NO_MERGE_TYPES:
-        return strip_inherited_session_filters(parsed, conversation_history, user_context)
+        return strip_inherited_session_filters(
+            parsed, conversation_history, user_context, resource_hints
+        )
 
     if not clf.get("keep_previous_resource") and not clf.get("merge_with_previous"):
         return parsed

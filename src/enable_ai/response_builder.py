@@ -259,8 +259,11 @@ class ResponseBuilder:
             if isinstance(data, dict) and "count" in data:
                 total_count = data["count"]
             elif isinstance(data, dict) and "results" in data:
-                results = data.get("results", [])
-                total_count = len(results)
+                api_count = data.get("count") or data.get("total_count")
+                if api_count is not None:
+                    total_count = int(api_count)
+                else:
+                    total_count = len(data.get("results") or [])
             elif isinstance(data, list):
                 total_count = len(data)
 

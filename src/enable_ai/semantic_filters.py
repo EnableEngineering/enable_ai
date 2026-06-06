@@ -9,6 +9,7 @@ No hardcoded phrases or field names.
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
+from .query_normalize import strip_quotes_for_matching
 from .utils import setup_logger
 
 logger = setup_logger("enable_ai.semantic_filters")
@@ -137,7 +138,7 @@ def apply_semantic_filters(
     result["filters"] = inject_semantic_filters(
         result.get("filters"),
         result.get("resource", ""),
-        query,
+        strip_quotes_for_matching(query),
         hints,
     )
     return result

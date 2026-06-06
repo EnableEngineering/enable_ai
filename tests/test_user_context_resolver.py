@@ -61,6 +61,16 @@ def test_normalize_user_context_aliases():
     assert ctx["user_id"] == 17
 
 
+def test_resolve_current_user_id_without_underscores():
+    parsed = {
+        "filters": {
+            "technician": {"operator": "equals", "value": "current_user_id"},
+        },
+    }
+    result = resolve_user_context_in_parsed(parsed, {"user_id": 17})
+    assert result["filters"]["technician"]["value"] == 17
+
+
 def test_resolve_params_dict_flat_placeholder():
     params = {"technician": "__current_user_id__", "status__name": "New"}
     resolved = resolve_params_dict(params, {"user_id": 17})

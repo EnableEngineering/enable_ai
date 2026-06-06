@@ -139,6 +139,7 @@ def test_apply_reset_clears_merge_flag():
 
 
 def test_strip_inherited_session_filters_removes_prev_and_technician():
+    """Test that user-scoped filters are removed using schema-driven __user_scoped_fields__."""
     parsed = {
         "intent": "read",
         "resource": "service-orders",
@@ -161,8 +162,14 @@ def test_strip_inherited_session_filters_removes_prev_and_technician():
             },
         },
     ]
+    # v0.3.68: user-scoped fields now come from resource_hints.__user_scoped_fields__
+    resource_hints = {
+        "service-orders": {
+            "__user_scoped_fields__": ["technician", "assigned_to"],
+        },
+    }
     result = strip_inherited_session_filters(
-        parsed, history_with_tech, user_context={"user_id": 17},
+        parsed, history_with_tech, user_context={"user_id": 17}, resource_hints=resource_hints,
     )
     assert result["filters"] == {}
     assert result["merge_with_previous"] is False

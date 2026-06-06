@@ -15,6 +15,7 @@ PRONOUN_MARKERS = ("assigned to me", " my ", " me ", "mine", " my,", "for me")
 
 USER_ID_PLACEHOLDERS: Set[str] = {
     "__current_user_id__",
+    "current_user_id",
     "{{current_user_id}}",
     "{current_user_id}",
     "{user_id}",
@@ -25,6 +26,7 @@ USER_ID_PLACEHOLDERS: Set[str] = {
 
 COMPANY_ID_PLACEHOLDERS: Set[str] = {
     "__current_company_id__",
+    "current_company_id",
     "{{current_company_id}}",
     "{current_company_id}",
     "{company_id}",
