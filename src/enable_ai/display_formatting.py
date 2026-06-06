@@ -47,6 +47,23 @@ def _looks_like_currency_field(field: str) -> bool:
     )
 
 
+def _coerce_numeric(val: Any) -> Optional[float]:
+    """Parse int/float or numeric strings (e.g. DRF decimal fields as \"51364.00\")."""
+    if isinstance(val, bool):
+        return None
+    if isinstance(val, (int, float)):
+        return float(val)
+    if isinstance(val, str):
+        stripped = val.strip().replace(",", "")
+        if not stripped:
+            return None
+        try:
+            return float(stripped)
+        except ValueError:
+            return None
+    return None
+
+
 def format_field_label(field: str, resource_hints: Dict[str, Any], resource: str = "") -> str:
     labels = get_list_display_labels(resource, resource_hints)
     if field in labels:
@@ -88,12 +105,18 @@ def format_display_value(
     is_money = field in currency_fields or (
         has_currency_config and _looks_like_currency_field(field)
     )
-    if is_money and isinstance(val, (int, float)):
+    num = _coerce_numeric(val)
+    if is_money and num is not None:
         code = get_currency_code(resource, hints)
         sym = _CURRENCY_SYMBOLS.get(code, f"{code} ")
-        if float(val) == int(val):
-            return f"{sym}{int(val):,}"
-        return f"{sym}{float(val):,.2f}"
+        if num == int(num):
+            return f"{sym}{int(num):,}"
+        return f"{sym}{num:,.2f}"
+
+    if num is not None and isinstance(val, str):
+        if num == int(num):
+            return str(int(num))
+        return str(num)
 
     if isinstance(val, float) and val == int(val):
         return str(int(val))

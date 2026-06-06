@@ -42,6 +42,7 @@ from .hint_utils import (
     align_parsed_resource_with_query,
     apply_resource_question_defaults,
     build_count_filter_description,
+    build_summary_list_mismatch_message,
     build_summary_response_text,
     expand_query_resources,
     get_response_count_fields,
@@ -1478,17 +1479,30 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
                     state.get("is_follow_up")
                     or state.get("follow_up_classification", {}).get("is_follow_up")
                 )
-                summary = build_summary_response_text(
-                    data if isinstance(data, dict) else {},
-                    resource_key,
-                    resource_hints,
-                    query=state.get("query") or "",
-                    parsed=parsed,
-                    schema_resource=schema_resource,
-                    follow_up_only=is_follow_up_turn,
+                list_mismatch = (
+                    question_type in ("summary", "aggregate_metric")
+                    and isinstance(data, dict)
+                    and "results" in data
+                    and not is_summary_response(
+                        data, resource_key, resource_hints, schema_resource,
+                    )
                 )
-                if not summary:
-                    summary = constants.SUMMARY_RETRIEVED_DATA
+                if list_mismatch:
+                    summary = build_summary_list_mismatch_message(
+                        resource_key, resource_hints, parsed,
+                    )
+                else:
+                    summary = build_summary_response_text(
+                        data if isinstance(data, dict) else {},
+                        resource_key,
+                        resource_hints,
+                        query=state.get("query") or "",
+                        parsed=parsed,
+                        schema_resource=schema_resource,
+                        follow_up_only=is_follow_up_turn,
+                    )
+                    if not summary:
+                        summary = constants.SUMMARY_RETRIEVED_DATA
                 logger.info("Summary/dashboard response: %s", summary)
                 summary_session_meta = {
                     "question_type": "summary",

@@ -39,21 +39,28 @@ class APIMatcher:
             return parsed_input
         
         try:
+            from .hint_utils import get_endpoint_role, resolve_match_resource
+
             intent = parsed_input.get('intent', '').lower()
-            resource = parsed_input.get('resource', '').lower()
             entities = parsed_input.get('entities', {})
             filters = parsed_input.get('filters', {}) or {}
             original_input = (parsed_input.get('original_input') or "").lower()
+
+            resources = api_schema.get('resources', {})
+            resource_hints = api_schema.get('resource_hints', {}) or {}
+
+            resource, lock_resource, parsed_input = resolve_match_resource(
+                parsed_input,
+                parsed_input.get('original_input') or '',
+                resource_hints,
+            )
+            resource = (resource or '').lower()
             question_type = (parsed_input.get('question_type') or '').lower()
             
             self.logger.debug(
                 f"Matching: intent={intent}, resource={resource}, "
                 f"entities={list(entities.keys())}, filters={list(filters.keys())}"
             )
-            
-            # Get resources and optional resource-level hints from schema
-            resources = api_schema.get('resources', {})
-            resource_hints = api_schema.get('resource_hints', {}) or {}
             
             if not resources:
                 self.logger.error(constants.ERROR_NO_RESOURCES_IN_SCHEMA)
@@ -66,7 +73,7 @@ class APIMatcher:
                 f"v0.3.42 debug: resource='{resource}', resource_hints={bool(resource_hints)}, "
                 f"hints_count={len(resource_hints) if resource_hints else 0}"
             )
-            if resource and resource_hints:
+            if resource and resource_hints and not lock_resource:
                 parsed_res_l = resource.lower().replace('-', ' ').replace('_', ' ')
                 original_tokens = set(
                     t for t in original_input.replace('/', ' ').replace('-', ' ').split() if t
@@ -133,7 +140,7 @@ class APIMatcher:
 
             # Also handle "namespace-child" style resources
             # (e.g. "inventory" + "equipment" in query → "inventory-equipment")
-            if resource and resource_hints and resources:
+            if resource and resource_hints and resources and not lock_resource:
                 parsed_res_l = resource.lower()
                 original_tokens = set(
                     t for t in original_input.replace('/', ' ').replace('-', ' ').split() if t
@@ -327,9 +334,13 @@ class APIMatcher:
                         score += 5
 
                     # Endpoint role routing (list vs summary/dashboard)
-                    from .hint_utils import get_endpoint_role
                     role = get_endpoint_role(res_name, resource_hints)
-                    if role in ("summary", "dashboard", "metrics"):
+                    if lock_resource:
+                        if role in ("summary", "dashboard", "metrics"):
+                            score += 50
+                        elif role == "list":
+                            score -= 100
+                    elif role in ("summary", "dashboard", "metrics"):
                         if question_type in ("count", "list"):
                             score -= 30
                         elif question_type in ("summary", "aggregate_metric"):

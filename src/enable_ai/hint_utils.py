@@ -3,7 +3,7 @@ Schema-driven helpers for resource_hints (user scope, aggregates, multi-resource
 """
 
 import re
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 # Imperative phrases where "me" is not a user-scope pronoun
 _IMPERATIVE_ME = re.compile(
@@ -900,6 +900,90 @@ def align_parsed_resource_with_query(
         result.pop("multiple_resources", None)
     result["merge_with_previous"] = False
     return result
+
+
+def should_lock_parsed_resource(
+    parsed: Dict[str, Any],
+    resource_hints: Dict[str, Any],
+) -> bool:
+    """True when API matcher must not override parsed resource via synonym heuristics."""
+    if not isinstance(parsed, dict):
+        return False
+    resource = parsed.get("resource")
+    if not resource:
+        return False
+    qt = (parsed.get("question_type") or "").lower()
+    if qt in ("summary", "aggregate_metric"):
+        return True
+    if parsed.get("summary_field"):
+        return True
+    role = get_endpoint_role(resource, resource_hints)
+    return role in ("summary", "dashboard", "metrics")
+
+
+def resolve_match_resource(
+    parsed: Dict[str, Any],
+    query: str,
+    resource_hints: Dict[str, Any],
+) -> Tuple[str, bool, Dict[str, Any]]:
+    """
+    Resolve resource for API matching.
+
+    Returns (resource_name, locked, updated_parsed).
+    """
+    if not isinstance(parsed, dict):
+        return "", False, parsed or {}
+
+    result = dict(parsed)
+    resource = (result.get("resource") or "").strip()
+    q = query or result.get("original_input") or ""
+
+    if (
+        resource
+        and _query_implies_amount_metric(q)
+        and not _query_implies_list_count(q)
+    ):
+        related = get_related_summary_resource(resource, resource_hints)
+        if related:
+            resource = related
+            result["resource"] = related
+            result["question_type"] = "summary"
+            field = resolve_summary_field_from_query(q, related, resource_hints, result)
+            if field:
+                result["summary_field"] = field
+
+    locked = should_lock_parsed_resource(result, resource_hints)
+    return resource, locked, result
+
+
+def build_summary_list_mismatch_message(
+    resource: str,
+    resource_hints: Dict[str, Any],
+    parsed: Optional[Dict[str, Any]] = None,
+) -> str:
+    """User-facing message when a summary turn receives paginated list data."""
+    label = (resource or "that resource").replace("-", " ")
+    role = get_endpoint_role(resource, resource_hints)
+    if role in ("summary", "dashboard", "metrics"):
+        return (
+            f"I expected dashboard metrics from {label}, but the API returned a paginated list. "
+            "Please verify the summary endpoint path in your schema configuration."
+        )
+    related = get_related_summary_resource(resource, resource_hints)
+    if related:
+        return (
+            f"That question needs dashboard metrics from {related.replace('-', ' ')}, "
+            f"not a list of {label}. Try asking for the AR summary instead."
+        )
+    field = (parsed or {}).get("summary_field")
+    if field:
+        return (
+            f"I couldn't find {field.replace('_', ' ')} in the list response. "
+            "This metric may only be available on the dashboard summary endpoint."
+        )
+    return (
+        f"I expected a dashboard metric for {label}, but received a list response instead."
+    )
 
 
 def apply_resource_question_defaults(

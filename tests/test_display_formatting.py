@@ -117,3 +117,25 @@ def test_summary_metric_follow_up_sets_field():
 
 def test_format_display_value_without_currency_config():
     assert format_display_value(99.5, "total", "other", {}) == "99.5"
+
+
+def test_currency_string_decimal_drf():
+    hints = {
+        "invoicing-ar-summary": {
+            "__currency_code__": "INR",
+            "__currency_fields__": [
+                "total_outstanding",
+                "collected_this_month",
+                "total_invoiced",
+            ],
+        },
+    }
+    assert format_display_value(
+        "51364.00", "total_outstanding", "invoicing-ar-summary", hints,
+    ) == "₹51,364"
+    assert format_display_value(
+        "14643.80", "collected_this_month", "invoicing-ar-summary", hints,
+    ) == "₹14,643.80"
+    assert format_display_value(
+        "455228.90", "total_invoiced", "invoicing-ar-summary", hints,
+    ) == "₹455,228.90"
