@@ -7,6 +7,13 @@ Used by workflow (API response fields) and response_formatter (summary text).
 from typing import Any, Dict, List, Optional
 
 from . import constants
+from .hint_utils import (
+    _BUILTIN_SUMMARY_PHRASE_FIELDS,
+    _field_for_builtin_phrase,
+    _available_summary_field_names,
+    get_related_list_resource,
+    get_response_summary_field_synonyms,
+)
 
 
 def _resource_label(parsed: Optional[Dict[str, Any]]) -> str:
@@ -14,12 +21,71 @@ def _resource_label(parsed: Optional[Dict[str, Any]]) -> str:
     return str(resource).replace("_", " ")
 
 
+def _is_summary_without_list(
+    parsed: Optional[Dict[str, Any]],
+    session_metadata: Optional[Dict[str, Any]],
+) -> bool:
+    meta = session_metadata or {}
+    question_type = (parsed or {}).get("question_type") or meta.get("question_type")
+    list_cache = meta.get("list_cache") or []
+    return question_type == "summary" and not list_cache
+
+
+def _summary_follow_up_queries(
+    parsed: Optional[Dict[str, Any]],
+    resource_hints: Dict[str, Any],
+) -> List[Dict[str, str]]:
+    """Contextual chips for dashboard/summary turns (no list pagination)."""
+    resource = (parsed or {}).get("resource") or ""
+    queries: List[Dict[str, str]] = []
+    related = get_related_list_resource(resource, resource_hints)
+    if related:
+        label = related.replace("-", " ")
+        queries.append({
+            "label": f"Show {label}",
+            "query": f"list {label}",
+        })
+
+    available = _available_summary_field_names(resource, resource_hints)
+    syns = get_response_summary_field_synonyms(resource, resource_hints)
+    seen_queries: set = set()
+
+    phrases = list(syns.keys()) + list(_BUILTIN_SUMMARY_PHRASE_FIELDS.keys())
+    for phrase in sorted(phrases, key=len, reverse=True):
+        field = syns.get(phrase) or _field_for_builtin_phrase(phrase, available)
+        if not field:
+            continue
+        q = f"what is the {phrase}"
+        if q in seen_queries:
+            continue
+        seen_queries.add(q)
+        queries.append({
+            "label": phrase.title(),
+            "query": q,
+        })
+        if len(queries) >= constants.SUGGESTIONS_MAX:
+            break
+
+    return queries[: constants.SUGGESTIONS_MAX]
+
+
 def generate_suggestions(
     pagination_info: Dict[str, Any],
     parsed: Optional[Dict[str, Any]] = None,
     data: Any = None,
+    session_metadata: Optional[Dict[str, Any]] = None,
+    resource_hints: Optional[Dict[str, Any]] = None,
 ) -> List[str]:
     """Generate contextual suggested_actions based on result count and pagination."""
+    if _is_summary_without_list(parsed, session_metadata):
+        suggestions: List[str] = []
+        resource = (parsed or {}).get("resource") or ""
+        related = get_related_list_resource(resource, resource_hints or {})
+        if related:
+            suggestions.append(f"List {related.replace('-', ' ')}")
+        suggestions.append("Ask about another AR metric")
+        return suggestions[: constants.SUGGESTIONS_MAX]
+
     suggestions: List[str] = []
     total = pagination_info.get("total_count", 0)
     has_more = pagination_info.get("has_more", False)
@@ -43,6 +109,8 @@ def generate_suggestions(
 def generate_follow_up_queries(
     pagination_info: Dict[str, Any],
     parsed: Optional[Dict[str, Any]] = None,
+    session_metadata: Optional[Dict[str, Any]] = None,
+    resource_hints: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, str]]:
     """
     Return structured follow-up query templates for the frontend.
@@ -51,6 +119,9 @@ def generate_follow_up_queries(
         - label: short display text
         - query: natural-language query the user can send
     """
+    if _is_summary_without_list(parsed, session_metadata):
+        return _summary_follow_up_queries(parsed, resource_hints or {})
+
     queries: List[Dict[str, str]] = []
     resource = _resource_label(parsed)
     total = pagination_info.get("total_count", 0)
@@ -102,13 +173,25 @@ def enrich_response_with_follow_ups(
     pagination_info: Optional[Dict[str, Any]] = None,
     parsed: Optional[Dict[str, Any]] = None,
     data: Any = None,
+    session_metadata: Optional[Dict[str, Any]] = None,
+    resource_hints: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Add suggested_actions and follow_up_queries to a response dict."""
     pagination_info = pagination_info or {}
+    meta = session_metadata or {}
+    if not meta.get("question_type") and response.get("question_type"):
+        meta = {**meta, "question_type": response.get("question_type")}
+    if "list_cache" not in meta and isinstance(data, dict) and data.get("list_cache"):
+        meta = {**meta, "list_cache": data.get("list_cache")}
+
     if "suggested_actions" not in response:
-        response["suggested_actions"] = generate_suggestions(pagination_info, parsed, data)
+        response["suggested_actions"] = generate_suggestions(
+            pagination_info, parsed, data, meta, resource_hints,
+        )
     if "follow_up_queries" not in response:
-        response["follow_up_queries"] = generate_follow_up_queries(pagination_info, parsed)
+        response["follow_up_queries"] = generate_follow_up_queries(
+            pagination_info, parsed, meta, resource_hints,
+        )
     return response
 
 
@@ -117,19 +200,16 @@ def _extract_resource_names(schema: Optional[Dict[str, Any]]) -> List[str]:
     if not schema:
         return []
     resources: List[str] = []
-    # Try resource_hints keys first (most reliable)
     hints = schema.get("resource_hints") or {}
     for name in hints.keys():
         if not name.startswith("__"):
             resources.append(str(name).replace("-", " ").replace("_", " "))
-    # Fallback to paths if no hints
     if not resources:
         paths = schema.get("paths") or {}
         for path in paths.keys():
             parts = str(path).strip("/").split("/")
             if parts and parts[0] and not parts[0].startswith("{"):
                 resources.append(parts[0].replace("-", " ").replace("_", " "))
-    # Dedupe and limit
     seen: set = set()
     unique: List[str] = []
     for r in resources:

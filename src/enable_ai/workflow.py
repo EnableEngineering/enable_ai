@@ -19,6 +19,7 @@ from .follow_up_suggestions import (
 )
 from .follow_up_detection import (
     apply_follow_up_context,
+    apply_summary_metric_follow_up,
     build_list_pivot_parsed,
     build_session_metadata,
     classify_follow_up,
@@ -751,6 +752,13 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
                     user_context=state.get("user_context"),
                     resource_hints=resource_hints,
                 )
+                parsed = apply_summary_metric_follow_up(
+                    parsed,
+                    query_text,
+                    conversation_history,
+                    resource_hints,
+                    active_schema,
+                )
 
             # Resolve __current_user_id__ etc. before planning (covers classify shortcut path)
             parsed = resolve_user_context_in_parsed(
@@ -772,8 +780,12 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
             parsed = expand_query_resources(parsed, query_text, active_schema)
 
             schema_resources = set((active_schema.get("resources") or {}).keys())
+            prior_resource = None
+            if conversation_history:
+                prior_resource = extract_last_result_metadata(conversation_history).get("resource")
             parsed = align_parsed_resource_with_query(
                 parsed, query_text, resource_hints, schema_resources,
+                prior_resource=prior_resource,
             )
             parsed = apply_resource_question_defaults(
                 parsed, query_text, active_schema,
@@ -1201,6 +1213,7 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
                 if list_projection.get("list_display_fields"):
                     window = list_projection["window_items"]
                     fields = list_projection["list_display_fields"]
+                    rh = active_schema.get("resource_hints") or {}
                     summary = build_chat_summary(
                         window,
                         fields,
@@ -1210,8 +1223,11 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
                         total_cached=list_projection["total_cached"],
                         total_count=len(combined),
                         has_more_in_chat=list_projection["has_more_in_chat"],
+                        resource_hints=rh,
                     )
-                    formatted = format_projected_table(window, fields, resource=resource_name)
+                    formatted = format_projected_table(
+                        window, fields, resource=resource_name, resource_hints=rh,
+                    )
                     fmt_format = "table"
                 else:
                     summary = constants.SUMMARY_RETRIEVED_ALL_LEN.format(count=len(combined))
@@ -1458,6 +1474,10 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
                 )
             ):
                 schema_resource = (active_schema.get("resources") or {}).get(resource_key)
+                is_follow_up_turn = bool(
+                    state.get("is_follow_up")
+                    or state.get("follow_up_classification", {}).get("is_follow_up")
+                )
                 summary = build_summary_response_text(
                     data if isinstance(data, dict) else {},
                     resource_key,
@@ -1465,10 +1485,16 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
                     query=state.get("query") or "",
                     parsed=parsed,
                     schema_resource=schema_resource,
+                    follow_up_only=is_follow_up_turn,
                 )
                 if not summary:
                     summary = constants.SUMMARY_RETRIEVED_DATA
                 logger.info("Summary/dashboard response: %s", summary)
+                summary_session_meta = {
+                    "question_type": "summary",
+                    "list_cache": [],
+                    "resource": resource_key,
+                }
                 response = enrich_response_with_follow_ups({
                     "success": True,
                     "data": data,
@@ -1479,7 +1505,10 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
                     "pagination": pagination_info,
                     "total_steps": 1,
                     "schema_type": active_schema.get("type"),
-                }, pagination_info, parsed, data)
+                }, pagination_info, parsed, data,
+                    session_metadata=summary_session_meta,
+                    resource_hints=resource_hints,
+                )
                 if tracker:
                     tracker.update(ProgressStage.COMPLETED, "Done! ✓")
                 response = enrich_api_response(
@@ -1647,6 +1676,7 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
                 if list_projection and list_projection.get("list_display_fields"):
                     window = list_projection["window_items"]
                     fields = list_projection["list_display_fields"]
+                    rh = (state.get("active_schema") or {}).get("resource_hints") or {}
                     summary = build_chat_summary(
                         window,
                         fields,
@@ -1656,8 +1686,11 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
                         total_cached=list_projection["total_cached"],
                         total_count=list_projection["total_count"],
                         has_more_in_chat=list_projection["has_more_in_chat"],
+                        resource_hints=rh,
                     )
-                    formatted = format_projected_table(window, fields, resource=resource_name)
+                    formatted = format_projected_table(
+                        window, fields, resource=resource_name, resource_hints=rh,
+                    )
                     fmt_format = "table"
                     used_projector = True
                     if isinstance(final_data, dict):
@@ -1898,6 +1931,7 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
                         chat_advance["window_items"],
                         chat_advance["list_display_fields"],
                         resource=chat_advance["resource"],
+                        resource_hints=active_schema.get("resource_hints") or {},
                     ) if chat_advance["list_display_fields"] else None,
                     "format": "table" if chat_advance["list_display_fields"] else "text",
                     "query": query,

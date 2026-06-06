@@ -130,13 +130,17 @@ def format_projected_table(
     fields: List[str],
     *,
     resource: str = "items",
+    resource_hints: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Build a deterministic markdown table from projected rows (no LLM)."""
+    from .display_formatting import format_display_value, format_field_label
+
     if not rows:
         return f"No {resource} found."
     if not fields:
         fields = list(rows[0].keys())[: constants.TABLE_FIELDS_MAX]
-    header_labels = [f.replace("__", " ").replace("_", " ").title() for f in fields]
+    hints = resource_hints or {}
+    header_labels = [format_field_label(f, hints, resource) for f in fields]
     lines = [
         "| " + " | ".join(header_labels) + " |",
         "| " + " | ".join(["---"] * len(fields)) + " |",
@@ -147,6 +151,8 @@ def format_projected_table(
             val = row.get(field, "")
             if val is None:
                 val = ""
+            else:
+                val = format_display_value(val, field, resource, hints)
             cells.append(str(val)[: constants.TABLE_FIELD_PREVIEW])
         lines.append("| " + " | ".join(cells) + " |")
     return "\n".join(lines)
@@ -162,13 +168,16 @@ def build_chat_summary(
     total_cached: int,
     total_count: Optional[int] = None,
     has_more_in_chat: bool = False,
+    resource_hints: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Human-readable summary for a chat window."""
     shown = len(window_rows)
     total = total_count if total_count is not None else total_cached
     start = offset + 1 if shown else 0
     end = offset + shown
-    table = format_projected_table(window_rows, fields, resource=resource)
+    table = format_projected_table(
+        window_rows, fields, resource=resource, resource_hints=resource_hints,
+    )
     header = f"Showing {start}–{end} of {total} {resource.replace('-', ' ')}"
     if has_more_in_chat:
         header += " (say \"show me next\" or \"next 10\" for more)"

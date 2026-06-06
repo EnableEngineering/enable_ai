@@ -12,8 +12,10 @@ from typing import Any, Dict, List, Optional, Set
 from . import constants
 from .hint_utils import (
     expand_aggregate_follow_up,
+    get_endpoint_role,
     get_related_list_resource,
     get_user_scoped_fields,
+    resolve_summary_field_from_query,
     should_force_standalone_for_resource_switch,
 )
 from .response_projector import (
@@ -142,6 +144,7 @@ def build_session_metadata(
         "total_cached": len(list_cache) if list_cache else (projection or {}).get("total_cached"),
         "multiple_resources": parsed.get("multiple_resources"),
         "related_list_resource": get_related_list_resource(resource or "", hints),
+        "endpoint_role": get_endpoint_role(resource or "", hints),
     }
 
 
@@ -243,6 +246,7 @@ def extract_last_result_metadata(conversation_history: List[Dict[str, Any]]) -> 
                 "total_cached": metadata.get("total_cached"),
                 "multiple_resources": metadata.get("multiple_resources"),
                 "related_list_resource": metadata.get("related_list_resource"),
+                "endpoint_role": metadata.get("endpoint_role"),
             }
     return {}
 
@@ -600,6 +604,46 @@ def should_merge_previous_filters(
     )
 
 
+def apply_summary_metric_follow_up(
+    parsed: Dict[str, Any],
+    query: str,
+    conversation_history: Optional[List[Dict[str, Any]]],
+    resource_hints: Dict[str, Any],
+    schema: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """
+    When the prior turn was a summary dashboard, route metric follow-ups to one field.
+    """
+    if not isinstance(parsed, dict) or not query:
+        return parsed
+
+    meta = extract_last_result_metadata(conversation_history or [])
+    prev_resource = meta.get("resource")
+    if not prev_resource or meta.get("question_type") != "summary":
+        return parsed
+
+    if parsed.get("question_type") == "list":
+        return parsed
+
+    role = get_endpoint_role(prev_resource, resource_hints)
+    if role not in ("summary", "dashboard", "metrics"):
+        return parsed
+
+    schema_resource = (schema or {}).get("resources", {}).get(prev_resource)
+    field = resolve_summary_field_from_query(
+        query, prev_resource, resource_hints, parsed, schema_resource,
+    )
+    if not field:
+        return parsed
+
+    result = dict(parsed)
+    result["resource"] = prev_resource
+    result["question_type"] = "summary"
+    result["summary_field"] = field
+    result["merge_with_previous"] = False
+    return result
+
+
 def apply_follow_up_context(
     parsed: Dict[str, Any],
     query: str,
@@ -662,4 +706,14 @@ def apply_follow_up_context(
     if meta.get("count") == 1 and not result.get("limit"):
         result["limit"] = 1
 
-    return expand_aggregate_follow_up(result, meta, clf, resource_hints or {})
+    result = expand_aggregate_follow_up(result, meta, clf, resource_hints or {})
+
+    if should_pivot_summary_to_list(meta, clf.get("follow_up_type") or ""):
+        related = get_related_list_resource(prev_resource, resource_hints or {})
+        if related:
+            result["resource"] = related
+            result["question_type"] = "list"
+            result["merge_with_previous"] = False
+            result.pop("summary_field", None)
+
+    return result

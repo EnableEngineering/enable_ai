@@ -210,6 +210,55 @@ def get_related_list_resource(
     return str(related) if related else None
 
 
+def get_related_summary_resource(
+    resource: str,
+    resource_hints: Dict[str, Any],
+) -> Optional[str]:
+    """Summary/dashboard resource for amount-metric queries on a list sibling."""
+    hints = (resource_hints or {}).get(resource) or {}
+    if not isinstance(hints, dict):
+        return None
+    related = hints.get("__related_summary_resource__")
+    return str(related) if related else None
+
+
+# Built-in phrase → candidate response field names (first match wins per resource)
+_BUILTIN_SUMMARY_PHRASE_FIELDS: Dict[str, List[str]] = {
+    "pending amount": ["total_outstanding", "pending_amount", "outstanding_amount"],
+    "pending": ["total_outstanding", "pending_amount"],
+    "outstanding amount": ["total_outstanding"],
+    "the outstanding": ["total_outstanding"],
+    "outstanding": ["total_outstanding"],
+    "collected this month": ["collected_this_month", "amount_collected_this_month"],
+    "collected": ["collected_this_month", "total_collected"],
+    "overdue amount": ["total_overdue"],
+    "overdue": ["total_overdue"],
+    "invoiced amount": ["total_invoiced", "total_invoiced_amount"],
+    "total invoiced": ["total_invoiced"],
+    "total invoiced amount": ["total_invoiced"],
+}
+
+
+def _available_summary_field_names(
+    resource: str,
+    resource_hints: Dict[str, Any],
+    schema_resource: Optional[Dict[str, Any]] = None,
+) -> Set[str]:
+    return set(
+        get_response_summary_fields(resource, resource_hints, schema_resource).keys()
+    ) | set(get_response_count_fields(resource, resource_hints))
+
+
+def _field_for_builtin_phrase(
+    phrase: str,
+    available: Set[str],
+) -> Optional[str]:
+    for candidate in _BUILTIN_SUMMARY_PHRASE_FIELDS.get(phrase.lower(), []):
+        if candidate in available:
+            return candidate
+    return None
+
+
 def _matching_term_lengths(query: str, resource_name: str, hints: Dict[str, Any]) -> List[int]:
     """Return lengths of all resource terms that match the query."""
     if not query:
@@ -533,6 +582,43 @@ def find_explicit_resources_in_query(
     return sorted(found)
 
 
+def find_best_explicit_resource(
+    query: str,
+    resource_hints: Dict[str, Any],
+    schema_resources: Set[str],
+    prior_resource: Optional[str] = None,
+) -> Optional[str]:
+    """
+    Pick the single best-matching resource using longest synonym/term length.
+
+    Prefers prior_resource on ties for session continuity.
+    """
+    mentioned = find_explicit_resources_in_query(query, resource_hints, schema_resources)
+    if not mentioned:
+        return None
+    if len(mentioned) == 1:
+        return mentioned[0]
+
+    scored: List[tuple] = []
+    for name in mentioned:
+        rh = resource_hints.get(name) or {}
+        if not isinstance(rh, dict):
+            rh = {}
+        lengths = _matching_term_lengths(query, name, rh)
+        scored.append((name, max(lengths) if lengths else 0))
+
+    if not scored:
+        return mentioned[0]
+
+    top_len = max(s for _, s in scored)
+    top = [n for n, s in scored if s == top_len]
+    if len(top) == 1:
+        return top[0]
+    if prior_resource and prior_resource in top:
+        return prior_resource
+    return top[0]
+
+
 def should_force_standalone_for_resource_switch(
     query: str,
     prior_meta: Dict[str, Any],
@@ -740,12 +826,23 @@ def resolve_summary_field_from_query(
     summary_fields = get_response_summary_fields(
         resource, resource_hints, schema_resource,
     )
+    available = _available_summary_field_names(resource, resource_hints, schema_resource)
     synonyms = get_response_summary_field_synonyms(resource, resource_hints)
 
     best_field: Optional[str] = None
     best_len = 0
     for phrase, field in synonyms.items():
+        if field not in available and field not in summary_fields:
+            continue
         if _phrase_matches_query(phrase, q) and len(phrase) > best_len:
+            best_field = field
+            best_len = len(phrase)
+
+    for phrase, candidates in _BUILTIN_SUMMARY_PHRASE_FIELDS.items():
+        if not _phrase_matches_query(phrase, q):
+            continue
+        field = _field_for_builtin_phrase(phrase, available)
+        if field and len(phrase) > best_len:
             best_field = field
             best_len = len(phrase)
 
@@ -763,22 +860,37 @@ def resolve_summary_field_from_query(
     return best_field
 
 
+def _query_implies_list_count(query: str) -> bool:
+    return bool(re.search(
+        r"\b(?:how many|count of|number of)\b", query or "", re.IGNORECASE,
+    ))
+
+
+def _query_implies_amount_metric(query: str) -> bool:
+    return bool(re.search(
+        r"\b(?:how much|total amount|invoiced amount|pending amount|outstanding|"
+        r"collected|overdue amount|what(?:'s| is) the (?:total|pending|outstanding|"
+        r"collected|overdue|invoiced))\b",
+        query or "",
+        re.IGNORECASE,
+    ))
+
+
 def align_parsed_resource_with_query(
     parsed: Dict[str, Any],
     query: str,
     resource_hints: Dict[str, Any],
     schema_resources: Set[str],
+    prior_resource: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Override parsed resource when the query explicitly names a different one."""
     if not isinstance(parsed, dict) or not query:
         return parsed
 
-    mentioned = find_explicit_resources_in_query(query, resource_hints, schema_resources)
-    if len(mentioned) != 1:
-        return parsed
-
-    target = mentioned[0]
-    if parsed.get("resource") == target:
+    target = find_best_explicit_resource(
+        query, resource_hints, schema_resources, prior_resource=prior_resource,
+    )
+    if not target or parsed.get("resource") == target:
         return parsed
 
     result = dict(parsed)
@@ -802,22 +914,38 @@ def apply_resource_question_defaults(
     resource = parsed.get("resource") or ""
     hints = (schema or {}).get("resource_hints") or {}
     role = get_endpoint_role(resource, hints)
+
+    if _query_implies_amount_metric(query) and not _query_implies_list_count(query):
+        related_summary = get_related_summary_resource(resource, hints)
+        if related_summary:
+            result = dict(parsed)
+            result["resource"] = related_summary
+            result["question_type"] = "summary"
+            field = resolve_summary_field_from_query(query, related_summary, hints, result)
+            if field:
+                result["summary_field"] = field
+            return result
+
     if role not in ("summary", "dashboard", "metrics"):
         return parsed
 
     qt = (parsed.get("question_type") or "").lower()
-    q = (query or "").lower()
     list_signals = re.search(
-        r"\b(?:how many|list|show all|show me all|count of)\b", q, re.IGNORECASE,
+        r"\b(?:how many|list|show all|show me all|count of)\b", query or "", re.IGNORECASE,
     )
     if qt == "count" and not list_signals:
         result = dict(parsed)
         result["question_type"] = "summary"
+        field = resolve_summary_field_from_query(query, resource, hints, result)
+        if field:
+            result["summary_field"] = field
         return result
     if not qt or qt == "read":
-        if resolve_summary_field_from_query(query, resource, hints, parsed):
+        field = resolve_summary_field_from_query(query, resource, hints, parsed)
+        if field:
             result = dict(parsed)
             result["question_type"] = "summary"
+            result["summary_field"] = field
             return result
     return parsed
 
@@ -835,18 +963,33 @@ def is_summary_response(
         resource, resource_hints, schema_resource,
     )
     count_fields = get_response_count_fields(resource, resource_hints)
-    keys = set(data.keys())
-    if summary_fields and keys.intersection(summary_fields.keys()):
-        return True
-    if count_fields and keys.intersection(count_fields):
-        return True
+    for field in list(summary_fields.keys()) + count_fields:
+        if _get_nested_summary_value(data, field) is not None:
+            return True
     return False
 
 
-def _format_summary_value(val: Any) -> Any:
-    if isinstance(val, float) and val == int(val):
-        return int(val)
-    return val
+def _format_summary_value(
+    val: Any,
+    field: str = "",
+    resource: str = "",
+    resource_hints: Optional[Dict[str, Any]] = None,
+) -> str:
+    from .display_formatting import format_display_value
+    return format_display_value(val, field, resource, resource_hints)
+
+
+def _get_nested_summary_value(data: Dict[str, Any], field_path: str) -> Any:
+    """Read a summary value supporting dotted paths (e.g. days_1_30_bucket.amount)."""
+    if field_path in data:
+        return data[field_path]
+    parts = field_path.split(".")
+    current: Any = data
+    for part in parts:
+        if not isinstance(current, dict) or part not in current:
+            return None
+        current = current[part]
+    return current
 
 
 def build_summary_response_text(
@@ -856,6 +999,7 @@ def build_summary_response_text(
     query: str = "",
     parsed: Optional[Dict[str, Any]] = None,
     schema_resource: Optional[Dict[str, Any]] = None,
+    follow_up_only: bool = False,
 ) -> str:
     """Format dashboard/summary API payloads — one metric when query names it."""
     summary_fields = get_response_summary_fields(
@@ -865,26 +1009,37 @@ def build_summary_response_text(
     target = resolve_summary_field_from_query(
         query, resource, resource_hints, parsed, schema_resource,
     )
-    if target and target in data and data[target] is not None:
-        label = summary_fields.get(target, target.replace("_", " ").title())
-        val = _format_summary_value(data[target])
-        return f"{label} is {val}."
+    if target:
+        val = _get_nested_summary_value(data, target)
+        if val is not None:
+            label = summary_fields.get(target, target.replace("_", " ").title())
+            formatted = _format_summary_value(val, target, resource, resource_hints)
+            return f"{label} is {formatted}."
 
-    # No query match: emit all configured fields (legacy fallback)
+    if follow_up_only:
+        return (
+            "I couldn't tell which metric you meant from the dashboard. "
+            "Try asking for a specific value, such as 'what is the outstanding amount?'"
+        )
+
+    # Standalone turn with no field match: emit all configured fields (legacy fallback)
     parts: List[str] = []
     for field, label in summary_fields.items():
-        if field not in data or data[field] is None:
+        val = _get_nested_summary_value(data, field)
+        if val is None:
             continue
-        val = _format_summary_value(data[field])
-        parts.append(f"{label} is {val}")
+        formatted = _format_summary_value(val, field, resource, resource_hints)
+        parts.append(f"{label} is {formatted}")
 
     if parts:
         return ". ".join(parts) + "."
 
     count_fields = get_response_count_fields(resource, resource_hints)
     for field in count_fields:
-        if field in data and data[field] is not None:
-            label = field.replace("_", " ")
-            return f"{label.title()} is {data[field]}."
+        val = _get_nested_summary_value(data, field)
+        if val is not None:
+            label = summary_fields.get(field, field.replace("_", " ").title())
+            formatted = _format_summary_value(val, field, resource, resource_hints)
+            return f"{label} is {formatted}."
 
     return ""
