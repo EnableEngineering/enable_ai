@@ -448,7 +448,9 @@ def strip_inherited_session_filters(
     user_id = (user_context or {}).get("user_id")
     if user_id is not None and resource_hints:
         resource = result.get("resource") or meta.get("resource") or ""
-        user_scoped_fields = get_user_scoped_fields(resource, resource_hints)
+        user_scoped_fields = get_user_scoped_fields(
+            resource, resource_hints, user_context,
+        )
         for field in user_scoped_fields:
             if field in filters:
                 field_val = filters[field]

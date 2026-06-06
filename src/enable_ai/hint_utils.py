@@ -27,13 +27,34 @@ _USER_SCOPE_PHRASES = (
 )
 
 
-def get_user_scoped_fields(resource: str, resource_hints: Dict[str, Any]) -> List[str]:
-    """Return field names from resource_hints.__user_scoped_fields__ for a resource."""
+def get_user_scoped_fields(
+    resource: str,
+    resource_hints: Dict[str, Any],
+    user_context: Optional[Dict[str, Any]] = None,
+) -> List[str]:
+    """
+    Return user-scoped filter fields for a resource.
+
+    Uses __user_scoped_fields_by_role__[role] when user_context.role is set,
+    otherwise __user_scoped_fields__.
+    """
     if not resource or not resource_hints:
         return []
     hints = resource_hints.get(resource) or {}
     if not isinstance(hints, dict):
         return []
+
+    role = (user_context or {}).get("role") or ""
+    by_role = hints.get("__user_scoped_fields_by_role__") or {}
+    if role and isinstance(by_role, dict):
+        if role in by_role:
+            fields = by_role[role]
+            return list(fields) if isinstance(fields, (list, tuple)) else []
+        role_l = str(role).lower()
+        for key, fields in by_role.items():
+            if str(key).lower() == role_l:
+                return list(fields) if isinstance(fields, (list, tuple)) else []
+
     fields = hints.get("__user_scoped_fields__") or []
     return list(fields) if isinstance(fields, (list, tuple)) else []
 
@@ -127,15 +148,44 @@ def get_response_count_fields(resource: str, resource_hints: Dict[str, Any]) -> 
 
 
 def get_response_summary_fields(
-    resource: str, resource_hints: Dict[str, Any],
+    resource: str,
+    resource_hints: Dict[str, Any],
+    schema_resource: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, str]:
     """Map response field names to display labels for summary/dashboard payloads."""
     hints = (resource_hints or {}).get(resource) or {}
     if not isinstance(hints, dict):
-        return {}
+        hints = {}
     fields = hints.get("__response_summary_fields__") or {}
-    if isinstance(fields, dict):
+    if isinstance(fields, dict) and fields:
         return {str(k): str(v) for k, v in fields.items()}
+
+    if get_endpoint_role(resource, resource_hints) in ("summary", "dashboard", "metrics"):
+        discovered: Dict[str, str] = {}
+        res_data = schema_resource or {}
+        for item in res_data.get("fields") or []:
+            if isinstance(item, dict) and item.get("name"):
+                name = str(item["name"])
+                label = item.get("label") or item.get("title") or name.replace("_", " ").title()
+                discovered[name] = str(label)
+            elif isinstance(item, str):
+                discovered[item] = item.replace("_", " ").title()
+        if discovered:
+            return discovered
+    return {}
+
+
+def get_response_summary_field_synonyms(
+    resource: str,
+    resource_hints: Dict[str, Any],
+) -> Dict[str, str]:
+    """Map query phrases to summary response field names."""
+    hints = (resource_hints or {}).get(resource) or {}
+    if not isinstance(hints, dict):
+        return {}
+    syns = hints.get("__response_summary_field_synonyms__") or {}
+    if isinstance(syns, dict):
+        return {str(k).lower(): str(v) for k, v in syns.items()}
     return {}
 
 
@@ -643,15 +693,135 @@ def build_count_filter_description(
     return " ".join(parts)
 
 
+def _phrase_matches_query(phrase: str, query_lower: str) -> bool:
+    """Match phrase in query, allowing a single missing character on single-token phrases."""
+    norm = phrase.lower().strip()
+    if not norm:
+        return False
+    if norm in query_lower:
+        return True
+    if _term_in_query(norm, query_lower):
+        return True
+    if " " not in norm and len(norm) >= 5:
+        for i in range(len(norm)):
+            variant = norm[:i] + norm[i + 1:]
+            if variant in query_lower:
+                return True
+    return False
+
+
+def resolve_summary_field_from_query(
+    query: str,
+    resource: str,
+    resource_hints: Dict[str, Any],
+    parsed: Optional[Dict[str, Any]] = None,
+    schema_resource: Optional[Dict[str, Any]] = None,
+) -> Optional[str]:
+    """Pick one dashboard metric field based on query phrasing or parsed summary_field."""
+    if isinstance(parsed, dict) and parsed.get("summary_field"):
+        return str(parsed["summary_field"])
+
+    q = (query or "").lower()
+    if not q:
+        return None
+
+    summary_fields = get_response_summary_fields(
+        resource, resource_hints, schema_resource,
+    )
+    synonyms = get_response_summary_field_synonyms(resource, resource_hints)
+
+    best_field: Optional[str] = None
+    best_len = 0
+    for phrase, field in synonyms.items():
+        if _phrase_matches_query(phrase, q) and len(phrase) > best_len:
+            best_field = field
+            best_len = len(phrase)
+
+    for field, label in summary_fields.items():
+        candidates = [
+            field.lower(),
+            field.replace("_", " ").lower(),
+            label.lower(),
+        ]
+        for cand in candidates:
+            if cand and _phrase_matches_query(cand, q) and len(cand) > best_len:
+                best_field = field
+                best_len = len(cand)
+
+    return best_field
+
+
+def align_parsed_resource_with_query(
+    parsed: Dict[str, Any],
+    query: str,
+    resource_hints: Dict[str, Any],
+    schema_resources: Set[str],
+) -> Dict[str, Any]:
+    """Override parsed resource when the query explicitly names a different one."""
+    if not isinstance(parsed, dict) or not query:
+        return parsed
+
+    mentioned = find_explicit_resources_in_query(query, resource_hints, schema_resources)
+    if len(mentioned) != 1:
+        return parsed
+
+    target = mentioned[0]
+    if parsed.get("resource") == target:
+        return parsed
+
+    result = dict(parsed)
+    result["resource"] = target
+    multi = result.get("multiple_resources")
+    if multi and target not in multi:
+        result.pop("multiple_resources", None)
+    result["merge_with_previous"] = False
+    return result
+
+
+def apply_resource_question_defaults(
+    parsed: Dict[str, Any],
+    query: str,
+    schema: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Adjust question_type for summary/dashboard resources and metric queries."""
+    if not isinstance(parsed, dict):
+        return parsed
+
+    resource = parsed.get("resource") or ""
+    hints = (schema or {}).get("resource_hints") or {}
+    role = get_endpoint_role(resource, hints)
+    if role not in ("summary", "dashboard", "metrics"):
+        return parsed
+
+    qt = (parsed.get("question_type") or "").lower()
+    q = (query or "").lower()
+    list_signals = re.search(
+        r"\b(?:how many|list|show all|show me all|count of)\b", q, re.IGNORECASE,
+    )
+    if qt == "count" and not list_signals:
+        result = dict(parsed)
+        result["question_type"] = "summary"
+        return result
+    if not qt or qt == "read":
+        if resolve_summary_field_from_query(query, resource, hints, parsed):
+            result = dict(parsed)
+            result["question_type"] = "summary"
+            return result
+    return parsed
+
+
 def is_summary_response(
     data: Any,
     resource: str,
     resource_hints: Dict[str, Any],
+    schema_resource: Optional[Dict[str, Any]] = None,
 ) -> bool:
     """True when data is a singleton dashboard/metrics dict, not a list page."""
     if not isinstance(data, dict) or "results" in data:
         return False
-    summary_fields = get_response_summary_fields(resource, resource_hints)
+    summary_fields = get_response_summary_fields(
+        resource, resource_hints, schema_resource,
+    )
     count_fields = get_response_count_fields(resource, resource_hints)
     keys = set(data.keys())
     if summary_fields and keys.intersection(summary_fields.keys()):
@@ -661,20 +831,39 @@ def is_summary_response(
     return False
 
 
+def _format_summary_value(val: Any) -> Any:
+    if isinstance(val, float) and val == int(val):
+        return int(val)
+    return val
+
+
 def build_summary_response_text(
     data: Dict[str, Any],
     resource: str,
     resource_hints: Dict[str, Any],
+    query: str = "",
+    parsed: Optional[Dict[str, Any]] = None,
+    schema_resource: Optional[Dict[str, Any]] = None,
 ) -> str:
-    """Format dashboard/summary API payloads for user-facing text."""
-    summary_fields = get_response_summary_fields(resource, resource_hints)
+    """Format dashboard/summary API payloads — one metric when query names it."""
+    summary_fields = get_response_summary_fields(
+        resource, resource_hints, schema_resource,
+    )
+
+    target = resolve_summary_field_from_query(
+        query, resource, resource_hints, parsed, schema_resource,
+    )
+    if target and target in data and data[target] is not None:
+        label = summary_fields.get(target, target.replace("_", " ").title())
+        val = _format_summary_value(data[target])
+        return f"{label} is {val}."
+
+    # No query match: emit all configured fields (legacy fallback)
     parts: List[str] = []
     for field, label in summary_fields.items():
         if field not in data or data[field] is None:
             continue
-        val = data[field]
-        if isinstance(val, float) and val == int(val):
-            val = int(val)
+        val = _format_summary_value(data[field])
         parts.append(f"{label} is {val}")
 
     if parts:

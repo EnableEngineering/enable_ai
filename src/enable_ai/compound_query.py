@@ -10,22 +10,43 @@ _QUESTION_SIGNAL = re.compile(
     re.IGNORECASE,
 )
 
+_PREFIX_STRIP = re.compile(
+    r"^(?:or\s+)?(?:[\w-]+\s+){0,4}questions?\s+like[-\s]*",
+    re.IGNORECASE,
+)
+
+
+def _normalize_compound_text(query: str) -> str:
+    text = (query or "").strip()
+    text = _PREFIX_STRIP.sub("", text).strip()
+    return text
+
+
+def _signaled_parts(parts: List[str]) -> List[str]:
+    return [p.strip() for p in parts if p.strip() and _QUESTION_SIGNAL.search(p)]
+
 
 def split_compound_questions(query: str) -> List[str]:
     """
-    Split comma/semicolon-separated messages into sub-questions when each
-    part looks like an independent query.
+    Split compound messages into sub-questions.
+
+    Supports comma/semicolon lists, ``and``-joined questions, and strips
+    prefixes like ``or invoicing questions like-``.
     """
-    text = (query or "").strip()
+    text = _normalize_compound_text(query)
     if not text:
         return []
 
-    parts = re.split(r"[,;]\s+", text)
-    if len(parts) <= 1:
-        return [text]
+    and_parts = re.split(r"\s+and\s+", text, flags=re.IGNORECASE)
+    if len(and_parts) >= 2:
+        signaled = _signaled_parts(and_parts)
+        if len(signaled) >= 2:
+            return signaled
 
-    signaled = [p.strip() for p in parts if p.strip() and _QUESTION_SIGNAL.search(p)]
-    if len(signaled) >= 2:
-        return signaled
+    comma_parts = re.split(r"[,;]\s+", text)
+    if len(comma_parts) >= 2:
+        signaled = _signaled_parts(comma_parts)
+        if len(signaled) >= 2:
+            return signaled
 
     return [text]

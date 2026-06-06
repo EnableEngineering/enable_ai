@@ -292,7 +292,9 @@ def resolve_user_context_in_parsed(
 
     # Inject user-scoped filters only for resources that declare them
     resource = result.get("resource", "")
-    scoped_fields = get_user_scoped_fields(resource, resource_hints or {})
+    scoped_fields = get_user_scoped_fields(
+        resource, resource_hints or {}, user_context,
+    )
     if (
         not skip_injection
         and user_id is not None

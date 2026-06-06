@@ -127,3 +127,21 @@ def test_get_user_scoped_fields():
     hints = {"service-orders": {"__user_scoped_fields__": ["technician"]}}
     assert get_user_scoped_fields("service-orders", hints) == ["technician"]
     assert get_user_scoped_fields("inventory-consumables", hints) == []
+
+
+def test_get_user_scoped_fields_by_role():
+    hints = {
+        "details-reports": {
+            "__user_scoped_fields__": ["created_by"],
+            "__user_scoped_fields_by_role__": {
+                "Technician": ["service_order__technician"],
+                "Admin": ["created_by"],
+            },
+        },
+    }
+    assert get_user_scoped_fields(
+        "details-reports", hints, {"role": "Technician"},
+    ) == ["service_order__technician"]
+    assert get_user_scoped_fields(
+        "details-reports", hints, {"role": "Admin"},
+    ) == ["created_by"]

@@ -35,6 +35,8 @@ from .response_projector import (
 from .query_execution import merge_execution_context
 from .semantic_filters import apply_semantic_filters
 from .hint_utils import (
+    align_parsed_resource_with_query,
+    apply_resource_question_defaults,
     build_count_filter_description,
     build_summary_response_text,
     expand_query_resources,
@@ -765,6 +767,14 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
 
             parsed = expand_query_resources(parsed, query_text, active_schema)
 
+            schema_resources = set((active_schema.get("resources") or {}).keys())
+            parsed = align_parsed_resource_with_query(
+                parsed, query_text, resource_hints, schema_resources,
+            )
+            parsed = apply_resource_question_defaults(
+                parsed, query_text, active_schema,
+            )
+
             execution_plan = planner.create_execution_plan(parsed, active_schema)
             total_steps = len(execution_plan.get("steps", []))
             if tracker:
@@ -1443,10 +1453,14 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
                     and is_summary_response(data, resource_key, resource_hints)
                 )
             ):
+                schema_resource = (active_schema.get("resources") or {}).get(resource_key)
                 summary = build_summary_response_text(
                     data if isinstance(data, dict) else {},
                     resource_key,
                     resource_hints,
+                    query=state.get("query") or "",
+                    parsed=parsed,
+                    schema_resource=schema_resource,
                 )
                 if not summary:
                     summary = constants.SUMMARY_RETRIEVED_DATA
@@ -1491,21 +1505,24 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
                 filter_desc = build_count_filter_description(
                     filters, resource_key, resource_hints,
                 )
-                
+                if filter_desc and filter_desc.lower() in resource.lower():
+                    filter_desc = ""
+
                 # Generate count-specific summary
                 if total_count == 0:
                     if filter_desc:
-                        summary = f"There are no {resource} {filter_desc}"
+                        summary = f"There are no {filter_desc} {resource}"
                     else:
                         summary = f"There are no {resource} matching your criteria"
                 elif total_count == 1:
+                    noun = resource.rstrip('s')
                     if filter_desc:
-                        summary = f"There is 1 {resource.rstrip('s')} {filter_desc}"
+                        summary = f"There is 1 {filter_desc} {noun}"
                     else:
-                        summary = f"There is 1 {resource.rstrip('s')}"
+                        summary = f"There is 1 {noun}"
                 else:
                     if filter_desc:
-                        summary = f"There are {total_count} {resource} {filter_desc}"
+                        summary = f"There are {total_count} {filter_desc} {resource}"
                     else:
                         summary = f"There are {total_count} {resource}"
                 
