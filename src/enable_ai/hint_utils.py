@@ -198,6 +198,18 @@ def get_endpoint_role(resource: str, resource_hints: Dict[str, Any]) -> Optional
     return str(role).lower() if role else None
 
 
+def get_related_list_resource(
+    resource: str,
+    resource_hints: Dict[str, Any],
+) -> Optional[str]:
+    """List resource to pivot to when user follows up on a summary/dashboard turn."""
+    hints = (resource_hints or {}).get(resource) or {}
+    if not isinstance(hints, dict):
+        return None
+    related = hints.get("__related_list_resource__")
+    return str(related) if related else None
+
+
 def _matching_term_lengths(query: str, resource_name: str, hints: Dict[str, Any]) -> List[int]:
     """Return lengths of all resource terms that match the query."""
     if not query:

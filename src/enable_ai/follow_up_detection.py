@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional, Set
 from . import constants
 from .hint_utils import (
     expand_aggregate_follow_up,
+    get_related_list_resource,
     get_user_scoped_fields,
     should_force_standalone_for_resource_switch,
 )
@@ -140,7 +141,77 @@ def build_session_metadata(
         "has_more_in_chat": has_more_in_chat,
         "total_cached": len(list_cache) if list_cache else (projection or {}).get("total_cached"),
         "multiple_resources": parsed.get("multiple_resources"),
+        "related_list_resource": get_related_list_resource(resource or "", hints),
     }
+
+
+LIST_CACHE_FOLLOW_UP_TYPES = ("reference", "first_n", "last_n", "next_page")
+
+
+def should_pivot_summary_to_list(
+    last_metadata: Dict[str, Any],
+    follow_up_type: str,
+) -> bool:
+    """True when a list-style follow-up follows a summary turn with no list_cache."""
+    if follow_up_type not in LIST_CACHE_FOLLOW_UP_TYPES:
+        return False
+    if last_metadata.get("list_cache"):
+        return False
+    return last_metadata.get("question_type") == "summary"
+
+
+def build_list_pivot_parsed(
+    last_metadata: Dict[str, Any],
+    resource_hints: Dict[str, Any],
+    query: str,
+    follow_up_type: str,
+    requested_limit: Optional[int] = None,
+) -> Optional[Dict[str, Any]]:
+    """Build a list query on __related_list_resource__ after a summary turn."""
+    resource = last_metadata.get("resource") or ""
+    related = get_related_list_resource(resource, resource_hints)
+    if not related:
+        return None
+
+    limit = requested_limit
+    q_lower = (query or "").lower()
+    if limit is None and follow_up_type == "first_n":
+        limit = 5
+    if limit is None and follow_up_type in ("reference", "refinement", "next_page"):
+        if "first" in q_lower:
+            limit = 1
+        elif "second" in q_lower:
+            limit = 2
+
+    return {
+        "intent": "read",
+        "resource": related,
+        "question_type": "list",
+        "display_mode": "summary",
+        "limit": limit,
+        "filters": dict(last_metadata.get("filters") or {}),
+        "original_input": query,
+        "merge_with_previous": False,
+    }
+
+
+def summary_list_follow_up_refusal_message(
+    last_metadata: Dict[str, Any],
+    resource_hints: Dict[str, Any],
+) -> str:
+    """User-facing message when list follow-up cannot pivot from summary."""
+    resource = last_metadata.get("resource") or "that metric"
+    related = get_related_list_resource(resource, resource_hints)
+    if related:
+        label = related.replace("-", " ")
+        return (
+            f"The previous answer was a summary metric for {resource.replace('-', ' ')}, "
+            f"not a browsable list. Try 'list {label}' or 'show overdue {label}' instead."
+        )
+    return (
+        "The previous answer was a summary metric with no item list to browse. "
+        "Please ask for a list explicitly, such as 'list invoices'."
+    )
 
 
 def extract_last_result_metadata(conversation_history: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -171,6 +242,7 @@ def extract_last_result_metadata(conversation_history: List[Dict[str, Any]]) -> 
                 "has_more_in_chat": metadata.get("has_more_in_chat", False),
                 "total_cached": metadata.get("total_cached"),
                 "multiple_resources": metadata.get("multiple_resources"),
+                "related_list_resource": metadata.get("related_list_resource"),
             }
     return {}
 

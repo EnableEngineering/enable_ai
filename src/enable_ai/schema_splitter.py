@@ -39,14 +39,35 @@ DEFAULT_SPLIT_RULES: Dict[str, Dict[str, str]] = {
         "details-reports": "/details-reports",
     },
     "invoicing": {
+        "invoicing-ar-invoices": "/ar-dashboard/invoices",
+        "invoicing-ar-credit-notes": "/ar-dashboard/credit-notes",
         "invoicing-invoices": "/invoices",
         "invoicing-ar-summary": "/ar-dashboard",
     },
 }
 
 
+def _normalize_path(path: str) -> str:
+    return (path or "").lower().rstrip("/")
+
+
 def _path_matches(path: str, pattern: str) -> bool:
-    return pattern.lower() in (path or "").lower()
+    """
+    Match pattern as trailing path segments (not arbitrary substring).
+
+    Pair with longest-pattern-first assignment so ``/invoices`` does not
+    claim ``/ar-dashboard/invoices`` when ``/ar-dashboard/invoices`` exists.
+    """
+    path_n = _normalize_path(path)
+    pattern_n = _normalize_path(pattern)
+    if not pattern_n.startswith("/"):
+        pattern_n = "/" + pattern_n
+
+    path_segs = [s for s in path_n.split("/") if s]
+    pattern_segs = [s for s in pattern_n.split("/") if s]
+    if not pattern_segs or len(path_segs) < len(pattern_segs):
+        return False
+    return path_segs[-len(pattern_segs):] == pattern_segs
 
 
 def _build_auto_split_rules(
@@ -121,14 +142,24 @@ def split_grouped_resources(schema: Dict[str, Any]) -> Dict[str, Any]:
         parent_display = parent.get("display_field")
         created: List[str] = []
 
-        for sub_name, path_pattern in sub_resources.items():
+        assigned_paths: set = set()
+        sorted_subs = sorted(
+            sub_resources.items(),
+            key=lambda item: len(item[1]),
+            reverse=True,
+        )
+        for sub_name, path_pattern in sorted_subs:
             if sub_name in resources and sub_name != parent_name:
                 continue
 
-            matching = [
-                ep for ep in parent.get("endpoints", [])
-                if _path_matches(ep.get("path", ""), path_pattern)
-            ]
+            matching = []
+            for ep in parent.get("endpoints", []):
+                ep_path = ep.get("path", "")
+                if ep_path in assigned_paths:
+                    continue
+                if _path_matches(ep_path, path_pattern):
+                    matching.append(ep)
+                    assigned_paths.add(ep_path)
             if not matching:
                 continue
 

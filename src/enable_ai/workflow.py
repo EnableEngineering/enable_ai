@@ -19,10 +19,13 @@ from .follow_up_suggestions import (
 )
 from .follow_up_detection import (
     apply_follow_up_context,
+    build_list_pivot_parsed,
     build_session_metadata,
     classify_follow_up,
     extract_last_result_metadata,
     should_merge_previous_filters,
+    should_pivot_summary_to_list,
+    summary_list_follow_up_refusal_message,
     try_advance_chat_window,
 )
 from .response_projector import (
@@ -738,15 +741,16 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
             resource_hints = active_schema.get("resource_hints") or {}
 
             # Anchor follow-ups to previous resource/filters (safety net after LLM parse)
-            parsed = apply_follow_up_context(
-                parsed,
-                query_text,
-                conversation_history,
-                state.get("is_follow_up", False),
-                classification=follow_up_classification,
-                user_context=state.get("user_context"),
-                resource_hints=resource_hints,
-            )
+            if not state.get("skip_llm_parse"):
+                parsed = apply_follow_up_context(
+                    parsed,
+                    query_text,
+                    conversation_history,
+                    state.get("is_follow_up", False),
+                    classification=follow_up_classification,
+                    user_context=state.get("user_context"),
+                    resource_hints=resource_hints,
+                )
 
             # Resolve __current_user_id__ etc. before planning (covers classify shortcut path)
             parsed = resolve_user_context_in_parsed(
@@ -1815,6 +1819,50 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
                 f"Processing follow-up query: {follow_up_type}"
             )
 
+        resource_hints = active_schema.get("resource_hints") or {}
+
+        def _try_summary_list_pivot() -> Optional[Dict[str, Any]]:
+            if not should_pivot_summary_to_list(last_metadata, follow_up_type):
+                return None
+            pivot = build_list_pivot_parsed(
+                last_metadata,
+                resource_hints,
+                query,
+                follow_up_type,
+                requested_limit,
+            )
+            if pivot:
+                logger.info(
+                    "Pivoting summary follow-up to list resource=%s",
+                    pivot.get("resource"),
+                )
+                return {
+                    "is_follow_up": True,
+                    "parsed": pivot,
+                    "skip_llm_parse": True,
+                    "follow_up_classification": follow_up_classification,
+                }
+            msg = summary_list_follow_up_refusal_message(last_metadata, resource_hints)
+            return {
+                "is_follow_up": True,
+                "response": enrich_response_with_follow_ups({
+                    "success": True,
+                    "data": None,
+                    "summary": msg,
+                    "query": query,
+                    "total_steps": 0,
+                    "suggested_actions": [
+                        f"List {last_metadata.get('related_list_resource', 'items').replace('-', ' ')}",
+                        "Start a new list query",
+                    ],
+                    "follow_up_queries": default_error_follow_up_queries(),
+                }),
+            }
+
+        pivot_result = _try_summary_list_pivot()
+        if pivot_result:
+            return pivot_result
+
         # Handle based on follow-up type
         if follow_up_type == "next_page":
             active_schema = state.get("active_schema") or {}
@@ -2106,6 +2154,9 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
         # If we already have a response (follow-up was fully handled), go to end
         if state.get("response"):
             return "end"
+        # Summary → list pivot already parsed — skip LLM parse
+        if state.get("skip_llm_parse") and state.get("parsed"):
+            return "create_plan"
         # If we have result from follow-up (fetched next page), go to summarize
         if state.get("is_follow_up") and state.get("result"):
             return "summarize"
@@ -2211,6 +2262,7 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
         {
             "classify": "classify",
             "parse": "parse",
+            "create_plan": "create_plan",
             "summarize": "summarize",  # Follow-up already fetched data
             "end": END,  # Follow-up returned response directly
         },
