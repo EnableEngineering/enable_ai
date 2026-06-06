@@ -50,6 +50,7 @@ from ._version import get_version
 
 __version__ = get_version()
 
+from .response_projector import ResponseProjector
 from .query_parser import QueryParser
 from .api_matcher import APIMatcher
 from .api_client import APIClient
@@ -91,6 +92,7 @@ __all__ = [
     'SchemaValidator',
     'validate_schema',
     'ResponseFormatter',
+    'ResponseProjector',
     'ProgressTracker',
     'ProgressStage',
     'ProgressUpdate',

@@ -9,7 +9,14 @@ import hashlib
 import json
 from typing import Any, Dict, List, Optional
 
+from . import constants
 from .hint_utils import get_user_scoped_fields
+from .response_projector import (
+    apply_chat_window,
+    build_chat_summary,
+    get_chat_window_size,
+    get_list_display_fields,
+)
 from .utils import get_openai_client, setup_logger, DETERMINISTIC_TEMP
 
 logger = setup_logger("enable_ai.follow_up_detection")
@@ -78,6 +85,8 @@ def extract_result_items_from_data(
 def build_session_metadata(
     parsed: Dict[str, Any],
     response: Dict[str, Any],
+    schema: Optional[Dict[str, Any]] = None,
+    projection: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Build assistant message metadata for follow-up / pronoun resolution."""
     pagination = response.get("pagination") or {}
@@ -95,8 +104,22 @@ def build_session_metadata(
     elif count == 1 and items:
         primary_item = items[0]
 
+    resource = parsed.get("resource")
+    hints = (schema or {}).get("resource_hints") or {}
+    list_cache = (projection or {}).get("list_cache") or []
+    chat_offset = (projection or {}).get("chat_offset", 0)
+    chat_window_size = (projection or {}).get("chat_window_size") or get_chat_window_size(
+        resource or "", hints,
+    )
+    list_display_fields = (projection or {}).get("list_display_fields") or get_list_display_fields(
+        resource or "", hints,
+    )
+    has_more_in_chat = (projection or {}).get("has_more_in_chat", False)
+    if list_cache and not projection:
+        has_more_in_chat = (chat_offset + chat_window_size) < len(list_cache)
+
     return {
-        "resource": parsed.get("resource"),
+        "resource": resource,
         "intent": parsed.get("intent"),
         "question_type": parsed.get("question_type"),
         "display_mode": parsed.get("display_mode"),
@@ -106,6 +129,12 @@ def build_session_metadata(
         "has_more": pagination.get("has_more", False),
         "result_items": items,
         "primary_item": primary_item,
+        "list_cache": list_cache,
+        "chat_offset": chat_offset,
+        "chat_window_size": chat_window_size,
+        "list_display_fields": list_display_fields,
+        "has_more_in_chat": has_more_in_chat,
+        "total_cached": len(list_cache) if list_cache else (projection or {}).get("total_cached"),
     }
 
 
@@ -130,8 +159,67 @@ def extract_last_result_metadata(conversation_history: List[Dict[str, Any]]) -> 
                 "display_mode": metadata.get("display_mode"),
                 "result_items": metadata.get("result_items") or [],
                 "primary_item": metadata.get("primary_item"),
+                "list_cache": metadata.get("list_cache") or [],
+                "chat_offset": metadata.get("chat_offset", 0),
+                "chat_window_size": metadata.get("chat_window_size"),
+                "list_display_fields": metadata.get("list_display_fields") or [],
+                "has_more_in_chat": metadata.get("has_more_in_chat", False),
+                "total_cached": metadata.get("total_cached"),
             }
     return {}
+
+
+def try_advance_chat_window(
+    last_metadata: Dict[str, Any],
+    step_size: Optional[int] = None,
+) -> Optional[Dict[str, Any]]:
+    """
+    Advance chat_offset within list_cache (no API call).
+
+    Returns display payload when more rows are available in cache, else None.
+    """
+    list_cache = last_metadata.get("list_cache") or []
+    if not list_cache:
+        return None
+
+    current_offset = int(last_metadata.get("chat_offset") or 0)
+    window_size = int(
+        step_size
+        or last_metadata.get("chat_window_size")
+        or constants.CHAT_WINDOW_SIZE
+    )
+    resource = last_metadata.get("resource") or "items"
+    fields = last_metadata.get("list_display_fields") or []
+    new_offset = current_offset + window_size
+
+    if new_offset >= len(list_cache):
+        return None
+
+    window, offset, has_more_in_chat = apply_chat_window(
+        list_cache, new_offset, window_size,
+    )
+    summary = build_chat_summary(
+        window,
+        fields,
+        resource=resource,
+        offset=offset,
+        window_size=window_size,
+        total_cached=len(list_cache),
+        total_count=last_metadata.get("count") or len(list_cache),
+        has_more_in_chat=has_more_in_chat,
+    )
+    return {
+        "summary": summary,
+        "window_items": window,
+        "chat_offset": offset,
+        "chat_window_size": window_size,
+        "has_more_in_chat": has_more_in_chat,
+        "list_cache": list_cache,
+        "list_display_fields": fields,
+        "resource": resource,
+        "filters": last_metadata.get("filters", {}),
+        "count": last_metadata.get("count"),
+    }
 
 
 def has_prior_context(conversation_history: Optional[List[Dict[str, Any]]]) -> bool:

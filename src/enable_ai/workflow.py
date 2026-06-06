@@ -23,6 +23,13 @@ from .follow_up_detection import (
     classify_follow_up,
     extract_last_result_metadata,
     should_merge_previous_filters,
+    try_advance_chat_window,
+)
+from .response_projector import (
+    ResponseProjector,
+    apply_chat_window,
+    build_chat_summary,
+    format_projected_table,
 )
 from .query_execution import merge_execution_context
 from .semantic_filters import apply_semantic_filters
@@ -169,6 +176,37 @@ def _analyze_pagination(data: Any) -> Dict[str, Any]:
         info['total_count'] = 1
 
     return info
+
+
+def _accumulate_paginated_results(
+    data: Any,
+    processor: Any,
+    active_schema: Dict[str, Any],
+    access_token: Optional[str],
+    max_items: int = constants.LIST_CACHE_MAX_ITEMS,
+) -> Any:
+    """Merge API pages into data.results for session list_cache (up to max_items)."""
+    if not isinstance(data, dict) or "results" not in data:
+        return data
+    merged = dict(data)
+    merged_results = list(merged.get("results") or [])
+    if not merged.get("next") or len(merged_results) >= max_items:
+        return merged
+    pages = 1
+    while merged.get("next") and len(merged_results) < max_items and pages < constants.SAFETY_MAX_PAGES:
+        page_result = processor._fetch_next_page(
+            merged["next"], active_schema, access_token,
+        )
+        if page_result.get("error"):
+            break
+        next_data = page_result.get("data") or {}
+        if isinstance(next_data.get("results"), list):
+            merged_results.extend(next_data["results"])
+        merged["next"] = next_data.get("next")
+        merged["count"] = next_data.get("count", merged.get("count"))
+        pages += 1
+    merged["results"] = merged_results[:max_items]
+    return merged
 
 
 def _extract_previous_filters(conversation_history: list) -> Dict[str, Any]:
@@ -1037,6 +1075,7 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
         final_data: Any = None
         response: Dict[str, Any] = {}
         summary = ""
+        list_projection = None
 
         if is_multi_step:
             # Summarize multi-step execution
@@ -1259,6 +1298,25 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
                     logger.warning(constants.PAGINATION_SAFETY_CAP_WARNING.format(max_pages=constants.SAFETY_MAX_PAGES))
             # Analyze response to extract accurate counts (Issue #2-4)
             pagination_info = _analyze_pagination(data)
+
+            # v0.3.72: Accumulate pages for session list_cache (chat windows without next_url)
+            list_projection = None
+            if question_type in ("list", "details") and isinstance(data, dict) and "results" in data:
+                if display_mode != "full":
+                    data = _accumulate_paginated_results(
+                        data,
+                        processor,
+                        state.get("active_schema") or {},
+                        state.get("access_token"),
+                    )
+                    pagination_info = _analyze_pagination(data)
+                projector = ResponseProjector(state.get("active_schema") or {})
+                list_projection = projector.prepare_list_display(
+                    data,
+                    parsed.get("resource", ""),
+                    display_mode=display_mode,
+                    chat_offset=0,
+                )
             
             # v0.3.12: Special handling for COUNT questions
             if question_type == "count":
@@ -1405,43 +1463,68 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
             
             has_error = result.get("error") is not None
             
-            # Attempt richer LLM-based formatting for non-count, single-step results
+            # Attempt formatting for non-count, single-step results
             formatted = None
             fmt_format = None
             format_error = None
             if question_type != "count":
-                try:
-                    # BUG FIX (v0.3.36): Pass the actual results array to formatter, not wrapper
-                    # This ensures LLM sees ALL items and can list them all
-                    if isinstance(final_data, dict) and 'results' in final_data:
-                        # Pass the results array directly, with pagination context
-                        format_data = final_data['results']
-                    else:
-                        format_data = final_data if final_data is not None else data
-
-                    fmt = formatter.format_response(
-                        data=format_data,
-                        query=state.get("query", ""),
-                        format_type="auto",
-                        context={
-                            "resource": parsed.get("resource"),
-                            "schema": state.get("active_schema", {}),
-                            "question_type": question_type,
-                            "display_mode": display_mode,
-                            "filters": filters_for_display(parsed),
-                        },
+                resource_name = parsed.get("resource", "items")
+                used_projector = False
+                if list_projection and list_projection.get("list_display_fields"):
+                    window = list_projection["window_items"]
+                    fields = list_projection["list_display_fields"]
+                    summary = build_chat_summary(
+                        window,
+                        fields,
+                        resource=resource_name,
+                        offset=list_projection["chat_offset"],
+                        window_size=list_projection["chat_window_size"],
+                        total_cached=list_projection["total_cached"],
+                        total_count=list_projection["total_count"],
+                        has_more_in_chat=list_projection["has_more_in_chat"],
                     )
-                    if fmt.get("summary"):
-                        summary = fmt["summary"]
+                    formatted = format_projected_table(window, fields, resource=resource_name)
+                    fmt_format = "table"
+                    used_projector = True
+                    if isinstance(final_data, dict):
+                        final_data = {
+                            **final_data,
+                            "results": window,
+                            "shown_count": len(window),
+                        }
+                if not used_projector:
+                    try:
+                        if list_projection and display_mode != "full":
+                            format_data = list_projection["window_items"]
+                        elif isinstance(final_data, dict) and 'results' in final_data:
+                            format_data = final_data['results']
+                        else:
+                            format_data = final_data if final_data is not None else data
 
-                    # v0.3.37: Fix JSON wrapper issue - extract clean text
-                    summary = _unwrap_json_response(summary)
-
-                    formatted = fmt.get("formatted")
-                    fmt_format = fmt.get("format")
-                except Exception as e:
-                    logger.error("ResponseFormatter (single-step) failed: %s", e)
-                    format_error = str(e)
+                        fmt = formatter.format_response(
+                            data=format_data,
+                            query=state.get("query", ""),
+                            format_type="auto",
+                            context={
+                                "resource": resource_name,
+                                "schema": state.get("active_schema", {}),
+                                "question_type": question_type,
+                                "display_mode": display_mode,
+                                "filters": filters_for_display(parsed),
+                                "list_display_fields": (
+                                    list_projection.get("list_display_fields")
+                                    if list_projection else None
+                                ),
+                            },
+                        )
+                        if fmt.get("summary"):
+                            summary = fmt["summary"]
+                        summary = _unwrap_json_response(summary)
+                        formatted = fmt.get("formatted")
+                        fmt_format = fmt.get("format")
+                    except Exception as e:
+                        logger.error("ResponseFormatter (single-step) failed: %s", e)
+                        format_error = str(e)
 
             # v0.3.37: Add filter warnings if any
             filter_warnings = state.get("filter_warnings", [])
@@ -1485,6 +1568,8 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
         last_result_metadata = build_session_metadata(
             parsed,
             {"data": session_data, "pagination": pagination_info},
+            schema=state.get("active_schema"),
+            projection=list_projection,
         )
 
         # v0.3.37: Log to tracer and save
@@ -1556,6 +1641,56 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
 
         # Handle based on follow-up type
         if follow_up_type == "next_page":
+            active_schema = state.get("active_schema") or {}
+            chat_step = requested_limit or last_metadata.get("chat_window_size")
+            chat_advance = try_advance_chat_window(last_metadata, chat_step)
+            if chat_advance:
+                pagination_info = {
+                    "total_count": chat_advance.get("count") or len(chat_advance["list_cache"]),
+                    "actual_count": len(chat_advance["window_items"]),
+                    "has_more": chat_advance["has_more_in_chat"] or bool(last_metadata.get("next_url")),
+                    "next_url": last_metadata.get("next_url"),
+                }
+                parsed_ctx = {
+                    "intent": "read",
+                    "resource": chat_advance["resource"],
+                    "filters": chat_advance.get("filters", {}),
+                    "display_mode": "summary",
+                    "question_type": "list",
+                }
+                projection = {
+                    "list_cache": chat_advance["list_cache"],
+                    "chat_offset": chat_advance["chat_offset"],
+                    "chat_window_size": chat_advance["chat_window_size"],
+                    "list_display_fields": chat_advance["list_display_fields"],
+                    "has_more_in_chat": chat_advance["has_more_in_chat"],
+                    "total_cached": len(chat_advance["list_cache"]),
+                }
+                response = enrich_response_with_follow_ups({
+                    "success": True,
+                    "data": {"results": chat_advance["window_items"]},
+                    "summary": chat_advance["summary"],
+                    "formatted": format_projected_table(
+                        chat_advance["window_items"],
+                        chat_advance["list_display_fields"],
+                        resource=chat_advance["resource"],
+                    ) if chat_advance["list_display_fields"] else None,
+                    "format": "table" if chat_advance["list_display_fields"] else "text",
+                    "query": query,
+                    "display_mode": "summary",
+                    "pagination": pagination_info,
+                    "total_steps": 0,
+                    "schema_type": active_schema.get("type"),
+                }, pagination_info, parsed_ctx, chat_advance["window_items"])
+                last_meta = build_session_metadata(
+                    parsed_ctx, response, schema=active_schema, projection=projection,
+                )
+                return {
+                    "is_follow_up": True,
+                    "response": response,
+                    "last_result_metadata": last_meta,
+                }
+
             next_url = last_metadata.get("next_url")
             if next_url:
                 # Fetch next page using the stored URL
@@ -1621,6 +1756,32 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
                         "limit": requested_limit,  # v0.3.40: Pass limit for summary
                     }
 
+                    page_projection = None
+                    if isinstance(data, dict) and "results" in data:
+                        merged_cache = list(last_metadata.get("list_cache") or [])
+                        prior_len = len(merged_cache)
+                        projector = ResponseProjector(active_schema)
+                        new_proj = projector.prepare_list_display(
+                            data,
+                            last_metadata.get("resource", "items"),
+                            display_mode="summary",
+                            chat_offset=0,
+                        )
+                        merged_cache.extend(new_proj.get("list_cache") or [])
+                        window, off, has_more_chat = apply_chat_window(
+                            merged_cache,
+                            prior_len,
+                            new_proj["chat_window_size"],
+                        )
+                        page_projection = {
+                            **new_proj,
+                            "list_cache": merged_cache,
+                            "window_items": window,
+                            "chat_offset": off,
+                            "has_more_in_chat": has_more_chat or bool(pagination_info.get("next_url")),
+                            "total_cached": len(merged_cache),
+                        }
+
                     return {
                         "is_follow_up": True,
                         "parsed": parsed,
@@ -1631,13 +1792,12 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
                             "result": data,
                             "status": "success",
                         }],
-                        "last_result_metadata": {
-                            "resource": last_metadata.get("resource"),
-                            "filters": last_metadata.get("filters", {}),
-                            "count": pagination_info.get("total_count", 0),
-                            "has_more": pagination_info.get("has_more", False),
-                            "next_url": pagination_info.get("next_url"),
-                        },
+                        "last_result_metadata": build_session_metadata(
+                            parsed,
+                            {"data": data, "pagination": pagination_info},
+                            schema=active_schema,
+                            projection=page_projection,
+                        ),
                         # Skip to summarize
                         "execution_plan": {"steps": [{"step_id": 1}], "is_multi_step": False},
                         "current_step": 1,

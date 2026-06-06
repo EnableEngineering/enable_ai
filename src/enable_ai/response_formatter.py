@@ -471,6 +471,8 @@ REMEMBER: Include ALL {data_count} items in your response!
             display_field = self._get_display_field_from_context(context)
             if display_field:
                 analysis["display_field"] = display_field
+            if context.get("list_display_fields"):
+                analysis["list_display_fields"] = context["list_display_fields"]
         
         return analysis
 
@@ -712,8 +714,14 @@ Provide a concise, accurate summary that answers what the user asked and reflect
         if not isinstance(first_item, dict):
             return self._format_concise(data, query, analysis)
 
-        # Select most relevant fields (max 6)
-        fields = self._select_important_fields(first_item, query)[: constants.TABLE_FIELDS_MAX]
+        # Prefer schema-driven display fields when provided in context
+        ctx_fields = (analysis.get("list_display_fields") or []) if isinstance(analysis, dict) else []
+        if ctx_fields:
+            fields = [f for f in ctx_fields if f in first_item or "." in f][: constants.TABLE_FIELDS_MAX]
+            if not fields:
+                fields = ctx_fields[: constants.TABLE_FIELDS_MAX]
+        else:
+            fields = self._select_important_fields(first_item, query)[: constants.TABLE_FIELDS_MAX]
 
         # If we have a display_field hint, ensure it is the first column
         display_field = analysis.get("display_field")

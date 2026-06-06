@@ -98,6 +98,12 @@ LLM_DATA_PREVIEW_2000 = 2000
 TABLE_FIELD_PREVIEW = 50
 # Max rows in code-built markdown tables (LLM tables are replaced by _format_as_table)
 TABLE_ROW_SAMPLE = _env_int("ENABLE_AI_TABLE_ROW_SAMPLE", 50)
+
+# Chat window: rows shown per assistant turn (summary display_mode)
+CHAT_WINDOW_SIZE = _env_int("ENABLE_AI_CHAT_WINDOW_SIZE", 10)
+
+# Max items to retain in session list_cache (fetch pages until cap)
+LIST_CACHE_MAX_ITEMS = _env_int("ENABLE_AI_LIST_CACHE_MAX", 500)
 # Use deterministic table format for list responses (1=always table for lists, 0=LLM chooses)
 LIST_FORMAT_TABLE = _env_int("ENABLE_AI_LIST_FORMAT_TABLE", 1)
 TABLE_FIELDS_MAX = 6
