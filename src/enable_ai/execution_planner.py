@@ -8,6 +8,7 @@ Handles dependency resolution and sequential execution ordering.
 import json
 from typing import Dict, Any, Optional, List
 
+from .hint_utils import expand_query_resources
 from .utils import get_openai_client, setup_logger, DETERMINISTIC_TEMP
 from .query_execution import enrich_step_from_parsed, merge_execution_context
 from .user_context_resolver import is_user_id_placeholder, is_company_id_placeholder
@@ -76,12 +77,24 @@ class ExecutionPlanner:
                 "total_steps": 1,
             }
 
+        parsed_query = expand_query_resources(parsed_query, parsed_query.get("original_input", ""), schema)
+
         # Smart FK detection - auto-generate lookup steps if needed
         fk_lookups = self._detect_fk_lookups_needed(parsed_query, schema)
 
         if fk_lookups:
             self.logger.info(f"Auto-detected FK lookups needed: {[l['field'] for l in fk_lookups]}")
             return self._build_fk_lookup_plan(parsed_query, fk_lookups, schema)
+
+        # Multi-resource count ("how many X and Y")
+        multi_count = self._plan_multi_resource_count(parsed_query)
+        if multi_count:
+            return multi_count
+
+        # Parent → child relationship (e.g. observations for my last report)
+        rel_plan = self._plan_relationship_query(parsed_query)
+        if rel_plan:
+            return rel_plan
 
         # Check if query requires multiple steps
         requires_multiple_steps = self._analyze_complexity(parsed_query)
@@ -304,6 +317,92 @@ class ExecutionPlanner:
         
         return False
     
+    def _plan_multi_resource_count(self, parsed_query: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Build parallel count steps for multiple_resources queries."""
+        multiple = parsed_query.get("multiple_resources", [])
+        if not isinstance(multiple, list) or len(multiple) < 2:
+            return None
+        if parsed_query.get("question_type") != "count":
+            return None
+
+        steps = []
+        for i, res in enumerate(multiple):
+            steps.append(enrich_step_from_parsed({
+                "step_id": i + 1,
+                "intent": parsed_query.get("intent", "read"),
+                "resource": res,
+                "entities": parsed_query.get("entities", {}),
+                "filters": parsed_query.get("filters", {}),
+                "depends_on": [],
+                "description": f"Count {res}",
+                "question_type": "count",
+            }, parsed_query))
+
+        self.logger.info("Multi-resource count plan: %s", multiple)
+        return {
+            "steps": steps,
+            "is_multi_step": True,
+            "total_steps": len(steps),
+            "plan_type": "multi_resource_count",
+        }
+
+    def _plan_relationship_query(self, parsed_query: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """
+        Deterministic parent→child plan when parser outputs relationships.
+
+        Step 1 fetches the parent (with sort/limit). Step 2 fetches the child
+        using the parent's id from step 1.
+        """
+        relationships = parsed_query.get("relationships") or []
+        if not relationships:
+            return None
+
+        parent_resource = parsed_query.get("resource")
+        if not parent_resource:
+            return None
+
+        rel = relationships[0]
+        child_resource = rel.get("target_entity")
+        if not child_resource:
+            return None
+
+        step1 = enrich_step_from_parsed({
+            "step_id": 1,
+            "intent": parsed_query.get("intent", "read"),
+            "resource": parent_resource,
+            "entities": parsed_query.get("entities", {}),
+            "filters": parsed_query.get("filters", {}),
+            "depends_on": [],
+            "extract": {"parent_id": "$.results[0].id"},
+            "description": f"Fetch {parent_resource} for child lookup",
+        }, parsed_query)
+
+        child_entities = dict(parsed_query.get("entities", {}))
+        child_entities["id"] = "{parent_id}"
+        child_filters = dict(rel.get("filters") or {})
+        child_filters["id"] = {"operator": "equals", "value": "{parent_id}"}
+
+        step2 = enrich_step_from_parsed({
+            "step_id": 2,
+            "intent": "read",
+            "resource": child_resource,
+            "entities": child_entities,
+            "filters": child_filters,
+            "depends_on": [1],
+            "description": f"Fetch {child_resource} for parent",
+        }, parsed_query)
+
+        self.logger.info(
+            "Relationship plan: %s → %s (type=%s)",
+            parent_resource, child_resource, rel.get("type"),
+        )
+        return {
+            "steps": [step1, step2],
+            "is_multi_step": True,
+            "total_steps": 2,
+            "plan_type": "parent_child",
+        }
+
     def _create_single_step(
         self, 
         parsed_query: Dict[str, Any], 

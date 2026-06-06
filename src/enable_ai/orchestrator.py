@@ -881,10 +881,12 @@ class APIOrchestrator:
 
         step_parsed = parsed
         if user_context:
+            hints = (schema or {}).get("resource_hints") or {}
             step_parsed = resolve_user_context_in_parsed(
                 parsed,
                 user_context,
                 parsed.get("original_input") or "",
+                resource_hints=hints,
             )
 
         filters = dedupe_fk_lookup_filters(step_parsed.get("filters") or {})

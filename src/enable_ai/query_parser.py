@@ -340,6 +340,7 @@ OUTPUT FORMAT (JSON):
     "display_mode": "summary|full|detailed",
     "merge_with_previous": true|false,
     "question_type": "count|list|details",
+    "multiple_resources": ["resource_a", "resource_b"],
     "use_next_page": true|false,
     "next_page_url": "url or omit"
 }
@@ -481,6 +482,18 @@ Output: {
     "display_mode": "detailed"
 }
 NOTE: The user is asking to SEE the actual items - set question_type="list" and display_mode="detailed", NOT question_type="count"!
+
+Example 9 - Multi-resource count ("X and Y"):
+Query: "how many flash and detailed reports are there?"
+Output: {
+    "intent": "read",
+    "resource": "flash-reports",
+    "multiple_resources": ["flash-reports", "details-reports"],
+    "entities": {},
+    "filters": {},
+    "question_type": "count"
+}
+NOTE: When the user asks for counts across multiple resources joined by "and", populate multiple_resources with each resource name from the schema.
 
 Return ONLY the JSON object, no explanations or markdown.
 """

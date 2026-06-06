@@ -27,7 +27,11 @@ from .follow_up_detection import (
 from .query_execution import merge_execution_context
 from .semantic_filters import apply_semantic_filters
 from .response_envelope import enrich_api_response
-from .user_context_resolver import resolve_params_dict, resolve_user_context_in_parsed
+from .user_context_resolver import (
+    filters_for_display,
+    resolve_params_dict,
+    resolve_user_context_in_parsed,
+)
 from . import constants
 
 # Module-level logger
@@ -235,17 +239,29 @@ def _extract_previous_entities(conversation_history: list) -> Dict[str, Any]:
 
 def _extract_by_path(data: Any, path: str) -> Any:
     """
-    Extract a value from dict/list using a simple path (e.g. $.id, $.data.user_id).
-    Supports $.key and $.key1.key2; no array indexing for v1.
+    Extract a value using JSONPath-like syntax (e.g. $.id, $.results[0].id).
     """
-    if not path.startswith("$.") or not isinstance(data, dict):
+    if not path.startswith("$."):
         return None
-    keys = path[2:].strip().split(".")
+    segments = path[2:].strip().split(".")
     current = data
-    for k in keys:
-        if not isinstance(current, dict) or k not in current:
+    for seg in segments:
+        if current is None:
             return None
-        current = current[k]
+        match = re.match(r"^([^\[]+)(?:\[(\d+)\])?$", seg)
+        if not match:
+            return None
+        key, idx = match.group(1), match.group(2)
+        if not isinstance(current, dict) or key not in current:
+            return None
+        current = current[key]
+        if idx is not None:
+            if not isinstance(current, list):
+                return None
+            i = int(idx)
+            if i >= len(current):
+                return None
+            current = current[i]
     return current
 
 
@@ -286,6 +302,13 @@ def _resolve_step_dependencies(
             for key, value in last_result.items():
                 if key not in variables:
                     variables[key] = value
+            # Paginated list responses: expose first item id as parent_id / id
+            results = last_result.get("results")
+            if isinstance(results, list) and results and isinstance(results[0], dict):
+                first_id = results[0].get("id")
+                if first_id is not None:
+                    variables.setdefault("parent_id", first_id)
+                    variables.setdefault("id", first_id)
 
     # Substitute {variable_name} in the step definition
     step_json = json.dumps(resolved)
@@ -656,6 +679,7 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
                 state.get("user_context"),
                 query_text,
                 follow_up_classification=follow_up_classification,
+                resource_hints=resource_hints,
             )
 
             # Semantic filters (idempotent) — covers classify shortcut that skips LLM parse
@@ -740,11 +764,13 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
 
         user_context = state.get("user_context")
         if user_context:
+            active_hints = (state.get("active_schema") or {}).get("resource_hints") or {}
             resolved_step = resolve_user_context_in_parsed(
                 resolved_step,
                 user_context,
                 state.get("query") or "",
                 follow_up_classification=state.get("follow_up_classification"),
+                resource_hints=active_hints,
             )
 
         # Convert step to API plan format
@@ -987,6 +1013,62 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
             # Summarize multi-step execution
             all_data = [sr.get("result") for sr in step_results if sr.get("status") == "success"]
             has_error = any(sr.get("status") == "failed" for sr in step_results)
+
+            # Multi-resource count: sum counts from each step
+            if execution_plan.get("plan_type") == "multi_resource_count" and question_type == "count":
+                total_count = 0
+                parts = []
+                for sr in step_results:
+                    if sr.get("status") != "success":
+                        continue
+                    step_data = sr.get("result")
+                    count = _api_total_count(step_data)
+                    if count is None and isinstance(step_data, dict) and "results" in step_data:
+                        count = len(step_data.get("results") or [])
+                    elif count is None and isinstance(step_data, list):
+                        count = len(step_data)
+                    count = count or 0
+                    total_count += count
+                    res_name = (sr.get("step_description") or "").replace("Count ", "")
+                    parts.append(f"{count} {res_name.replace('-', ' ')}")
+
+                if parts:
+                    summary = f"There are {total_count} total ({', '.join(parts)})."
+                else:
+                    summary = f"There are {total_count} items total."
+
+                pagination_info = {"total_count": total_count, "actual_count": total_count, "has_more": False}
+                response = enrich_response_with_follow_ups({
+                    "success": not has_error,
+                    "data": {"count": total_count, "breakdown": parts},
+                    "summary": summary,
+                    "query": state.get("query"),
+                    "question_type": "count",
+                    "display_mode": "count",
+                    "pagination": pagination_info,
+                    "total_steps": len(step_results),
+                    "schema_type": state.get("active_schema", {}).get("type"),
+                }, pagination_info, parsed, all_data[-1] if all_data else None)
+
+                if tracker:
+                    tracker.update(ProgressStage.COMPLETED, f"Done! Found {total_count} items ✓")
+
+                response = enrich_api_response(
+                    response,
+                    {
+                        "parsed": parsed,
+                        "step_results": step_results,
+                        "filter_warnings": state.get("filter_warnings", []),
+                        "result": result,
+                    },
+                )
+                last_result_metadata = build_session_metadata(parsed, response)
+                return {
+                    "summary": summary,
+                    "response": response,
+                    "last_result_metadata": last_result_metadata,
+                    "parsed": parsed,
+                }
             
             # v0.3.9: Better handling of display_mode for multi-step
             if display_mode == "full":
@@ -1272,7 +1354,7 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
                             "schema": state.get("active_schema", {}),
                             "question_type": question_type,
                             "display_mode": display_mode,
-                            "filters": parsed.get("filters", {}),
+                            "filters": filters_for_display(parsed),
                         },
                     )
                     if fmt.get("summary"):

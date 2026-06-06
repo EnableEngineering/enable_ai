@@ -9,6 +9,7 @@ import hashlib
 import json
 from typing import Any, Dict, List, Optional
 
+from .hint_utils import get_user_scoped_fields
 from .utils import get_openai_client, setup_logger, DETERMINISTIC_TEMP
 
 logger = setup_logger("enable_ai.follow_up_detection")
@@ -317,17 +318,6 @@ def _filter_values_equal(a: Any, b: Any) -> bool:
     return val_a == val_b
 
 
-def _get_user_scoped_fields(resource: str, resource_hints: Dict[str, Any]) -> List[str]:
-    """Get user-scoped field names from resource_hints.__user_scoped_fields__."""
-    if not resource or not resource_hints:
-        return []
-    hints = resource_hints.get(resource) or {}
-    if not isinstance(hints, dict):
-        return []
-    fields = hints.get("__user_scoped_fields__") or []
-    return list(fields) if isinstance(fields, (list, tuple)) else []
-
-
 def strip_inherited_session_filters(
     parsed: Dict[str, Any],
     conversation_history: Optional[List[Dict[str, Any]]],
@@ -348,7 +338,7 @@ def strip_inherited_session_filters(
     user_id = (user_context or {}).get("user_id")
     if user_id is not None and resource_hints:
         resource = result.get("resource") or meta.get("resource") or ""
-        user_scoped_fields = _get_user_scoped_fields(resource, resource_hints)
+        user_scoped_fields = get_user_scoped_fields(resource, resource_hints)
         for field in user_scoped_fields:
             if field in filters:
                 field_val = filters[field]

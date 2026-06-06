@@ -7,11 +7,13 @@ are replaced with the real ID instead of triggering FK lookup API calls.
 
 from typing import Any, Dict, Optional, Set
 
+from .hint_utils import get_user_scoped_fields, query_implies_user_scope
 from .utils import setup_logger
 
 logger = setup_logger("enable_ai.user_context_resolver")
 
-PRONOUN_MARKERS = ("assigned to me", " my ", " me ", "mine", " my,", "for me")
+# Legacy export for param_validator; prefer query_implies_user_scope()
+PRONOUN_MARKERS = ("assigned to me", " my ", "for me", "mine")
 
 USER_ID_PLACEHOLDERS: Set[str] = {
     "__current_user_id__",
@@ -153,9 +155,48 @@ def _resolve_filter_entry(
     return resolved if resolved != fval else fval
 
 
-def _query_needs_user_filter(query: str) -> bool:
-    q_lower = (query or "").lower()
-    return any(m in q_lower for m in PRONOUN_MARKERS)
+def _filter_display_value(val: Any) -> Any:
+    if isinstance(val, dict):
+        return val.get("value", val)
+    return val
+
+
+def _sync_entities_to_filters(filters: Dict[str, Any], entities: Dict[str, Any]) -> Dict[str, Any]:
+    """Keep filters in sync with resolved entity values for display and execution."""
+    synced = dict(filters)
+    for field, entity_val in entities.items():
+        if field not in synced:
+            continue
+        fval = synced[field]
+        if isinstance(fval, dict):
+            synced[field] = {**fval, "value": entity_val}
+        else:
+            synced[field] = entity_val
+    return synced
+
+
+def filters_for_display(parsed: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Return filters with resolved values for user-facing messages.
+
+    Prefers resolved entities over placeholder values still in filters.
+    """
+    if not isinstance(parsed, dict):
+        return {}
+    filters = dict(parsed.get("filters") or {})
+    entities = parsed.get("entities") or {}
+    for field, entity_val in entities.items():
+        if field in filters:
+            fval = filters[field]
+            display = _filter_display_value(fval)
+            if is_user_id_placeholder(display) or is_company_id_placeholder(display):
+                if isinstance(fval, dict):
+                    filters[field] = {**fval, "value": entity_val}
+                else:
+                    filters[field] = entity_val
+        elif entity_val is not None:
+            filters[field] = entity_val
+    return filters
 
 
 def resolve_params_dict(
@@ -199,11 +240,13 @@ def resolve_user_context_in_parsed(
     user_context: Optional[Dict[str, Any]],
     query: str = "",
     follow_up_classification: Optional[Dict[str, Any]] = None,
+    resource_hints: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     Replace user/company placeholders with IDs from user_context.
 
-    Also injects technician=user_id when the query uses pronouns but no user filter exists.
+    Injects user-scoped filters only when the query implies user ownership
+    (not imperative "show me") and the resource defines __user_scoped_fields__.
     Skips injection on reset/standalone queries and item-referent follow-ups.
     """
     if not isinstance(parsed, dict) or not user_context:
@@ -247,16 +290,25 @@ def resolve_user_context_in_parsed(
                 field, resolved, user_id,
             )
 
-    # Inject technician filter for pronoun queries when not already set
-    if not skip_injection and user_id is not None and _query_needs_user_filter(query):
-        user_field = "technician"
-        if user_field not in filters and user_field not in entities:
-            filters[user_field] = {"operator": "equals", "value": user_id}
-            logger.info(
-                "Injected %s=%s from user_context for pronoun query",
-                user_field, user_id,
-            )
+    # Inject user-scoped filters only for resources that declare them
+    resource = result.get("resource", "")
+    scoped_fields = get_user_scoped_fields(resource, resource_hints or {})
+    if (
+        not skip_injection
+        and user_id is not None
+        and scoped_fields
+        and query_implies_user_scope(query)
+    ):
+        for user_field in scoped_fields:
+            if user_field not in filters and user_field not in entities:
+                filters[user_field] = {"operator": "equals", "value": user_id}
+                entities[user_field] = user_id
+                logger.info(
+                    "Injected %s=%s from user_context for user-scoped query (resource=%s)",
+                    user_field, user_id, resource,
+                )
 
+    filters = _sync_entities_to_filters(filters, entities)
     result["filters"] = filters
     result["entities"] = entities
     return result

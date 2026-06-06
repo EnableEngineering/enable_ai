@@ -1159,6 +1159,9 @@ Summarize accurately from the data above only.
         context = context or {}
         resource = context.get("resource", "items")
         filters = context.get("filters", {})
+        if not filters and context.get("parsed"):
+            from .user_context_resolver import filters_for_display
+            filters = filters_for_display(context["parsed"])
         schema = context.get("schema", {})
         resource_hints = schema.get("resource_hints", {}).get(resource, {}) if schema else {}
 
@@ -1238,6 +1241,26 @@ Summarize accurately from the data above only.
         if not has_more and returned == total:
             if total > 0:
                 summary += f"\n\n✅ Showing all {total} result(s)."
+            return summary
+
+        # Partial page: clarify total vs shown (count vs list consistency)
+        if total > returned > 0:
+            resource = context.get("resource", "items") if context else "items"
+            summary += (
+                f"\n\n📊 There are {total} {resource} "
+                f"(showing first {returned})."
+            )
+            if has_more:
+                pagination_info = {
+                    "total_count": total,
+                    "actual_count": returned,
+                    "has_more": has_more,
+                }
+                follow_ups = generate_follow_up_queries(pagination_info, context)
+                if follow_ups:
+                    summary += f"\n\n💡 **To see more:**"
+                    for item in follow_ups:
+                        summary += f"\n  • \"{item['query']}\" - {item['label']}"
             return summary
 
         # More data available - ALWAYS inform user (aligned with follow_up_queries templates)

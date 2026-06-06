@@ -7,7 +7,8 @@ No extra LLM calls — uses SchemaIntrospector and resource_hints already in the
 from typing import Any, Dict, List, Optional, Tuple
 
 from .schema_introspector import SchemaIntrospector
-from .user_context_resolver import PRONOUN_MARKERS, resolve_user_context_in_parsed
+from .user_context_resolver import resolve_user_context_in_parsed
+from .hint_utils import query_implies_user_scope
 from .utils import setup_logger
 
 logger = setup_logger("enable_ai.param_validator")
@@ -77,8 +78,11 @@ def validate_parsed(
             result.pop("limit", None)
 
     # Resolve __current_user_id__ before schema validation (placeholders are not real values)
+    hints = schema.get("resource_hints") or {}
     if user_context:
-        result = resolve_user_context_in_parsed(result, user_context, query)
+        result = resolve_user_context_in_parsed(
+            result, user_context, query, resource_hints=hints,
+        )
 
     # Validate filter values via introspector
     resource = result.get("resource", "")
@@ -99,8 +103,7 @@ def validate_parsed(
         result["filters"] = repaired_filters
 
     # Pronouns without user context → ask for clarification
-    q_lower = (query or "").lower()
-    if not user_context and any(m in q_lower for m in PRONOUN_MARKERS):
+    if not user_context and query_implies_user_scope(query):
         if result.get("question_type") != "needs_clarification":
             clarification = (
                 "This query refers to you ('me' / 'my') but no user context was provided. "
