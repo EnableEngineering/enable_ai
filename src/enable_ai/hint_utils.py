@@ -317,3 +317,114 @@ def expand_aggregate_follow_up(
         result["resource"] = agg[0]
 
     return result
+
+
+def find_explicit_resources_in_query(
+    query: str,
+    resource_hints: Dict[str, Any],
+    schema_resources: Set[str],
+) -> List[str]:
+    """Resources explicitly named in the query (schema + virtual hint keys)."""
+    if not query:
+        return []
+    found: Set[str] = set(find_mentioned_resources(query, resource_hints, schema_resources))
+    q = query.lower()
+    for name, hints in (resource_hints or {}).items():
+        if not isinstance(hints, dict):
+            continue
+        terms = [name, name.replace("-", " ")]
+        syns = hints.get("__resource_synonyms__") or []
+        if isinstance(syns, list):
+            terms.extend(str(s) for s in syns)
+        elif syns:
+            terms.append(str(syns))
+        if any(_term_in_query(t, q) for t in terms if t):
+            found.add(name)
+    return sorted(found)
+
+
+def should_force_standalone_for_resource_switch(
+    query: str,
+    prior_meta: Dict[str, Any],
+    resource_hints: Dict[str, Any],
+    schema_resources: Set[str],
+) -> bool:
+    """
+    Force standalone when the query explicitly names a different resource scope.
+
+    Covers: users → service-orders, aggregate reports → detailed reports only.
+    """
+    if not prior_meta.get("resource"):
+        return False
+
+    mentioned = find_explicit_resources_in_query(query, resource_hints, schema_resources)
+    if not mentioned:
+        return False
+
+    prev = prior_meta.get("resource")
+    prev_multi = prior_meta.get("multiple_resources") or []
+
+    if len(mentioned) == 1:
+        target = mentioned[0]
+        if len(prev_multi) > 1 and target in prev_multi:
+            return True
+        if target != prev and target not in prev_multi:
+            return True
+
+    if len(mentioned) > 1 and set(mentioned) != set(prev_multi):
+        return True
+
+    return False
+
+
+def apply_count_default_filters(
+    parsed: Dict[str, Any],
+    query: str,
+    resource_hints: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    Apply __count_default_filters__ when question_type=count and query
+    does not explicitly mention the excluded values (e.g. archived).
+    """
+    if not isinstance(parsed, dict) or parsed.get("question_type") != "count":
+        return parsed
+
+    resource = parsed.get("resource", "")
+    hints = (resource_hints or {}).get(resource) or {}
+    if not isinstance(hints, dict):
+        return parsed
+
+    defaults = hints.get("__count_default_filters__") or {}
+    if not defaults:
+        return parsed
+
+    q_lower = (query or "").lower()
+    result = dict(parsed)
+    filters = dict(result.get("filters") or {})
+
+    for field, fval in defaults.items():
+        if field in filters:
+            continue
+        excluded = fval.get("value") if isinstance(fval, dict) else fval
+        if excluded is not None and str(excluded).lower() in q_lower:
+            continue
+        field_hints = hints.get(field) or {}
+        skip = False
+        if isinstance(field_hints, dict):
+            for phrase in (field_hints.get("synonyms") or {}).keys():
+                if phrase and str(phrase).lower() in q_lower:
+                    skip = True
+                    break
+            if not skip:
+                for val in field_hints.get("values") or []:
+                    if val is not None and str(val).lower() in q_lower:
+                        skip = True
+                        break
+        if skip:
+            continue
+        filters[field] = fval if isinstance(fval, dict) else {
+            "operator": "equals", "value": fval,
+        }
+
+    result["filters"] = filters
+    return result

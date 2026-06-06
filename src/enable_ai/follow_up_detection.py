@@ -7,10 +7,14 @@ continues or refines the previous conversation turn.
 
 import hashlib
 import json
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 from . import constants
-from .hint_utils import expand_aggregate_follow_up, get_user_scoped_fields
+from .hint_utils import (
+    expand_aggregate_follow_up,
+    get_user_scoped_fields,
+    should_force_standalone_for_resource_switch,
+)
 from .response_projector import (
     apply_chat_window,
     build_chat_summary,
@@ -248,6 +252,8 @@ def _clean_history_for_prompt(conversation_history: List[Dict[str, Any]]) -> Lis
 def classify_follow_up(
     query: str,
     conversation_history: Optional[List[Dict[str, Any]]] = None,
+    resource_hints: Optional[Dict[str, Any]] = None,
+    schema_resources: Optional[Set[str]] = None,
 ) -> Dict[str, Any]:
     """
     Use LLM to classify whether query is a follow-up and how to route it.
@@ -321,6 +327,10 @@ Decide:
    - After question_type=list: pagination/subset/detail queries stay follow-ups when scope is unchanged
 6. If the query refers to a specific prior item via pronoun/deixis, set referent from PREVIOUS RESULT ITEMS (id, resource)
 7. Decide follow-up vs standalone from meaning, not resource name — same resource + different filters = standalone
+8. RESOURCE SWITCH → STANDALONE:
+   - Query explicitly names a different resource than previous (e.g. prior users → "service orders") → STANDALONE
+   - Prior aggregate count (multiple_resources) and query names ONE child type (e.g. "how many detailed reports?") → STANDALONE
+   - Vague deixis only ("those", "them") without naming a resource → may stay follow-up
 
 Return JSON only:
 {{
@@ -374,6 +384,16 @@ Return JSON only:
     except Exception as exc:
         logger.warning("Follow-up LLM classification failed: %s — treating as standalone", exc)
         result = default
+
+    if prior_meta and resource_hints is not None:
+        resources = schema_resources or set()
+        if should_force_standalone_for_resource_switch(
+            query.strip(), prior_meta, resource_hints, resources,
+        ):
+            logger.info(
+                "Forcing standalone: query names different resource scope than prior turn",
+            )
+            result = dict(default)
 
     logger.info(
         "Follow-up classification: is_follow_up=%s type=%s merge=%s keep_resource=%s referent=%s",

@@ -144,7 +144,10 @@ class QueryParser:
                 follow_up_clf = follow_up_classification
                 if follow_up_clf is None:
                     follow_up_clf = classify_follow_up(
-                        natural_language_input, conversation_history,
+                        natural_language_input,
+                        conversation_history,
+                        resource_hints=schema.get("resource_hints"),
+                        schema_resources=set((schema.get("resources") or {}).keys()),
                     )
                 follow_up_type = follow_up_clf.get("follow_up_type")
                 has_referent = bool(follow_up_clf.get("referent"))

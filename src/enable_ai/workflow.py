@@ -503,8 +503,12 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
         # v0.3.37: Detect follow-up queries
         query_text = state.get("query") or ""
         conversation_history = state.get("conversation_history") or []
+        active_schema_for_clf = state.get("active_schema") or {}
         follow_up_classification = state.get("follow_up_classification") or classify_follow_up(
-            query_text, conversation_history,
+            query_text,
+            conversation_history,
+            resource_hints=active_schema_for_clf.get("resource_hints"),
+            schema_resources=set((active_schema_for_clf.get("resources") or {}).keys()),
         )
         is_follow_up = follow_up_classification.get("is_follow_up", False)
         last_metadata = state.get("last_result_metadata")
@@ -1697,7 +1701,13 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
         tracker = state.get("progress_tracker")
 
         # LLM classifies whether this query continues the previous turn
-        follow_up_classification = classify_follow_up(query, conversation_history)
+        active_schema = state.get("active_schema") or {}
+        follow_up_classification = classify_follow_up(
+            query,
+            conversation_history,
+            resource_hints=active_schema.get("resource_hints"),
+            schema_resources=set((active_schema.get("resources") or {}).keys()),
+        )
         is_follow_up = follow_up_classification.get("is_follow_up", False)
 
         if not is_follow_up:

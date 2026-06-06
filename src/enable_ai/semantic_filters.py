@@ -9,6 +9,7 @@ No hardcoded phrases or field names.
 import re
 from typing import Any, Dict, List, Optional, Tuple
 
+from .hint_utils import apply_count_default_filters
 from .query_normalize import strip_quotes_for_matching
 from .utils import setup_logger
 
@@ -141,4 +142,5 @@ def apply_semantic_filters(
         strip_quotes_for_matching(query),
         hints,
     )
+    result = apply_count_default_filters(result, query, hints)
     return result
