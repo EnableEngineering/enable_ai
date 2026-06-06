@@ -225,3 +225,46 @@ def test_pagination_still_detected(mock_client):
 
     assert is_follow_up_query("show me more", []) is True
     assert classify_follow_up("show me more", [])["follow_up_type"] == "next_page"
+
+
+# Regression test for v0.3.68 bug: same resource + different filters = standalone
+DIFFERENT_FILTER_STANDALONE = {
+    "is_follow_up": False,
+    "follow_up_type": "standalone",
+    "merge_with_previous": False,
+    "keep_previous_resource": False,
+    "question_type_override": None,
+    "display_mode_override": None,
+    "referent": None,
+}
+
+
+@patch("enable_ai.follow_up_detection.get_openai_client")
+def test_same_resource_different_filters_is_standalone(mock_client):
+    """
+    Bug fix: 'low priority service orders' after 'new service orders' should be standalone.
+    Same resource but different filter scope = no merge.
+    """
+    clear_classification_cache()
+    mock_client.return_value.parse_json_response.return_value = DIFFERENT_FILTER_STANDALONE
+
+    history_new_orders = [
+        {"role": "user", "content": "Show me new service orders assigned to me"},
+        {
+            "role": "assistant",
+            "content": "Found 5 new service orders",
+            "metadata": {
+                "resource": "service-orders",
+                "filters": {
+                    "status__name": {"operator": "equals", "value": "New"},
+                    "technician": {"operator": "equals", "value": 17},
+                },
+            },
+        },
+    ]
+
+    # Query about low priority — different filter scope, should NOT inherit status__name=New
+    clf = classify_follow_up("Which service orders are in low priority?", history_new_orders)
+    assert clf["follow_up_type"] == "standalone"
+    assert clf["merge_with_previous"] is False
+    assert should_merge_previous_filters({}, clf, history_new_orders) is False

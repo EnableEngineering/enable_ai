@@ -149,16 +149,20 @@ class QueryParser:
                 follow_up_type = follow_up_clf.get("follow_up_type")
                 has_referent = bool(follow_up_clf.get("referent"))
 
-                if follow_up_type in NO_MERGE_TYPES:
+                # v0.3.68: Only merge when classifier explicitly says merge_with_previous=true
+                # Same resource + different filters = standalone (no merge)
+                should_merge = follow_up_clf.get("merge_with_previous", False)
+
+                if follow_up_type in NO_MERGE_TYPES or not should_merge:
                     self.logger.info(
-                        "Reset/standalone query — parsing without session merge: %r",
-                        natural_language_input[:80],
+                        "Standalone/reset query — parsing without session merge: %r (type=%s, merge=%s)",
+                        natural_language_input[:80], follow_up_type, should_merge,
                     )
                     parsed = self._parse_without_session_merge(messages, follow_up_clf)
-                elif follow_up_clf.get("is_follow_up") or has_referent:
+                elif has_referent or should_merge:
                     self.logger.info(
-                        "Follow-up detected — forcing context merge for: %r",
-                        natural_language_input[:80],
+                        "Follow-up detected — forcing context merge for: %r (type=%s)",
+                        natural_language_input[:80], follow_up_type,
                     )
                     parsed = self._parse_with_forced_context(
                         messages, schema, conversation_history, user_context, follow_up_clf,

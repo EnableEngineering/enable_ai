@@ -210,19 +210,26 @@ Decide:
 1. Is the current query a FOLLOW-UP that continues or refines the previous turn?
    - Follow-ups refer back to prior results, paginate them, or ask for more detail about them
    - Standalone/reset queries start fresh — do NOT inherit previous filters
+   - IMPORTANT: A query on the SAME resource but with DIFFERENT/NEW filters is STANDALONE, not a follow-up
+     Example: After "new service orders assigned to me" → "low priority service orders" is STANDALONE (different filter scope)
+   - Follow-ups must reference the PREVIOUS RESULTS specifically ("those", "them", "which of them", "more", "next")
 2. If follow-up, what type?
    - reset: user wants a fresh unfiltered list on a resource — clears prior filters
    - next_page: user wants more/paginated results from the prior list
    - first_n / last_n: user wants a specific slice (first N, last N)
    - reference: user wants to see/enumerate items from the prior scoped result set
    - refinement: user asks a detail or subset question about the prior result(s) without changing topic/resource
-   - standalone: new independent query (may be same or different resource)
+   - standalone: new independent query — includes same resource with DIFFERENT filters
 3. merge_with_previous=true ONLY for next_page, first_n, last_n, reference, refinement — NEVER for reset or standalone
-4. Use prior question_type from PREVIOUS RESULT METADATA:
-   - After question_type=count: if the user now wants to see/name/subset those items, set question_type_override="list" (not a fresh page-only count)
-   - After question_type=list: pagination/subset/detail queries stay follow-ups with merge_with_previous=true when scope is unchanged
-5. If the query refers to a specific prior item via pronoun/deixis, set referent from PREVIOUS RESULT ITEMS (id, resource)
-6. Decide follow-up vs standalone from RECENT CONVERSATION meaning and prior resource/filters — do not match fixed phrase lists
+4. CRITICAL — Standalone detection:
+   - Query mentions different filter values than previous (e.g., "low priority" vs prior "new status") → STANDALONE
+   - Query uses generic quantifiers ("all", "any", "which") without pronouns referencing prior results → STANDALONE
+   - Query introduces new filter criteria not present in prior context → STANDALONE
+5. Use prior question_type from PREVIOUS RESULT METADATA:
+   - After question_type=count: if the user now wants to see/name/subset those items, set question_type_override="list"
+   - After question_type=list: pagination/subset/detail queries stay follow-ups when scope is unchanged
+6. If the query refers to a specific prior item via pronoun/deixis, set referent from PREVIOUS RESULT ITEMS (id, resource)
+7. Decide follow-up vs standalone from meaning, not resource name — same resource + different filters = standalone
 
 Return JSON only:
 {{
