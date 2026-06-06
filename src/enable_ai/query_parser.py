@@ -236,6 +236,12 @@ Your task: Understand the user's intent and extract structured information so th
 **User identity (USER_CONTEXT)**
 - Resolve first-person pronouns (me, my, mine, assigned to me) using USER_CONTEXT user_id / company_id on the user-scoped filter fields defined in the schema for that resource.
 - Use actual numeric IDs from USER_CONTEXT — never emit placeholder strings like current_user_id or __current_user_id__ in filters.
+- Do NOT add user-scoped filters for breadth queries ("show all X", "every X", "any X") unless the user also says "my" or "assigned to me".
+
+**Embedded fields (nested data, not separate API resources)**
+- Fields listed in resource_hints.__embedded_fields__ (e.g. observations on details-reports) are returned inside a detail response — NOT separate API resources.
+- For "observations for my last report": resource=details-reports, question_type=details, sort desc, limit 1, NO relationships array.
+- Do NOT set relationships.target_entity to an embedded field name unless it is also a top-level schema resource.
 
 **CRITICAL: NO HARDCODED DATA - ANTI-HALLUCINATION RULES**
 - NEVER generate example data, user lists, or sample responses
@@ -449,24 +455,36 @@ Output: {
 }
 NOTE: Use the actual user_id (123) from USER_CONTEXT on fields listed in __user_scoped_fields__ for that resource.
 
-Example 7 - Child resource fetch (multi-step: get parent, then its children):
-Query: "what are the details for my last record?"
+Example 7 - Embedded field on detail response (NOT a separate API resource):
+Query: "what are the observations for my last report?"
 USER_CONTEXT: {"user_id": 456}
+Schema: details-reports has __embedded_fields__: ["observations"], __user_scoped_fields__: ["service_order__technician"]
 Output: {
     "intent": "read",
-    "resource": "[PARENT_RESOURCE_FROM_SCHEMA]",
-    "entities": {"owner": 456},
+    "resource": "details-reports",
+    "entities": {"service_order__technician": 456},
     "filters": {
-        "owner": {"operator": "equals", "value": 456}
+        "service_order__technician": {"operator": "equals", "value": 456}
     },
     "sort": {"field": "created_at", "order": "desc"},
     "limit": 1,
     "question_type": "details",
-    "relationships": [
-        {"type": "child", "target_entity": "[CHILD_RESOURCE_FROM_SCHEMA]", "filters": {}}
-    ]
+    "display_mode": "detailed"
 }
-NOTE: Use schema relationships to find child resource name. Use __user_scoped_fields__ to identify the owner filter field.
+NOTE: observations is embedded in the detail response — do NOT add relationships or a separate observations resource.
+
+Example 7b - Show all (breadth reset, no user-scoped filters):
+Query: "show me all service orders" or "pls show me all service orders"
+Output: {
+    "intent": "read",
+    "resource": "service-orders",
+    "entities": {},
+    "filters": {},
+    "merge_with_previous": false,
+    "question_type": "list",
+    "display_mode": "full"
+}
+NOTE: "all" without "my/assigned to me" means unfiltered — empty filters, no technician filter.
 
 Example 8 - Follow-up asking for details (user wants to see items, not just count):
 Previous conversation: User asked "Show me pending items assigned to me" → System responded "Found 9 items"

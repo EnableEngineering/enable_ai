@@ -1007,6 +1007,22 @@ Summarize accurately from the data above only.
 
         return "\n".join(lines)
 
+    def format_embedded_field(
+        self,
+        data: Dict[str, Any],
+        field_name: str,
+        resource_hints: Optional[Dict[str, Any]] = None,
+        resource: Optional[str] = None,
+    ) -> Optional[str]:
+        """Format a nested/embedded field from a detail API response."""
+        if not isinstance(data, dict) or field_name not in data:
+            return None
+        hints = {}
+        if resource_hints and resource:
+            hints = dict(resource_hints.get(resource) or {})
+        hints["include_fields"] = [field_name]
+        return self._format_detailed_with_hints([data], hints)
+
     def _format_detailed_with_hints(self, data: List[Dict], hints: Dict[str, Any]) -> str:
         """Format data in detailed view with specific fields."""
         include_fields = hints.get("include_fields", [])

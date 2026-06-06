@@ -26,6 +26,7 @@ from .follow_up_detection import (
 )
 from .query_execution import merge_execution_context
 from .semantic_filters import apply_semantic_filters
+from .hint_utils import strip_user_scoped_filters_on_breadth
 from .response_envelope import enrich_api_response
 from .user_context_resolver import (
     filters_for_display,
@@ -685,6 +686,11 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
             # Semantic filters (idempotent) — covers classify shortcut that skips LLM parse
             parsed = apply_semantic_filters(parsed, query_text, active_schema)
 
+            # Breadth queries ("show all X") must not retain user-scoped filters
+            parsed = strip_user_scoped_filters_on_breadth(
+                parsed, query_text, resource_hints,
+            )
+
             execution_plan = planner.create_execution_plan(parsed, active_schema)
             total_steps = len(execution_plan.get("steps", []))
             if tracker:
@@ -805,9 +811,32 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
             }
 
         if not api_plan or api_plan.get("type") == "error":
-            return {
-                "error": f"Step {current_step_idx + 1} planning failed: {api_plan.get('error', 'Unknown error')}"
+            err_msg = (
+                f"Step {current_step_idx + 1} planning failed: "
+                f"{api_plan.get('error', 'Unknown error') if api_plan else 'No API plan'}"
+            )
+            step_result = {
+                "step_id": current_step_def.get("step_id"),
+                "step_description": current_step_def.get("description"),
+                "result": None,
+                "status": "failed",
+                "error": err_msg,
             }
+            step_results.append(step_result)
+            out: Dict[str, Any] = {
+                "current_step": current_step_idx + 1,
+                "step_results": step_results,
+                "error": err_msg,
+            }
+            if (current_step_idx + 1) >= len(steps) and all(
+                sr.get("status") == "failed" for sr in step_results
+            ):
+                err_parts = [
+                    f"Step {i + 1}: {sr.get('error', 'Unknown')}"
+                    for i, sr in enumerate(step_results)
+                ]
+                out["error"] = "All steps failed. " + "; ".join(err_parts)
+            return out
         
         # Execute the API call
         result = processor._execute_api(
@@ -1013,6 +1042,51 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
             # Summarize multi-step execution
             all_data = [sr.get("result") for sr in step_results if sr.get("status") == "success"]
             has_error = any(sr.get("status") == "failed" for sr in step_results)
+
+            # Embedded child: format nested field from detail response (e.g. observations)
+            if execution_plan.get("plan_type") == "embedded_child":
+                embedded_field = execution_plan.get("embedded_field")
+                detail_data = step_results[-1].get("result") if step_results else None
+                active_schema = state.get("active_schema") or {}
+                resource = parsed.get("resource", "")
+                if embedded_field and isinstance(detail_data, dict):
+                    embedded_summary = formatter.format_embedded_field(
+                        detail_data,
+                        embedded_field,
+                        active_schema.get("resource_hints"),
+                        resource,
+                    )
+                    if embedded_summary:
+                        summary = embedded_summary
+                        final_data = detail_data.get(embedded_field, detail_data)
+                        pagination_info = _analyze_pagination(detail_data)
+                        response = enrich_response_with_follow_ups({
+                            "success": not has_error,
+                            "data": final_data,
+                            "summary": summary,
+                            "query": state.get("query"),
+                            "display_mode": "detailed",
+                            "question_type": "details",
+                            "pagination": pagination_info,
+                            "total_steps": len(step_results),
+                            "schema_type": active_schema.get("type"),
+                        }, pagination_info, parsed, detail_data)
+                        response = enrich_api_response(
+                            response,
+                            {
+                                "parsed": parsed,
+                                "step_results": step_results,
+                                "filter_warnings": state.get("filter_warnings", []),
+                                "result": result,
+                            },
+                        )
+                        last_result_metadata = build_session_metadata(parsed, response)
+                        return {
+                            "summary": summary,
+                            "response": response,
+                            "last_result_metadata": last_result_metadata,
+                            "parsed": parsed,
+                        }
 
             # Multi-resource count: sum counts from each step
             if execution_plan.get("plan_type") == "multi_resource_count" and question_type == "count":

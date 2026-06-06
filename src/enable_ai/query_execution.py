@@ -38,7 +38,7 @@ def enrich_step_from_parsed(step: Dict[str, Any], parsed: Optional[Dict[str, Any
         "depends_on": step.get("depends_on", []),
         "description": step.get("description", ""),
     }
-    for optional in ("extract", "fetch_all_pages", "type", "url"):
+    for optional in ("extract", "fetch_all_pages", "type", "url", "embedded_field"):
         if optional in step:
             base[optional] = step[optional]
     return merge_execution_context(base, parsed)
@@ -120,6 +120,8 @@ def dedupe_fk_lookup_filters(filters: Dict[str, Any]) -> Dict[str, Any]:
 def split_filters_for_endpoint(
     filters: Dict[str, Any],
     endpoint_data: Dict[str, Any],
+    resource: Optional[str] = None,
+    resource_hints: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Dict[str, Any], Dict[str, Any], List[str]]:
     """
     Split filters into server-side (API params) and client-side (post-filter).
@@ -130,13 +132,22 @@ def split_filters_for_endpoint(
     if not filters:
         return {}, {}, []
 
+    from .hint_utils import get_client_side_filter_fields, get_extra_query_params
+
     available = get_endpoint_query_param_names(endpoint_data)
+    extra_params = get_extra_query_params(resource or "", resource_hints or {})
+    client_side_known = get_client_side_filter_fields(resource or "", resource_hints or {})
     server_filters: Dict[str, Any] = {}
     client_filters: Dict[str, Any] = {}
     warnings: List[str] = []
 
     for field, value in filters.items():
-        if available and filter_matches_endpoint(field, available):
+        base = field.split("__")[0]
+        if field in extra_params or base in extra_params:
+            server_filters[field] = value
+        elif field in client_side_known or base in client_side_known:
+            client_filters[field] = value
+        elif available and filter_matches_endpoint(field, available):
             server_filters[field] = value
         elif not available:
             # No param metadata — attempt server-side (legacy behaviour)

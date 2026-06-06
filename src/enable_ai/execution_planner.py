@@ -8,7 +8,7 @@ Handles dependency resolution and sequential execution ordering.
 import json
 from typing import Dict, Any, Optional, List
 
-from .hint_utils import expand_query_resources
+from .hint_utils import expand_query_resources, get_embedded_fields
 from .utils import get_openai_client, setup_logger, DETERMINISTIC_TEMP
 from .query_execution import enrich_step_from_parsed, merge_execution_context
 from .user_context_resolver import is_user_id_placeholder, is_company_id_placeholder
@@ -92,7 +92,7 @@ class ExecutionPlanner:
             return multi_count
 
         # Parent → child relationship (e.g. observations for my last report)
-        rel_plan = self._plan_relationship_query(parsed_query)
+        rel_plan = self._plan_relationship_query(parsed_query, schema)
         if rel_plan:
             return rel_plan
 
@@ -346,12 +346,16 @@ class ExecutionPlanner:
             "plan_type": "multi_resource_count",
         }
 
-    def _plan_relationship_query(self, parsed_query: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    def _plan_relationship_query(
+        self,
+        parsed_query: Dict[str, Any],
+        schema: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
         """
         Deterministic parent→child plan when parser outputs relationships.
 
-        Step 1 fetches the parent (with sort/limit). Step 2 fetches the child
-        using the parent's id from step 1.
+        Embedded children (nested fields, not API resources) use:
+          step 1 list parent → step 2 retrieve parent /{id}/ and extract field.
         """
         relationships = parsed_query.get("relationships") or []
         if not relationships:
@@ -362,9 +366,17 @@ class ExecutionPlanner:
             return None
 
         rel = relationships[0]
-        child_resource = rel.get("target_entity")
-        if not child_resource:
+        child_target = rel.get("target_entity")
+        if not child_target:
             return None
+
+        resource_hints = (schema or {}).get("resource_hints") or {}
+        schema_resources = set((schema or {}).get("resources") or {})
+        embedded_fields = get_embedded_fields(parent_resource, resource_hints)
+        is_embedded = (
+            child_target in embedded_fields
+            or child_target not in schema_resources
+        )
 
         step1 = enrich_step_from_parsed({
             "step_id": 1,
@@ -374,33 +386,49 @@ class ExecutionPlanner:
             "filters": parsed_query.get("filters", {}),
             "depends_on": [],
             "extract": {"parent_id": "$.results[0].id"},
-            "description": f"Fetch {parent_resource} for child lookup",
+            "description": f"List {parent_resource} for lookup",
         }, parsed_query)
 
-        child_entities = dict(parsed_query.get("entities", {}))
-        child_entities["id"] = "{parent_id}"
-        child_filters = dict(rel.get("filters") or {})
-        child_filters["id"] = {"operator": "equals", "value": "{parent_id}"}
-
-        step2 = enrich_step_from_parsed({
-            "step_id": 2,
-            "intent": "read",
-            "resource": child_resource,
-            "entities": child_entities,
-            "filters": child_filters,
-            "depends_on": [1],
-            "description": f"Fetch {child_resource} for parent",
-        }, parsed_query)
+        if is_embedded:
+            step2 = enrich_step_from_parsed({
+                "step_id": 2,
+                "intent": "read",
+                "resource": parent_resource,
+                "entities": {"id": "{parent_id}"},
+                "filters": {},
+                "depends_on": [1],
+                "description": f"Retrieve {parent_resource} detail for {child_target}",
+                "embedded_field": child_target,
+                "question_type": "details",
+                "display_mode": "detailed",
+            }, parsed_query)
+            plan_type = "embedded_child"
+        else:
+            child_entities = dict(parsed_query.get("entities", {}))
+            child_entities["id"] = "{parent_id}"
+            child_filters = dict(rel.get("filters") or {})
+            child_filters["id"] = {"operator": "equals", "value": "{parent_id}"}
+            step2 = enrich_step_from_parsed({
+                "step_id": 2,
+                "intent": "read",
+                "resource": child_target,
+                "entities": child_entities,
+                "filters": child_filters,
+                "depends_on": [1],
+                "description": f"Fetch {child_target} for parent",
+            }, parsed_query)
+            plan_type = "parent_child"
 
         self.logger.info(
-            "Relationship plan: %s → %s (type=%s)",
-            parent_resource, child_resource, rel.get("type"),
+            "Relationship plan: %s → %s (embedded=%s, type=%s)",
+            parent_resource, child_target, is_embedded, rel.get("type"),
         )
         return {
             "steps": [step1, step2],
             "is_multi_step": True,
             "total_steps": 2,
-            "plan_type": "parent_child",
+            "plan_type": plan_type,
+            "embedded_field": child_target if is_embedded else None,
         }
 
     def _create_single_step(

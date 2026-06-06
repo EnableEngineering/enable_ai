@@ -1,8 +1,11 @@
 from enable_ai.hint_utils import (
     expand_query_resources,
     find_aggregate_resources_for_query,
+    get_extra_query_params,
     get_user_scoped_fields,
+    query_implies_breadth,
     query_implies_user_scope,
+    strip_user_scoped_filters_on_breadth,
 )
 from enable_ai.user_context_resolver import resolve_user_context_in_parsed
 
@@ -11,6 +14,31 @@ def test_query_implies_user_scope_excludes_show_me():
     assert not query_implies_user_scope("Show me the low stock items to refill")
     assert not query_implies_user_scope("pls show me all service orders")
     assert not query_implies_user_scope("show me all of them")
+
+
+def test_query_implies_breadth_without_user_scope():
+    assert query_implies_breadth("show me all service orders")
+    assert not query_implies_user_scope("show me all service orders")
+    assert query_implies_user_scope("show all my service orders")
+
+
+def test_strip_user_scoped_on_breadth():
+    parsed = {
+        "resource": "service-orders",
+        "filters": {"technician": {"operator": "equals", "value": 29}},
+        "entities": {"technician": 29},
+    }
+    hints = {"service-orders": {"__user_scoped_fields__": ["technician"]}}
+    result = strip_user_scoped_filters_on_breadth(
+        parsed, "pls show me all service orders", hints,
+    )
+    assert "technician" not in result["filters"]
+    assert "technician" not in result["entities"]
+
+
+def test_get_extra_query_params():
+    hints = {"users": {"__extra_query_params__": ["role", "is_active"]}}
+    assert get_extra_query_params("users", hints) == {"role", "is_active"}
 
 
 def test_query_implies_user_scope_includes_assigned_to_me():

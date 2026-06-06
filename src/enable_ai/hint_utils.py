@@ -11,6 +11,8 @@ _IMPERATIVE_ME = re.compile(
     re.IGNORECASE,
 )
 
+_BREADTH_PATTERN = re.compile(r"\b(?:all|every|any|entire)\b", re.IGNORECASE)
+
 _USER_SCOPE_PHRASES = (
     "assigned to me",
     "belonging to me",
@@ -36,29 +38,96 @@ def get_user_scoped_fields(resource: str, resource_hints: Dict[str, Any]) -> Lis
     return list(fields) if isinstance(fields, (list, tuple)) else []
 
 
+def query_implies_breadth(query: str) -> bool:
+    """True when the query asks for an unqualified broad set (all, every, any)."""
+    return bool(_BREADTH_PATTERN.search(query or ""))
+
+
+def _has_explicit_user_scope_markers(query: str) -> bool:
+    q = (query or "").lower()
+    if not q.strip():
+        return False
+    for phrase in _USER_SCOPE_PHRASES:
+        if phrase in q:
+            return True
+    if re.search(r"\bmy\s+\w", q):
+        return True
+    stripped = _IMPERATIVE_ME.sub("", q)
+    return bool(re.search(r"(?<!\w)me(?!\w)", stripped))
+
+
 def query_implies_user_scope(query: str) -> bool:
     """
     True when the query asks for user-owned/assigned data.
 
     Excludes imperative phrases like "show me", "give me", "tell me".
+    Breadth tokens (all/every/any) without explicit user markers are not user-scoped.
     """
-    q = (query or "").lower()
-    if not q.strip():
+    if not (query or "").strip():
         return False
+    if query_implies_breadth(query) and not _has_explicit_user_scope_markers(query):
+        return False
+    return _has_explicit_user_scope_markers(query)
 
-    for phrase in _USER_SCOPE_PHRASES:
-        if phrase in q:
-            return True
 
-    if re.search(r"\bmy\s+\w", q):
-        return True
+def get_embedded_fields(resource: str, resource_hints: Dict[str, Any]) -> List[str]:
+    """Return nested field names from resource_hints.__embedded_fields__."""
+    if not resource or not resource_hints:
+        return []
+    hints = resource_hints.get(resource) or {}
+    if not isinstance(hints, dict):
+        return []
+    fields = hints.get("__embedded_fields__") or []
+    return list(fields) if isinstance(fields, (list, tuple)) else []
 
-    # Bare "me" only after stripping imperative "X me" phrases
-    stripped = _IMPERATIVE_ME.sub("", q)
-    if re.search(r"(?<!\w)me(?!\w)", stripped):
-        return True
 
-    return False
+def get_extra_query_params(resource: str, resource_hints: Dict[str, Any]) -> Set[str]:
+    """Params supported by the API but missing from OpenAPI (declared in hints)."""
+    if not resource or not resource_hints:
+        return set()
+    hints = resource_hints.get(resource) or {}
+    if not isinstance(hints, dict):
+        return set()
+    extra = hints.get("__extra_query_params__") or []
+    return {str(p) for p in extra} if isinstance(extra, (list, tuple)) else set()
+
+
+def get_client_side_filter_fields(resource: str, resource_hints: Dict[str, Any]) -> Set[str]:
+    """Filters intentionally applied client-side (no warning)."""
+    if not resource or not resource_hints:
+        return set()
+    hints = resource_hints.get(resource) or {}
+    if not isinstance(hints, dict):
+        return set()
+    fields = hints.get("__client_side_filters__") or []
+    return {str(f) for f in fields} if isinstance(fields, (list, tuple)) else set()
+
+
+def strip_user_scoped_filters_on_breadth(
+    parsed: Dict[str, Any],
+    query: str,
+    resource_hints: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Remove user-scoped filters when the user asked for an unqualified broad list."""
+    if not isinstance(parsed, dict):
+        return parsed
+    if query_implies_user_scope(query):
+        return parsed
+
+    resource = parsed.get("resource", "")
+    scoped = get_user_scoped_fields(resource, resource_hints or {})
+    if not scoped:
+        return parsed
+
+    result = dict(parsed)
+    filters = dict(result.get("filters") or {})
+    entities = dict(result.get("entities") or {})
+    for field in scoped:
+        filters.pop(field, None)
+        entities.pop(field, None)
+    result["filters"] = filters
+    result["entities"] = entities
+    return result
 
 
 def _normalize_term(term: str) -> str:

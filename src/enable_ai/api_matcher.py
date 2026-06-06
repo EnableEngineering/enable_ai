@@ -232,6 +232,13 @@ class APIMatcher:
                 def endpoint_score(res_name, ep):
                     score = 0
                     path = (ep.get('path') or '').lower()
+                    ep_path_params = self._get_path_params(ep)
+                    if ep_path_params and entities:
+                        required = list(ep_path_params.keys())
+                        if required and all(p in entities for p in required):
+                            score += 25
+                        elif any(p in entities for p in required):
+                            score -= 10
                     # Pre-tokenize for smarter synonym matching
                     original_tokens = set(
                         t for t in original_input.replace('/', ' ').replace('-', ' ').split() if t
@@ -375,7 +382,7 @@ class APIMatcher:
 
                 # Split filters: server-side params vs client-side post-filter
                 server_filters, client_filters, split_warnings = split_filters_for_endpoint(
-                    filters, matched_endpoint
+                    filters, matched_endpoint, resource=resource, resource_hints=resource_hints,
                 )
                 filter_warnings.extend(split_warnings)
                 filters = server_filters
