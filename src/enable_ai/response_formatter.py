@@ -651,15 +651,25 @@ Respond with only the format name, lowercase.
         }
     
     def _format_concise(self, data: Any, query: str, analysis: Dict[str, Any]) -> Dict[str, Any]:
-        """Generate a rich but still compact summary using LLM."""
+        """Generate a rich but still compact summary using LLM.
+
+        When the serialised data exceeds LLM_DATA_PREVIEW_1000 characters the
+        dataset is split into chunks, each chunk is summarised independently,
+        and then a final merge call produces one cohesive response.  Nothing
+        is ever silently truncated.
+        """
         display_field = analysis.get("display_field")
         is_small_list = isinstance(data, list) and 1 <= len(data) <= 5
+        total_count = len(data) if isinstance(data, list) else 1
+        budget = constants.LLM_DATA_PREVIEW_1000
 
         hint_section = ""
-        # Pass the exact count so the summary is accurate
-        n = len(data) if isinstance(data, list) else 0
-        if n > 0:
-            hint_section += f"\nTotal count: {n} item(s). Include this exact count in your summary (e.g. 'Found {n} items: ...'). Use wording that matches the user's query.\n"
+        if total_count > 0:
+            hint_section += (
+                f"\nTotal count: {total_count} item(s). Include this exact count in your"
+                f" summary (e.g. 'Found {total_count} items: ...'). Use wording that"
+                " matches the user's query.\n"
+            )
         if display_field:
             hint_section += f"\nWhen listing items, prefer the '{display_field}' field from the data as the primary identifier.\n"
         if is_small_list:
@@ -667,41 +677,65 @@ Respond with only the format name, lowercase.
         if isinstance(data, list) and constants.MIN_LIST_LENGTH_MEDIUM_SAMPLE <= len(data) <= constants.LLM_DATA_SAMPLE_MEDIUM:
             hint_section += "\nInclude as many concrete item names or identifiers from the data as reasonably possible, not only the count.\n"
 
-        prompt = f"""Summarize this API response for the user in a small number of short sentences or bullets (typically 2-5).
+        # Determine whether all data fits in one call
+        items = data[:constants.LLM_DATA_SAMPLE_MEDIUM] if isinstance(data, list) else data
+        data_json = json.dumps(items, indent=2, default=str)
 
-Rules:
-- Base your summary only on the data and query below. Do not add or assume information not present in the data.
-- Use the exact count given for the total number of items. Keep wording generic (e.g. "items" or terms that match what the user asked for).
-- Where the data contains names or identifiers, you may list representative examples; do not invent examples.
-
-User query: "{query}"
-
-Data: {json.dumps(data[:constants.LLM_DATA_SAMPLE_MEDIUM] if isinstance(data, list) else data, indent=2)[:constants.LLM_DATA_PREVIEW_1000]}
-
-{hint_section}
-
-Provide a concise, accurate summary that answers what the user asked and reflects only the data above.
-"""
-        
-        try:
-            content = self.client.chat_completion(
-                messages=[{"role": "user", "content": prompt}],
-                model=self.model,
-                temperature=DETERMINISTIC_TEMP,
-                max_tokens=constants.MAX_TOKENS_SUMMARY,
+        if len(data_json) <= budget:
+            # ── single call path ──────────────────────────────────────────
+            prompt = (
+                "Summarize this API response for the user in a small number of short"
+                " sentences or bullets (typically 2-5).\n\n"
+                "Rules:\n"
+                "- Base your summary only on the data and query below."
+                "  Do not add or assume information not present in the data.\n"
+                "- Use the exact count given for the total number of items."
+                "  Keep wording generic (e.g. \"items\" or terms that match what the user asked for).\n"
+                "- Where the data contains names or identifiers, you may list representative"
+                "  examples; do not invent examples.\n\n"
+                f'User query: "{query}"\n\n'
+                f"Data: {data_json}\n\n"
+                f"{hint_section}\n"
+                "Provide a concise, accurate summary that answers what the user asked"
+                " and reflects only the data above.\n"
             )
-            
-            summary = (content or "").strip()
-            
-            return {
-                "format": "concise",
-                "summary": summary,
-                "formatted": summary,
-                "raw_data": data
-            }
-        except Exception as e:
-            logger.error("Error creating concise summary: %s", e)
-            raise
+            try:
+                content = self.client.chat_completion(
+                    messages=[{"role": "user", "content": prompt}],
+                    model=self.model,
+                    temperature=DETERMINISTIC_TEMP,
+                    max_tokens=constants.MAX_TOKENS_SUMMARY,
+                )
+                summary = (content or "").strip()
+            except Exception as e:
+                logger.error("Error creating concise summary: %s", e)
+                raise
+        else:
+            # ── chunked path: summarise each chunk then merge ─────────────
+            all_items = data if isinstance(data, list) else [data]
+            chunks = self._split_data_into_chunks(all_items, budget)
+            logger.debug(
+                "_format_concise: data_json=%d chars → %d chunk(s)", len(data_json), len(chunks)
+            )
+            partials: List[str] = []
+            for i, chunk in enumerate(chunks):
+                partials.append(
+                    self._summarize_one_chunk(
+                        chunk, query, total_count, i, len(chunks), display_field
+                    )
+                )
+            summary = (
+                self._merge_chunk_summaries(partials, query, total_count)
+                if len(partials) > 1
+                else partials[0]
+            )
+
+        return {
+            "format": "concise",
+            "summary": summary,
+            "formatted": summary,
+            "raw_data": data,
+        }
     
     def _format_as_table(self, data: Any, query: str, analysis: Dict[str, Any]) -> Dict[str, Any]:
         """Format data as markdown table."""
@@ -867,42 +901,175 @@ Provide a concise, accurate summary that answers what the user asked and reflect
         }
     
     def _format_detailed(self, data: Any, query: str, analysis: Dict[str, Any]) -> Dict[str, Any]:
-        """Provide detailed breakdown of data."""
-        prompt = f"""Provide a detailed, well-structured breakdown of this API response that answers what the user asked.
+        """Provide detailed breakdown of data.
 
-Rules:
-- Base your breakdown only on the data below. Do not add facts, numbers, or details that are not present in the data.
-- Use generic wording (e.g. "items", "records") unless the query or data clearly indicates a specific type.
-- Organize with key findings and important details from the data. Use markdown (headers, lists, bold) where it helps.
+        When the serialised data exceeds LLM_DATA_PREVIEW_2000 characters the
+        dataset is split into chunks, each chunk is broken down independently,
+        and the sections are merged by a final LLM call.  Nothing is truncated.
+        """
+        budget = constants.LLM_DATA_PREVIEW_2000
+        total_count = analysis.get("count", 1)
 
-User query: "{query}"
-
-Data: {json.dumps(data, indent=2)[:constants.LLM_DATA_PREVIEW_2000]}
-
-Summarize accurately from the data above only.
-"""
-        
-        try:
+        def _single_call(payload: Any) -> str:
+            prompt = (
+                "Provide a detailed, well-structured breakdown of this API response"
+                " that answers what the user asked.\n\n"
+                "Rules:\n"
+                "- Base your breakdown only on the data below. Do not add facts,"
+                "  numbers, or details that are not present in the data.\n"
+                "- Use generic wording (e.g. \"items\", \"records\") unless the query"
+                "  or data clearly indicates a specific type.\n"
+                "- Organise with key findings and important details from the data."
+                "  Use markdown (headers, lists, bold) where it helps.\n\n"
+                f'User query: "{query}"\n\n'
+                f"Data: {json.dumps(payload, indent=2, default=str)}\n\n"
+                "Summarize accurately from the data above only.\n"
+            )
             content = self.client.chat_completion(
                 messages=[{"role": "user", "content": prompt}],
                 model=self.model,
                 temperature=DETERMINISTIC_TEMP,
                 max_tokens=constants.MAX_TOKENS_DETAILED,
             )
-            
-            detailed = (content or "").strip()
-            summary = f"Detailed breakdown of {analysis['count']} item(s)"
-            
-            return {
-                "format": "detailed",
-                "summary": summary,
-                "formatted": detailed,
-                "raw_data": data
-            }
-        except Exception as e:
-            logger.error("Error creating detailed summary: %s", e)
-            raise
+            return (content or "").strip()
+
+        data_json = json.dumps(data, indent=2, default=str)
+
+        if len(data_json) <= budget:
+            # ── single call path ──────────────────────────────────────────
+            try:
+                detailed = _single_call(data)
+            except Exception as e:
+                logger.error("Error creating detailed summary: %s", e)
+                raise
+        else:
+            # ── chunked path ──────────────────────────────────────────────
+            all_items = data if isinstance(data, list) else [data]
+            chunks = self._split_data_into_chunks(all_items, budget)
+            logger.debug(
+                "_format_detailed: data_json=%d chars → %d chunk(s)", len(data_json), len(chunks)
+            )
+            try:
+                section_parts: List[str] = []
+                for i, chunk in enumerate(chunks):
+                    section_parts.append(_single_call(chunk))
+
+                if len(section_parts) == 1:
+                    detailed = section_parts[0]
+                else:
+                    # Merge all section breakdowns into one response
+                    combined = "\n\n---\n\n".join(section_parts)
+                    merge_prompt = (
+                        f'The user asked: "{query}". The API returned {total_count} items.\n\n'
+                        "Below are detailed breakdowns of each batch. Merge them into a single"
+                        " well-structured response. Do not invent or omit any information.\n\n"
+                        f"{combined}\n\n"
+                        "Final merged response:"
+                    )
+                    content = self.client.chat_completion(
+                        messages=[{"role": "user", "content": merge_prompt}],
+                        model=self.model,
+                        temperature=DETERMINISTIC_TEMP,
+                        max_tokens=constants.MAX_TOKENS_DETAILED,
+                    )
+                    detailed = (content or "").strip()
+            except Exception as e:
+                logger.error("Error creating detailed summary (chunked): %s", e)
+                raise
+
+        return {
+            "format": "detailed",
+            "summary": f"Detailed breakdown of {total_count} item(s)",
+            "formatted": detailed,
+            "raw_data": data,
+        }
     
+    # ------------------------------------------------------------------
+    # Chunked LLM helpers — used when a dataset is too large for one call
+    # ------------------------------------------------------------------
+
+    def _split_data_into_chunks(self, data: list, max_chars: int) -> List[list]:
+        """Split *data* into sublists where each sublist serialises to ≤ max_chars."""
+        chunks: List[list] = []
+        current: list = []
+        current_size = 0
+        for item in data:
+            item_json = json.dumps(item, default=str)
+            item_size = len(item_json)
+            if item_size >= max_chars:
+                if current:
+                    chunks.append(current)
+                    current = []
+                    current_size = 0
+                chunks.append([item])
+            elif current_size + item_size > max_chars and current:
+                chunks.append(current)
+                current = [item]
+                current_size = item_size
+            else:
+                current.append(item)
+                current_size += item_size
+        if current:
+            chunks.append(current)
+        return chunks
+
+    def _summarize_one_chunk(
+        self,
+        chunk: list,
+        query: str,
+        total_count: int,
+        chunk_index: int,
+        total_chunks: int,
+        display_field: Optional[str] = None,
+    ) -> str:
+        """Return one-line-per-item bullet text for a single chunk."""
+        n = len(chunk)
+        start = chunk_index * n + 1
+        display_hint = (
+            f"\nPrefer the '{display_field}' field as the primary identifier per item."
+            if display_field
+            else ""
+        )
+        prompt = (
+            f'The user asked: "{query}"\n\n'
+            f"Total dataset: {total_count} items. "
+            f"This batch covers items {start}–{start + n - 1} of {total_chunks} batch(es).{display_hint}\n\n"
+            "List each item as ONE bullet line. Use only information from the data below. "
+            "Do not invent or omit anything.\n\n"
+            f"Data:\n{json.dumps(chunk, indent=2, default=str)}\n\n"
+            "Output (one bullet per item):\n- ..."
+        )
+        content = self.client.chat_completion(
+            messages=[{"role": "user", "content": prompt}],
+            model=self.model,
+            temperature=DETERMINISTIC_TEMP,
+            max_tokens=constants.MAX_TOKENS_SUMMARY,
+        )
+        return (content or "").strip()
+
+    def _merge_chunk_summaries(
+        self, partial_summaries: List[str], query: str, total_count: int
+    ) -> str:
+        """Combine per-chunk bullet lists into one cohesive final response."""
+        combined = "\n".join(partial_summaries)
+        prompt = (
+            f'The user asked: "{query}". The API returned {total_count} items in total.\n\n'
+            "The items were processed in batches. Below are the per-batch summaries.\n"
+            "Merge them into a single, coherent response that:\n"
+            "- Mentions the exact total count\n"
+            "- Lists all items (no omissions, no invented items)\n"
+            "- Uses a consistent bullet or prose style\n\n"
+            f"Batch summaries:\n{combined}\n\n"
+            "Final combined response:"
+        )
+        content = self.client.chat_completion(
+            messages=[{"role": "user", "content": prompt}],
+            model=self.model,
+            temperature=DETERMINISTIC_TEMP,
+            max_tokens=constants.MAX_TOKENS_SUMMARY * 3,
+        )
+        return (content or "").strip()
+
     def _select_important_fields(self, item: Dict, query: str) -> List[str]:
         """Select most important fields for display based on query."""
         fields = list(item.keys())
