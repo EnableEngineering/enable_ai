@@ -38,6 +38,7 @@ from .response_projector import (
     extract_raw_items,
     format_projected_table,
 )
+from .query_execution import merge_execution_context
 from .query_examples import apply_query_example_defaults
 from .temporal_filters import apply_temporal_filters
 from .post_filter import apply_client_side_filters
