@@ -203,18 +203,17 @@ class ResponseFormatter:
             if data_count <= 25:
                 sample_size = data_count  # Show ALL items
                 data_sample = data
-                # Allow larger preview for small datasets (8KB)
-                data_preview = json.dumps(data_sample, indent=2, default=str)[:8000]
+                data_preview = json.dumps(data_sample, indent=2, default=str)[:constants.LLM_DATA_PREVIEW_LARGE]
             else:
-                # For large datasets, show first 15 + mention total
-                sample_size = min(data_count, 15)
+                # For large datasets, show first 25 + mention total
+                sample_size = min(data_count, 25)
                 data_sample = data[:sample_size]
-                data_preview = json.dumps(data_sample, indent=2, default=str)[:5000]
+                data_preview = json.dumps(data_sample, indent=2, default=str)[:constants.LLM_DATA_PREVIEW_LARGE]
             remaining = data_count - sample_size
         else:
             data_count = 1
             sample_size = 1
-            data_preview = json.dumps(data, indent=2, default=str)[:5000]
+            data_preview = json.dumps(data, indent=2, default=str)[:constants.LLM_DATA_PREVIEW_LARGE]
             remaining = 0
 
         logger.debug(

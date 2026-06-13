@@ -61,11 +61,13 @@ REDIS_MAX_MESSAGES = _env_int("ENABLE_AI_REDIS_MAX_MESSAGES", 20)
 CHART_MAX_ITEMS = 20
 
 # LLM max_tokens for format/summary (response_formatter)
-MAX_TOKENS_CONCISE = 50
-MAX_TOKENS_SUMMARY = 150
+# ENABLE_AI_MAX_TOKENS_CONCISE — format selector (one word); keep small
+MAX_TOKENS_CONCISE = _env_int("ENABLE_AI_MAX_TOKENS_CONCISE", 50)
+# ENABLE_AI_MAX_TOKENS_SUMMARY — prose summary; needs room for names & identifiers
+MAX_TOKENS_SUMMARY = _env_int("ENABLE_AI_MAX_TOKENS_SUMMARY", 600)
 # 500 was too low for 25-row tables (25 × ~50 tokens/row ≈ 1250+ tokens)
 # so we allow a more realistic detailed budget here.
-MAX_TOKENS_DETAILED = 4000
+MAX_TOKENS_DETAILED = _env_int("ENABLE_AI_MAX_TOKENS_DETAILED", 4000)
 
 # HTTP and schema fetch timeout (seconds) (api_client, orchestrator, schema_loader)
 REQUEST_TIMEOUT = _env_int("ENABLE_AI_REQUEST_TIMEOUT", 30)
@@ -90,11 +92,15 @@ LOG_CONTENT_PREVIEW = 200
 PARSER_INPUT_PREVIEW = 50
 
 # LLM prompt data sample/preview sizes (response_formatter)
-LLM_DATA_SAMPLE_SMALL = 2
-LLM_DATA_SAMPLE_MEDIUM = 50
-LLM_DATA_PREVIEW_500 = 500
-LLM_DATA_PREVIEW_1000 = 1000
-LLM_DATA_PREVIEW_2000 = 2000
+LLM_DATA_SAMPLE_SMALL = _env_int("ENABLE_AI_LLM_SAMPLE_SMALL", 5)
+LLM_DATA_SAMPLE_MEDIUM = _env_int("ENABLE_AI_LLM_SAMPLE_MEDIUM", 50)
+# Character budgets for data JSON sent to the LLM (not log truncation).
+# These apply only to the ResponseFormatter LLM path; the parser prompt
+# sends schema/hints without any character truncation.
+LLM_DATA_PREVIEW_500   = _env_int("ENABLE_AI_LLM_PREVIEW_SMALL",   3000)
+LLM_DATA_PREVIEW_1000  = _env_int("ENABLE_AI_LLM_PREVIEW_MEDIUM",  6000)
+LLM_DATA_PREVIEW_2000  = _env_int("ENABLE_AI_LLM_PREVIEW_LARGE",  12000)
+LLM_DATA_PREVIEW_LARGE = _env_int("ENABLE_AI_LLM_PREVIEW_LARGE",  12000)
 TABLE_FIELD_PREVIEW = 50
 # Max rows in code-built markdown tables (LLM tables are replaced by _format_as_table)
 TABLE_ROW_SAMPLE = _env_int("ENABLE_AI_TABLE_ROW_SAMPLE", 50)
