@@ -39,7 +39,6 @@ from .response_projector import (
     format_projected_table,
 )
 from .query_execution import merge_execution_context
-from .query_examples import apply_query_example_defaults
 from .temporal_filters import apply_temporal_filters
 from .post_filter import apply_client_side_filters
 from .semantic_filters import apply_semantic_filters
@@ -832,7 +831,6 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
             # Semantic filters (idempotent) — covers classify shortcut that skips LLM parse
             parsed = apply_semantic_filters(parsed, query_text, active_schema)
 
-            parsed = apply_query_example_defaults(parsed, query_text, active_schema)
             parsed = apply_temporal_filters(parsed, query_text, active_schema)
 
             # Breadth queries ("show all X") must not retain user-scoped filters
