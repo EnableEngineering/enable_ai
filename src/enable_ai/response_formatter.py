@@ -178,49 +178,26 @@ class ResponseFormatter:
         pagination: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """
-        Generate an intelligent response using a single LLM call.
+        Generate an intelligent response using LLM.
 
-        The LLM decides:
-        1. What format is best (text, table, chart, bullets, etc.)
-        2. What information to include based on what the user asked
-        3. How to present it naturally and helpfully
-
-        Args:
-            data: The data to format
-            query: User's original query
-            context: Optional context (resource name, schema, etc.)
-            pagination: Optional pagination info from API response
-
-        Returns:
-            Dict with format, summary, formatted, and raw_data
+        When the serialised data fits within LLM_DATA_PREVIEW_LARGE a single
+        call is used.  Otherwise the dataset is split into chunks, each chunk is
+        summarised independently, and a final merge call produces the response.
+        Nothing is silently truncated.
         """
-        # BUG FIX (v0.3.36): Show ALL data to LLM for small datasets
-        # Previously only showed 10 items, causing "1 of 3 users" summaries
+        budget = constants.LLM_DATA_PREVIEW_LARGE
         if isinstance(data, list):
             data_count = len(data)
-            # For small datasets (<=25 items), show ALL data to LLM
-            # For larger datasets, show a representative sample
-            if data_count <= 25:
-                sample_size = data_count  # Show ALL items
-                data_sample = data
-                data_preview = json.dumps(data_sample, indent=2, default=str)[:constants.LLM_DATA_PREVIEW_LARGE]
-            else:
-                # For large datasets, show first 25 + mention total
-                sample_size = min(data_count, 25)
-                data_sample = data[:sample_size]
-                data_preview = json.dumps(data_sample, indent=2, default=str)[:constants.LLM_DATA_PREVIEW_LARGE]
-            remaining = data_count - sample_size
+            data_json = json.dumps(data, indent=2, default=str)
         else:
             data_count = 1
-            sample_size = 1
-            data_preview = json.dumps(data, indent=2, default=str)[:constants.LLM_DATA_PREVIEW_LARGE]
-            remaining = 0
+            data_json = json.dumps(data, indent=2, default=str)
 
         logger.debug(
-            "Formatter LLM input: data_count=%s sample_size=%s preview_chars=%s",
+            "Formatter LLM input: data_count=%s data_json_chars=%s budget=%s",
             data_count,
-            sample_size if isinstance(data, list) else 1,
-            len(data_preview),
+            len(data_json),
+            budget,
         )
 
         # Build pagination context for LLM
@@ -239,6 +216,15 @@ PAGINATION INFO:
 IMPORTANT: Include the total count in your response. If there are more items available,
 mention that the user can say "show more" or "next page" to see additional results.
 """
+
+        if len(data_json) > budget:
+            return self._generate_intelligent_response_chunked(
+                data, query, data_count, budget, pagination_info, context
+            )
+
+        # ── single call path: full dataset fits in one prompt ─────────────
+        data_preview = data_json
+        remaining = 0
 
         # Build the prompt
         prompt = f"""You are a helpful AI assistant. The user asked a question and I retrieved data from an API.
@@ -367,6 +353,62 @@ REMEMBER: Include ALL {data_count} items in your response!
             logger.error("Error in intelligent response generation: %s", e)
             # Fallback to basic formatting
             return self._fallback_format(data, query)
+
+    def _generate_intelligent_response_chunked(
+        self,
+        data: Any,
+        query: str,
+        data_count: int,
+        budget: int,
+        pagination_info: str,
+        context: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Chunked variant of _generate_intelligent_response for large datasets."""
+        all_items = data if isinstance(data, list) else [data]
+        chunks = self._split_data_into_chunks(all_items, budget)
+        logger.debug(
+            "_generate_intelligent_response: data_count=%d → %d chunk(s)",
+            data_count,
+            len(chunks),
+        )
+
+        display_field = self._get_display_field_from_context(context) if context else None
+        partials: List[str] = []
+        item_offset = 0
+        for i, chunk in enumerate(chunks):
+            partials.append(
+                self._summarize_one_chunk(
+                    chunk, query, data_count, item_offset, i, len(chunks), display_field
+                )
+            )
+            item_offset += len(chunk)
+
+        merged = (
+            self._merge_chunk_summaries(partials, query, data_count)
+            if len(partials) > 1
+            else partials[0]
+        )
+
+        if pagination_info:
+            merged = merged + "\n" + pagination_info.strip()
+
+        # Table path still uses full data deterministically when enabled
+        if constants.LIST_FORMAT_TABLE and isinstance(data, list) and len(data) > 1:
+            analysis = self._analyze_data_structure(data, context)
+            table_result = self._format_as_table(data, query, analysis)
+            return {
+                "format": "table",
+                "summary": merged,
+                "formatted": table_result["formatted"],
+                "raw_data": data,
+            }
+
+        return {
+            "format": "text",
+            "summary": merged,
+            "formatted": merged,
+            "raw_data": data,
+        }
     
     def _fallback_format(self, data: Any, query: str) -> Dict[str, Any]:
         """
@@ -677,8 +719,8 @@ Respond with only the format name, lowercase.
         if isinstance(data, list) and constants.MIN_LIST_LENGTH_MEDIUM_SAMPLE <= len(data) <= constants.LLM_DATA_SAMPLE_MEDIUM:
             hint_section += "\nInclude as many concrete item names or identifiers from the data as reasonably possible, not only the count.\n"
 
-        # Determine whether all data fits in one call
-        items = data[:constants.LLM_DATA_SAMPLE_MEDIUM] if isinstance(data, list) else data
+        # Determine whether all data fits in one call (use full dataset, no slice)
+        items = data if isinstance(data, list) else data
         data_json = json.dumps(items, indent=2, default=str)
 
         if len(data_json) <= budget:
@@ -718,12 +760,14 @@ Respond with only the format name, lowercase.
                 "_format_concise: data_json=%d chars → %d chunk(s)", len(data_json), len(chunks)
             )
             partials: List[str] = []
+            item_offset = 0
             for i, chunk in enumerate(chunks):
                 partials.append(
                     self._summarize_one_chunk(
-                        chunk, query, total_count, i, len(chunks), display_field
+                        chunk, query, total_count, item_offset, i, len(chunks), display_field
                     )
                 )
+                item_offset += len(chunk)
             summary = (
                 self._merge_chunk_summaries(partials, query, total_count)
                 if len(partials) > 1
@@ -988,27 +1032,31 @@ Respond with only the format name, lowercase.
     # Chunked LLM helpers — used when a dataset is too large for one call
     # ------------------------------------------------------------------
 
+    def _serialized_chunk_size(self, chunk: list) -> int:
+        """Return character length of *chunk* as it appears in LLM prompts."""
+        return len(json.dumps(chunk, indent=2, default=str))
+
     def _split_data_into_chunks(self, data: list, max_chars: int) -> List[list]:
-        """Split *data* into sublists where each sublist serialises to ≤ max_chars."""
+        """Split *data* into sublists where each sublist serialises to ≤ max_chars.
+
+        Uses the same indent=2 JSON format as the prompts so chunk budgets are
+        accurate.  A single item that exceeds *max_chars* is placed in its own
+        chunk rather than being dropped.
+        """
         chunks: List[list] = []
         current: list = []
-        current_size = 0
         for item in data:
-            item_json = json.dumps(item, default=str)
-            item_size = len(item_json)
-            if item_size >= max_chars:
-                if current:
-                    chunks.append(current)
-                    current = []
-                    current_size = 0
-                chunks.append([item])
-            elif current_size + item_size > max_chars and current:
+            if current:
+                candidate = current + [item]
+                if self._serialized_chunk_size(candidate) <= max_chars:
+                    current = candidate
+                    continue
                 chunks.append(current)
-                current = [item]
-                current_size = item_size
-            else:
-                current.append(item)
-                current_size += item_size
+                current = []
+            current = [item]
+            if self._serialized_chunk_size(current) > max_chars:
+                chunks.append(current)
+                current = []
         if current:
             chunks.append(current)
         return chunks
@@ -1018,13 +1066,15 @@ Respond with only the format name, lowercase.
         chunk: list,
         query: str,
         total_count: int,
+        item_offset: int,
         chunk_index: int,
         total_chunks: int,
         display_field: Optional[str] = None,
     ) -> str:
         """Return one-line-per-item bullet text for a single chunk."""
         n = len(chunk)
-        start = chunk_index * n + 1
+        start = item_offset + 1
+        end = item_offset + n
         display_hint = (
             f"\nPrefer the '{display_field}' field as the primary identifier per item."
             if display_field
@@ -1033,7 +1083,8 @@ Respond with only the format name, lowercase.
         prompt = (
             f'The user asked: "{query}"\n\n'
             f"Total dataset: {total_count} items. "
-            f"This batch covers items {start}–{start + n - 1} of {total_chunks} batch(es).{display_hint}\n\n"
+            f"This batch covers items {start}–{end} of {total_count} "
+            f"(batch {chunk_index + 1} of {total_chunks}).{display_hint}\n\n"
             "List each item as ONE bullet line. Use only information from the data below. "
             "Do not invent or omit anything.\n\n"
             f"Data:\n{json.dumps(chunk, indent=2, default=str)}\n\n"
