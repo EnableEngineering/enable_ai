@@ -2,6 +2,7 @@
 Client-side filtering when the API does not support a requested filter param.
 """
 
+import re
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 from .utils import setup_logger
@@ -53,7 +54,11 @@ def _compare(actual: Any, expected: Any, operator: str) -> bool:
         return not _compare(actual, expected, "equals")
 
     if op in ("contains", "icontains"):
-        return _normalize(expected) in _normalize(actual)
+        exp_norm = _normalize(expected)
+        act_norm = _normalize(actual)
+        if re.match(r"^[a-z]{2,4}-[\w-]+$", exp_norm, re.I):
+            return act_norm == exp_norm
+        return exp_norm in act_norm
 
     if op in ("starts_with", "istartswith"):
         return _normalize(actual).startswith(_normalize(expected))

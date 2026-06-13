@@ -15,6 +15,16 @@ def test_item_rejects_wrong_role():
     assert not item_matches_filters(item, filters)
 
 
+def test_reference_code_contains_is_exact():
+    item = {"number": "SO-159-A"}
+    assert not item_matches_filters(
+        item, {"number": {"operator": "contains", "value": "SO-159"}},
+    )
+    assert item_matches_filters(
+        item, {"number": {"operator": "contains", "value": "SO-159-A"}},
+    )
+
+
 def test_apply_client_side_filters_paginated():
     data = {
         "count": 3,

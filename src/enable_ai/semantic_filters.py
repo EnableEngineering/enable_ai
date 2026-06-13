@@ -129,6 +129,17 @@ def inject_semantic_filters(
                     )
                     break
 
+        # Report type tokens (UT/PT) when field is report_type
+        if not matched and field_name in ("report_type", "type"):
+            for token, canonical in (("ut", "UT"), ("pt", "PT")):
+                if re.search(rf"\b{token}\b", text):
+                    filters[field_name] = {"operator": "equals", "value": canonical}
+                    logger.info(
+                        "Semantic filter report_type=%s from token %s",
+                        canonical, token,
+                    )
+                    break
+
     return filters
 
 

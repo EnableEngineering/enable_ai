@@ -21,10 +21,12 @@ from .follow_up_detection import (
     apply_follow_up_context,
     apply_summary_metric_follow_up,
     build_list_pivot_parsed,
+    build_count_list_pivot_parsed,
     build_session_metadata,
     classify_follow_up,
     extract_last_result_metadata,
     should_merge_previous_filters,
+    should_pivot_count_to_list,
     should_pivot_summary_to_list,
     summary_list_follow_up_refusal_message,
     try_advance_chat_window,
@@ -36,7 +38,9 @@ from .response_projector import (
     extract_raw_items,
     format_projected_table,
 )
-from .query_execution import merge_execution_context
+from .query_examples import apply_query_example_defaults
+from .temporal_filters import apply_temporal_filters
+from .post_filter import apply_client_side_filters
 from .semantic_filters import apply_semantic_filters
 from .hint_utils import (
     align_parsed_resource_with_query,
@@ -242,6 +246,28 @@ def _analyze_pagination(
     return info
 
 
+def _parsed_limit(parsed: Optional[Dict[str, Any]]) -> Optional[int]:
+    if not isinstance(parsed, dict) or parsed.get("limit") is None:
+        return None
+    try:
+        return max(1, int(parsed["limit"]))
+    except (TypeError, ValueError):
+        return None
+
+
+def _apply_parsed_limit_to_data(data: Any, parsed: Optional[Dict[str, Any]]) -> Any:
+    """Trim list results to parsed.limit before display projection."""
+    n = _parsed_limit(parsed)
+    if n is None or not isinstance(data, dict) or not isinstance(data.get("results"), list):
+        return data
+    trimmed = data["results"][:n]
+    out = dict(data)
+    out["results"] = trimmed
+    if not data.get("next"):
+        out["count"] = len(trimmed)
+    return out
+
+
 def _accumulate_paginated_results(
     data: Any,
     processor: Any,
@@ -254,6 +280,11 @@ def _accumulate_paginated_results(
         return data
     merged = dict(data)
     merged_results = list(merged.get("results") or [])
+    api_total = merged.get("count")
+    if isinstance(api_total, int) and len(merged_results) >= api_total:
+        merged["results"] = merged_results[:api_total]
+        merged["next"] = None
+        return merged
     if not merged.get("next") or len(merged_results) >= max_items:
         return merged
     pages = 1
@@ -799,6 +830,9 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
 
             # Semantic filters (idempotent) — covers classify shortcut that skips LLM parse
             parsed = apply_semantic_filters(parsed, query_text, active_schema)
+
+            parsed = apply_query_example_defaults(parsed, query_text, active_schema)
+            parsed = apply_temporal_filters(parsed, query_text, active_schema)
 
             # Breadth queries ("show all X") must not retain user-scoped filters
             parsed = strip_user_scoped_filters_on_breadth(
@@ -1440,6 +1474,11 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
             # v0.3.11: Enhanced handling with accurate counts and pagination (Issues #2-7)
             # v0.3.12: Count-specific formatting
             data = result.get("data", {})
+            client_filters = result.get("client_side_filters") or {}
+            if client_filters and data is not None:
+                data, _ = apply_client_side_filters(data, client_filters)
+                result = {**result, "data": data}
+
             # Automatic pagination: only when display_mode is "full" do we fetch all pages.
             # When display_mode is "summary" or "detailed", return first page so user can say "show me more" for next page.
             pages_fetched = 1
@@ -1472,6 +1511,7 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
             # v0.3.72: Accumulate pages for session list_cache (chat windows without next_url)
             list_projection = None
             if question_type in ("list", "details") and isinstance(data, dict) and "results" in data:
+                data = _apply_parsed_limit_to_data(data, parsed)
                 if display_mode != "full":
                     data = _accumulate_paginated_results(
                         data,
@@ -1486,6 +1526,7 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
                     parsed.get("resource", ""),
                     display_mode=display_mode,
                     chat_offset=0,
+                    user_limit=_parsed_limit(parsed),
                 )
             
             # Summary/dashboard responses (singleton metrics, not list pages)
@@ -1887,6 +1928,28 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
             )
 
         resource_hints = active_schema.get("resource_hints") or {}
+
+        def _try_count_list_pivot() -> Optional[Dict[str, Any]]:
+            if not should_pivot_count_to_list(last_metadata, follow_up_type):
+                return None
+            pivot = build_count_list_pivot_parsed(
+                last_metadata, query, follow_up_type, requested_limit,
+            )
+            logger.info(
+                "Pivoting count follow-up to list resource=%s filters=%s",
+                pivot.get("resource"),
+                list((pivot.get("filters") or {}).keys()),
+            )
+            return {
+                "is_follow_up": True,
+                "parsed": pivot,
+                "skip_llm_parse": True,
+                "follow_up_classification": follow_up_classification,
+            }
+
+        count_pivot = _try_count_list_pivot()
+        if count_pivot:
+            return count_pivot
 
         def _try_summary_list_pivot() -> Optional[Dict[str, Any]]:
             if not should_pivot_summary_to_list(last_metadata, follow_up_type):

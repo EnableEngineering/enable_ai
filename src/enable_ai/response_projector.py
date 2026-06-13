@@ -139,13 +139,19 @@ def format_projected_table(
         return f"No {resource} found."
     if not fields:
         fields = list(rows[0].keys())[: constants.TABLE_FIELDS_MAX]
+    display_rows = [
+        r for r in rows
+        if any(r.get(f) not in (None, "") for f in fields)
+    ]
+    if not display_rows:
+        return f"No {resource} found with displayable details."
     hints = resource_hints or {}
     header_labels = [format_field_label(f, hints, resource) for f in fields]
     lines = [
         "| " + " | ".join(header_labels) + " |",
         "| " + " | ".join(["---"] * len(fields)) + " |",
     ]
-    for row in rows:
+    for row in display_rows:
         cells = []
         for field in fields:
             val = row.get(field, "")
@@ -200,6 +206,7 @@ class ResponseProjector:
         *,
         display_mode: str = "summary",
         chat_offset: int = 0,
+        user_limit: Optional[int] = None,
     ) -> Dict[str, Any]:
         """
         Build projected list cache and optional chat window for display.
@@ -209,7 +216,18 @@ class ResponseProjector:
         """
         raw_items = extract_raw_items(data)
         projected, fields = project_items(raw_items, resource, self.resource_hints)
+        if user_limit is not None:
+            try:
+                cap = max(1, int(user_limit))
+                projected = projected[:cap]
+            except (TypeError, ValueError):
+                pass
         window_size = get_chat_window_size(resource, self.resource_hints)
+        if user_limit is not None:
+            try:
+                window_size = min(window_size, max(1, int(user_limit)))
+            except (TypeError, ValueError):
+                pass
         total_count = None
         if isinstance(data, dict):
             for key in ("count", "total_count", "total"):

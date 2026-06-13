@@ -1028,6 +1028,7 @@ class APIOrchestrator:
                 parsed.get("question_type") != "count"
                 and parsed.get("display_mode") != "full"
                 and parsed.get("intent") == "read"
+                and parsed.get("limit") is None
             ):
                 param_name = self._get_limit_param_for_endpoint(schema, result.endpoint)
                 if not any(name in params for name in constants.LIMIT_PARAM_NAMES):

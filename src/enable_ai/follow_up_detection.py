@@ -124,6 +124,11 @@ def build_session_metadata(
     has_more_in_chat = (projection or {}).get("has_more_in_chat", False)
     if list_cache and not projection:
         has_more_in_chat = (chat_offset + chat_window_size) < len(list_cache)
+    total_known = count or len(list_cache)
+    if not has_more_in_chat and len(list_cache) < total_known:
+        has_more_in_chat = True
+    if not has_more_in_chat and pagination.get("next_url"):
+        has_more_in_chat = True
 
     return {
         "resource": resource,
@@ -149,6 +154,39 @@ def build_session_metadata(
 
 
 LIST_CACHE_FOLLOW_UP_TYPES = ("reference", "first_n", "last_n", "next_page")
+
+
+def should_pivot_count_to_list(
+    last_metadata: Dict[str, Any],
+    follow_up_type: str,
+) -> bool:
+    """True when a list-style follow-up follows a count turn."""
+    if follow_up_type not in LIST_CACHE_FOLLOW_UP_TYPES:
+        return False
+    return last_metadata.get("question_type") == "count"
+
+
+def build_count_list_pivot_parsed(
+    last_metadata: Dict[str, Any],
+    query: str,
+    follow_up_type: str,
+    requested_limit: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Build a list query preserving filters from a prior count turn."""
+    resource = last_metadata.get("resource") or ""
+    limit = requested_limit
+    if limit is None and follow_up_type == "first_n":
+        limit = 5
+    return {
+        "intent": "read",
+        "resource": resource,
+        "question_type": "list",
+        "display_mode": "summary",
+        "limit": limit,
+        "filters": dict(last_metadata.get("filters") or {}),
+        "original_input": query,
+        "merge_with_previous": False,
+    }
 
 
 def should_pivot_summary_to_list(
