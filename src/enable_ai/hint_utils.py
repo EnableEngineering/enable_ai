@@ -46,14 +46,14 @@ def get_user_scoped_fields(
 
     role = (user_context or {}).get("role") or ""
     by_role = hints.get("__user_scoped_fields_by_role__") or {}
-    if role and isinstance(by_role, dict):
-        if role in by_role:
-            fields = by_role[role]
-            return list(fields) if isinstance(fields, (list, tuple)) else []
-        role_l = str(role).lower()
-        for key, fields in by_role.items():
-            if str(key).lower() == role_l:
-                return list(fields) if isinstance(fields, (list, tuple)) else []
+    if isinstance(by_role, dict) and by_role:
+        if role:
+            role_l = str(role).lower()
+            for key, fields in by_role.items():
+                if str(key).lower() == role_l:
+                    return list(fields) if isinstance(fields, (list, tuple)) else []
+            return []
+        # by_role configured but no role in context — legacy fallback below
 
     fields = hints.get("__user_scoped_fields__") or []
     return list(fields) if isinstance(fields, (list, tuple)) else []

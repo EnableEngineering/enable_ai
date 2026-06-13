@@ -58,3 +58,18 @@ def test_new_status_word_boundary():
         },
     )
     assert plural["role"]["value"] == "Technician"
+
+
+def test_list_valued_status_synonym_uses_in_operator():
+    hints = {
+        "service-orders": {
+            "priority": {
+                "synonyms": {"urgent or high": ["High", "Urgent"]},
+            },
+        },
+    }
+    filters = inject_semantic_filters(
+        {}, "service-orders", "show urgent or high priority orders", hints,
+    )
+    assert filters["priority"]["operator"] == "in"
+    assert filters["priority"]["value"] == ["High", "Urgent"]

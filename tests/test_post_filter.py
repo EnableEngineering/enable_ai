@@ -33,6 +33,25 @@ def test_apply_client_side_filters_paginated():
     assert filtered["count"] == 2
 
 
+def test_apply_client_side_filters_preserves_count_with_next_page():
+    data = {
+        "count": 100,
+        "next": "http://api/page2",
+        "results": [
+            {"role": "Customer", "username": "c@x.com"},
+            {"role": "Admin", "username": "a@x.com"},
+        ],
+    }
+    filtered, removed = apply_client_side_filters(
+        data,
+        {"role": {"operator": "equals", "value": "Customer"}},
+    )
+    assert len(filtered["results"]) == 1
+    assert filtered["count"] == 100
+    assert filtered.get("_client_filter_partial") is True
+    assert filtered.get("_filtered_page_count") == 1
+
+
 def test_apply_client_side_filters_list():
     data = [
         {"status": "New"},

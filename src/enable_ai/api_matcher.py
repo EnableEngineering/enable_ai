@@ -716,6 +716,10 @@ class APIMatcher:
                                     # v0.3.47: Mark that we applied semantic mapping
                                     applied_semantic_mapping = True
                                     break
+                            elif isinstance(syn_val, (list, tuple)):
+                                validated[field] = {"operator": "in", "value": list(syn_val)}
+                                applied_semantic_mapping = True
+                                break
                             else:
                                 # Simple value synonym
                                 value = syn_val
@@ -741,7 +745,10 @@ class APIMatcher:
                     if not value_matches:
                         warnings.append(f"Value '{value}' for {field} not in allowed values: {allowed_values}")
 
-            validated[field] = {"operator": operator, "value": value}
+            if isinstance(value, (list, tuple)):
+                validated[field] = {"operator": "in", "value": list(value)}
+            else:
+                validated[field] = {"operator": operator, "value": value}
 
         return {"filters": validated, "warnings": warnings}
 

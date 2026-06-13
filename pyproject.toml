@@ -4,7 +4,7 @@ build-backend = "poetry.core.masonry.api"
 
 [tool.poetry]
 name = "enable-ai"
-version = "0.3.80"
+version = "0.3.81"
 description = "AI-powered natural language interface for REST APIs with OpenAPI support and real-time streaming"
 authors = ["Enable Engineering"]
 license = "MIT"

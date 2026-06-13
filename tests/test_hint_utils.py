@@ -145,3 +145,17 @@ def test_get_user_scoped_fields_by_role():
     assert get_user_scoped_fields(
         "details-reports", hints, {"role": "Admin"},
     ) == ["created_by"]
+
+
+def test_by_role_empty_list_blocks_fallback():
+    hints = {
+        "service-orders": {
+            "__user_scoped_fields__": ["technician"],
+            "__user_scoped_fields_by_role__": {
+                "Technician": ["technician"],
+                "Admin": [],
+            },
+        },
+    }
+    assert get_user_scoped_fields("service-orders", hints, {"role": "Admin"}) == []
+    assert get_user_scoped_fields("service-orders", hints, {"role": "Accountant"}) == []

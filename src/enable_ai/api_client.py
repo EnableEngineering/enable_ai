@@ -186,7 +186,11 @@ class APIClient:
                 if response.status_code == 401:
                     return APIError("Authentication failed - token may be invalid or expired")
                 if response.status_code == 403:
-                    return APIError("Insufficient permissions to access this resource")
+                    endpoint_label = (api_request.endpoint or "this resource").rstrip("/")
+                    return APIError(
+                        f"Insufficient permissions to access {endpoint_label}. "
+                        "Your role may not allow this operation."
+                    )
                 if response.status_code == 404:
                     return APIError(f"Resource not found: {api_request.endpoint}")
                 if response.status_code == 400:

@@ -297,18 +297,29 @@ def resolve_user_context_in_parsed(
     )
     if (
         not skip_injection
-        and user_id is not None
         and scoped_fields
         and query_implies_user_scope(query)
     ):
         for user_field in scoped_fields:
-            if user_field not in filters and user_field not in entities:
-                filters[user_field] = {"operator": "equals", "value": user_id}
-                entities[user_field] = user_id
-                logger.info(
-                    "Injected %s=%s from user_context for user-scoped query (resource=%s)",
-                    user_field, user_id, resource,
-                )
+            if user_field in filters or user_field in entities:
+                continue
+            field_lower = user_field.lower().replace("-", "_")
+            base = field_lower.split("__")[0]
+            inject_id = None
+            if base in COMPANY_ID_FIELDS or field_lower in COMPANY_ID_FIELDS:
+                inject_id = ctx.get("company_id")
+            elif base in USER_ID_FIELDS or field_lower in USER_ID_FIELDS:
+                inject_id = user_id
+            else:
+                inject_id = user_id
+            if inject_id is None:
+                continue
+            filters[user_field] = {"operator": "equals", "value": inject_id}
+            entities[user_field] = inject_id
+            logger.info(
+                "Injected %s=%s from user_context for user-scoped query (resource=%s)",
+                user_field, inject_id, resource,
+            )
 
     filters = _sync_entities_to_filters(filters, entities)
     result["filters"] = filters

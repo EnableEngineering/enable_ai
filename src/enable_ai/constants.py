@@ -387,3 +387,12 @@ EMPTY_RESPONSE_VALID_VALUES_HINT = "Valid values for '{field}': {values}"
 
 # When filter_warnings are present (filter may not be supported by API)
 FILTER_WARNING_NOTE = "Results might not be filtered as requested if the API does not support these filters."
+
+ERROR_FORBIDDEN_RESOURCE = (
+    "You don't have permission to access {resource}. "
+    "Try a narrower query or contact your administrator."
+)
+ERROR_FORBIDDEN_GENERIC = (
+    "You don't have permission to perform this action."
+)
+ERROR_CAPABILITY_FAILED = "Unable to complete that request."

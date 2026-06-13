@@ -125,7 +125,11 @@ def apply_client_side_filters(
         removed = len(original) - len(filtered)
         result = {**data, "results": filtered}
         if "count" in result and isinstance(result["count"], int):
-            result["count"] = len(filtered)
+            if data.get("next"):
+                result["_client_filter_partial"] = True
+                result["_filtered_page_count"] = len(filtered)
+            else:
+                result["count"] = len(filtered)
         logger.info(
             "Client-side filter: %d -> %d items (removed %d)",
             len(original), len(filtered), removed,

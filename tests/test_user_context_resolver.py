@@ -85,3 +85,49 @@ def test_resolve_user_context_placeholders_alias():
     result = resolve_user_context_placeholders(parsed, {"id": 17})
     assert result["filters"]["technician"]["value"] == 17
 
+
+def test_admin_role_gets_no_scoped_injection():
+    hints = {
+        "service-orders": {
+            "__user_scoped_fields__": ["technician"],
+            "__user_scoped_fields_by_role__": {
+                "Technician": ["technician"],
+                "Admin": [],
+            },
+        },
+    }
+    parsed = {
+        "resource": "service-orders",
+        "filters": {},
+        "entities": {},
+    }
+    result = resolve_user_context_in_parsed(
+        parsed,
+        {"user_id": 1, "role": "Admin"},
+        query="show my service orders",
+        resource_hints=hints,
+    )
+    assert "technician" not in result["filters"]
+
+
+def test_customer_company_scoped_injection():
+    hints = {
+        "invoicing-invoices": {
+            "__user_scoped_fields_by_role__": {
+                "Customer": ["company"],
+            },
+        },
+    }
+    parsed = {
+        "resource": "invoicing-invoices",
+        "filters": {},
+        "entities": {},
+    }
+    result = resolve_user_context_in_parsed(
+        parsed,
+        {"user_id": 5, "company_id": 42, "role": "Customer"},
+        query="show my invoices",
+        resource_hints=hints,
+    )
+    assert result["filters"]["company"]["value"] == 42
+

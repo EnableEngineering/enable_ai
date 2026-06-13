@@ -41,9 +41,12 @@ def _filter_value_from_synonym(mapped_value: Any, phrase: str) -> Any:
     Resolve the filter value to inject from a synonym mapping.
 
     Simple mappings use the value as-is (e.g. "low stock" -> "low").
+    List mappings use operator "in" (e.g. "urgent or high" -> ["High", "Urgent"]).
     Complex API mappings (field__op=value) use the phrase when it is a
     single token; api_matcher._validate_filter_values expands them later.
     """
+    if isinstance(mapped_value, (list, tuple)):
+        return list(mapped_value)
     if not isinstance(mapped_value, str):
         return mapped_value
     if "=" in mapped_value and "__" in mapped_value.split("=", 1)[0]:
@@ -103,7 +106,10 @@ def inject_semantic_filters(
         for phrase, mapped_value in _synonym_phrases_for_field(field_hints):
             if _phrase_in_query(phrase, text):
                 value = _filter_value_from_synonym(mapped_value, phrase)
-                filters[field_name] = {"operator": "equals", "value": value}
+                if isinstance(value, (list, tuple)):
+                    filters[field_name] = {"operator": "in", "value": list(value)}
+                else:
+                    filters[field_name] = {"operator": "equals", "value": value}
                 logger.info(
                     "Semantic filter from hint: %s=%r (phrase=%r, resource=%s)",
                     field_name, value, phrase, resource,

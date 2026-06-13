@@ -161,6 +161,33 @@ def _api_total_count(
     return None
 
 
+def _humanize_execution_errors(
+    step_results: List[Dict[str, Any]],
+    parsed: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Turn step failure details into user-facing capability messages."""
+    resource = ((parsed or {}).get("resource") or "this resource").replace("-", " ")
+    parts: List[str] = []
+    for sr in step_results:
+        if sr.get("status") != "failed":
+            continue
+        err = str(sr.get("error") or "Unknown error")
+        err_l = err.lower()
+        if "403" in err or "insufficient permissions" in err_l or "permission" in err_l:
+            parts.append(constants.ERROR_FORBIDDEN_RESOURCE.format(resource=resource))
+        elif "404" in err or "not found" in err_l:
+            parts.append(f"I couldn't find an API endpoint for {resource}.")
+        elif "authentication" in err_l or "401" in err:
+            parts.append("Your session may have expired. Please sign in again.")
+        else:
+            parts.append(err.split("Step")[0].strip() or err)
+    if not parts:
+        return constants.ERROR_CAPABILITY_FAILED
+    if len(parts) == 1:
+        return parts[0]
+    return constants.ERROR_CAPABILITY_FAILED + " " + "; ".join(dict.fromkeys(parts))
+
+
 def _analyze_pagination(
     data: Any,
     resource: str = "",
@@ -932,11 +959,7 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
             if (current_step_idx + 1) >= len(steps) and all(
                 sr.get("status") == "failed" for sr in step_results
             ):
-                err_parts = [
-                    f"Step {i + 1}: {sr.get('error', 'Unknown')}"
-                    for i, sr in enumerate(step_results)
-                ]
-                out["error"] = "All steps failed. " + "; ".join(err_parts)
+                out["error"] = _humanize_execution_errors(step_results, state.get("parsed"))
             return out
         
         # Execute the API call
@@ -1004,8 +1027,7 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
         # When all steps failed, set error so route_after_step can send to format_error
         if step_result.get("status") == "failed" and (current_step_idx + 1) >= len(steps):
             if all(sr.get("status") == "failed" for sr in step_results):
-                err_parts = [f"Step {i + 1}: {sr.get('error', 'Unknown')}" for i, sr in enumerate(step_results)]
-                out["error"] = "All steps failed. " + "; ".join(err_parts)
+                out["error"] = _humanize_execution_errors(step_results, state.get("parsed"))
         return out
 
     def execute_plan(state: APIQueryState) -> Dict[str, Any]:
@@ -1097,7 +1119,10 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
             "response": enrich_response_with_follow_ups({
                 "success": False,
                 "data": None,
-                "summary": f"{constants.ERROR_PREFIX}{error}",
+                "summary": _humanize_execution_errors(
+                    state.get("step_results") or [],
+                    state.get("parsed"),
+                ) if state.get("step_results") else f"{constants.ERROR_PREFIX}{error}",
                 "error": error,
                 "query": state.get("query"),
                 "total_steps": 0,
@@ -1399,8 +1424,6 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
             # v0.3.37: Add filter warnings to multi-step response
             if filter_warnings:
                 response["filter_warnings"] = filter_warnings
-                warning_text = "\n".join(f"⚠️ {w}" for w in filter_warnings)
-                response["summary"] = f"{warning_text}\n\n{constants.FILTER_WARNING_NOTE}\n\n{summary}"
 
             if formatted is not None:
                 response["formatted"] = formatted
@@ -1761,12 +1784,9 @@ def build_api_workflow(processor, checkpointer=None, formatter_config: Optional[
                 "schema_type": state.get("active_schema", {}).get("type"),
             }, pagination_info, parsed, data)
 
-            # v0.3.37: Add filter warnings to response
+            # v0.3.37: Add filter warnings to response (metadata only — not in summary)
             if filter_warnings:
                 response["filter_warnings"] = filter_warnings
-                # Prepend warning to summary
-                warning_text = "\n".join(f"⚠️ {w}" for w in filter_warnings)
-                response["summary"] = f"{warning_text}\n\n{constants.FILTER_WARNING_NOTE}\n\n{summary}"
 
             if formatted is not None:
                 response["formatted"] = formatted

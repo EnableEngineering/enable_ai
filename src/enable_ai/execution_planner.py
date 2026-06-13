@@ -6,12 +6,22 @@ Handles dependency resolution and sequential execution ordering.
 """
 
 import json
+import re
 from typing import Dict, Any, Optional, List
 
 from .hint_utils import expand_query_resources, get_embedded_fields
 from .utils import get_openai_client, setup_logger, DETERMINISTIC_TEMP
 from .query_execution import enrich_step_from_parsed, merge_execution_context
 from .user_context_resolver import is_user_id_placeholder, is_company_id_placeholder
+
+_REFERENCE_CODE_PATTERN = re.compile(r"^[A-Z]{2,4}-[\w-]+$", re.IGNORECASE)
+
+
+def _lookup_search_operator(value: Any) -> str:
+    """Use exact match for structured reference codes (e.g. SO-159, WO-42)."""
+    if isinstance(value, str) and _REFERENCE_CODE_PATTERN.match(value.strip()):
+        return "exact"
+    return "icontains"
 
 
 class ExecutionPlanner:
@@ -253,7 +263,7 @@ class ExecutionPlanner:
                 "resource": lookup["target_resource"],
                 "filters": {
                     lookup["search_field"]: {
-                        "operator": "icontains",  # Case-insensitive search
+                        "operator": _lookup_search_operator(lookup["value"]),
                         "value": lookup["value"]
                     }
                 },
