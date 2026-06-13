@@ -4,6 +4,7 @@ All LLM calls are mocked so no OPENAI_API_KEY is required.
 """
 
 import json
+from typing import Tuple
 from unittest.mock import MagicMock, patch
 
 from enable_ai import constants
@@ -14,12 +15,13 @@ from enable_ai.response_formatter import ResponseFormatter
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _make_formatter() -> ResponseFormatter:
+def _make_formatter() -> Tuple[ResponseFormatter, MagicMock]:
+    mock_client = MagicMock()
     with patch("enable_ai.response_formatter.get_openai_client"):
         fmt = ResponseFormatter.__new__(ResponseFormatter)
         fmt.model = "gpt-4o-mini"
-        fmt.client = MagicMock()
-        return fmt
+        fmt.client = mock_client
+        return fmt, mock_client
 
 
 def _large_items(n: int, chars_per_item: int = 400) -> list:
@@ -45,14 +47,14 @@ def _items_exceeding_budget(n: int, budget: int) -> list:
 
 class TestSplitDataIntoChunks:
     def test_all_fit_in_one_chunk(self):
-        fmt = _make_formatter()
+        fmt, _ = _make_formatter()
         data = [{"id": 1}, {"id": 2}]
         chunks = fmt._split_data_into_chunks(data, max_chars=10_000)
         assert len(chunks) == 1
         assert chunks[0] == data
 
     def test_splits_when_over_budget(self):
-        fmt = _make_formatter()
+        fmt, _ = _make_formatter()
         items = _large_items(5, chars_per_item=400)
         chunks = fmt._split_data_into_chunks(items, max_chars=600)
         reconstructed = [item for chunk in chunks for item in chunk]
@@ -61,7 +63,7 @@ class TestSplitDataIntoChunks:
 
     def test_each_chunk_respects_budget(self):
         """Every chunk must serialise to ≤ max_chars (same format as prompts)."""
-        fmt = _make_formatter()
+        fmt, _ = _make_formatter()
         budget = 600
         items = _large_items(8, chars_per_item=350)
         chunks = fmt._split_data_into_chunks(items, budget)
@@ -72,7 +74,7 @@ class TestSplitDataIntoChunks:
             )
 
     def test_oversized_single_item_gets_its_own_chunk(self):
-        fmt = _make_formatter()
+        fmt, _ = _make_formatter()
         big = {"id": 1, "blob": "z" * 2000}
         small = {"id": 2}
         chunks = fmt._split_data_into_chunks([big, small], max_chars=500)
@@ -81,7 +83,7 @@ class TestSplitDataIntoChunks:
         assert chunks[1] == [small]
 
     def test_empty_input(self):
-        fmt = _make_formatter()
+        fmt, _ = _make_formatter()
         assert fmt._split_data_into_chunks([], max_chars=1000) == []
 
 
@@ -91,20 +93,20 @@ class TestSplitDataIntoChunks:
 
 class TestFormatConciseSingleCall:
     def test_small_data_uses_single_llm_call(self):
-        fmt = _make_formatter()
-        fmt.client.chat_completion.return_value = "Found 2 items: A, B."
+        fmt, mock_client = _make_formatter()
+        mock_client.chat_completion.return_value = "Found 2 items: A, B."
 
         data = [{"id": 1, "name": "A"}, {"id": 2, "name": "B"}]
         result = fmt._format_concise(data, "list items", {"display_field": "name"})
 
         assert result["format"] == "concise"
         assert result["summary"] == "Found 2 items: A, B."
-        assert fmt.client.chat_completion.call_count == 1
+        assert mock_client.chat_completion.call_count == 1
 
 
 class TestFormatConciseChunked:
     def test_large_data_calls_merge_with_final_result(self):
-        fmt = _make_formatter()
+        fmt, mock_client = _make_formatter()
         budget = constants.LLM_DATA_PREVIEW_1000
         items = _items_exceeding_budget(30, budget)
         n_chunks = len(fmt._split_data_into_chunks(items, budget))
@@ -115,17 +117,17 @@ class TestFormatConciseChunked:
                 return "Final merged summary"
             return "chunk summary"
 
-        fmt.client.chat_completion.side_effect = respond
+        mock_client.chat_completion.side_effect = respond
 
         result = fmt._format_concise(items, "show me all items", {"display_field": "name"})
 
         assert result["format"] == "concise"
         assert result["summary"] == "Final merged summary"
-        assert fmt.client.chat_completion.call_count == n_chunks + 1
+        assert mock_client.chat_completion.call_count == n_chunks + 1
 
     def test_all_items_sent_to_llm_none_dropped(self):
         """Every item id must appear in at least one LLM prompt."""
-        fmt = _make_formatter()
+        fmt, mock_client = _make_formatter()
         items = _items_exceeding_budget(15, constants.LLM_DATA_PREVIEW_1000)
         prompts: list = []
 
@@ -133,7 +135,7 @@ class TestFormatConciseChunked:
             prompts.append(messages[0]["content"])
             return "chunk summary"
 
-        fmt.client.chat_completion.side_effect = capture
+        mock_client.chat_completion.side_effect = capture
         fmt._format_concise(items, "list all", {"display_field": "name"})
 
         ids_seen = set()
@@ -146,7 +148,7 @@ class TestFormatConciseChunked:
 
     def test_more_than_sample_medium_limit_all_processed(self):
         """Regression: _format_concise must not slice to LLM_DATA_SAMPLE_MEDIUM (50)."""
-        fmt = _make_formatter()
+        fmt, mock_client = _make_formatter()
         # 60 small items — under char budget individually but > 50 count
         # Force chunked path with large per-item payload
         budget = constants.LLM_DATA_PREVIEW_1000
@@ -159,7 +161,7 @@ class TestFormatConciseChunked:
             prompts.append(messages[0]["content"])
             return "ok"
 
-        fmt.client.chat_completion.side_effect = capture
+        mock_client.chat_completion.side_effect = capture
         fmt._format_concise(items, "list all", {})
 
         ids_seen = set()
@@ -173,7 +175,7 @@ class TestFormatConciseChunked:
 
     def test_item_ranges_in_chunk_prompts_are_correct(self):
         """Batch prompts must report correct 1-based item ranges."""
-        fmt = _make_formatter()
+        fmt, mock_client = _make_formatter()
         items = _large_items(5, chars_per_item=400)
         chunks = fmt._split_data_into_chunks(items, max_chars=600)
         assert len(chunks) >= 2
@@ -184,7 +186,7 @@ class TestFormatConciseChunked:
             prompts.append(messages[0]["content"])
             return "ok"
 
-        fmt.client.chat_completion.side_effect = capture
+        mock_client.chat_completion.side_effect = capture
 
         item_offset = 0
         for i, chunk in enumerate(chunks):
@@ -204,30 +206,30 @@ class TestFormatConciseChunked:
 
 class TestFormatDetailedChunked:
     def test_large_data_triggers_chunked_detailed_with_merge(self):
-        fmt = _make_formatter()
+        fmt, mock_client = _make_formatter()
         budget = constants.LLM_DATA_PREVIEW_2000
         items = _items_exceeding_budget(20, budget)
 
-        n_chunks = len(_make_formatter()._split_data_into_chunks(items, budget))
+        n_chunks = len(fmt._split_data_into_chunks(items, budget))
         section_responses = [f"Section {i}" for i in range(n_chunks)]
-        fmt.client.chat_completion.side_effect = section_responses + ["Merged detailed breakdown"]
+        mock_client.chat_completion.side_effect = section_responses + ["Merged detailed breakdown"]
 
         result = fmt._format_detailed(items, "explain all items", {"count": len(items)})
 
         assert result["format"] == "detailed"
         assert result["formatted"] == "Merged detailed breakdown"
-        assert fmt.client.chat_completion.call_count == n_chunks + 1
+        assert mock_client.chat_completion.call_count == n_chunks + 1
 
     def test_small_data_single_call(self):
-        fmt = _make_formatter()
-        fmt.client.chat_completion.return_value = "Item 1 detail: ..."
+        fmt, mock_client = _make_formatter()
+        mock_client.chat_completion.return_value = "Item 1 detail: ..."
 
         result = fmt._format_detailed(
             [{"id": 1, "name": "A"}], "explain item", {"count": 1}
         )
 
         assert result["format"] == "detailed"
-        assert fmt.client.chat_completion.call_count == 1
+        assert mock_client.chat_completion.call_count == 1
 
 
 # ---------------------------------------------------------------------------
@@ -237,7 +239,7 @@ class TestFormatDetailedChunked:
 class TestGenerateIntelligentResponseChunked:
     def test_large_dataset_uses_chunked_path_not_truncation(self):
         """Main format_response path must not silently drop items beyond 25."""
-        fmt = _make_formatter()
+        fmt, mock_client = _make_formatter()
         budget = constants.LLM_DATA_PREVIEW_LARGE
         items = _items_exceeding_budget(30, budget)
         n_chunks = len(fmt._split_data_into_chunks(items, budget))
@@ -248,7 +250,7 @@ class TestGenerateIntelligentResponseChunked:
                 return "Merged response"
             return "chunk"
 
-        fmt.client.chat_completion.side_effect = respond
+        mock_client.chat_completion.side_effect = respond
 
         with patch.object(constants, "LIST_FORMAT_TABLE", 0):
             result = fmt._generate_intelligent_response(
@@ -256,11 +258,11 @@ class TestGenerateIntelligentResponseChunked:
             )
 
         assert result["summary"] == "Merged response"
-        assert fmt.client.chat_completion.call_count == n_chunks + 1
+        assert mock_client.chat_completion.call_count == n_chunks + 1
 
     def test_small_dataset_single_call_with_full_data(self):
-        fmt = _make_formatter()
-        fmt.client.chat_completion.return_value = (
+        fmt, mock_client = _make_formatter()
+        mock_client.chat_completion.return_value = (
             '{"format": "bullets", "response": "Found 3 items."}'
         )
 
@@ -268,24 +270,24 @@ class TestGenerateIntelligentResponseChunked:
         with patch.object(constants, "LIST_FORMAT_TABLE", 0):
             result = fmt._generate_intelligent_response(items, "list items", context={})
 
-        assert fmt.client.chat_completion.call_count == 1
-        prompt = fmt.client.chat_completion.call_args[1]["messages"][0]["content"]
+        assert mock_client.chat_completion.call_count == 1
+        prompt = mock_client.chat_completion.call_args[1]["messages"][0]["content"]
         # All three items must be in the single prompt
         for i in range(1, 4):
             assert f'"id": {i}' in prompt
 
     def test_thirty_items_not_truncated_to_twenty_five(self):
         """Regression: old code sent only first 25 of 30+ items."""
-        fmt = _make_formatter()
+        fmt, mock_client = _make_formatter()
         items = [{"id": i, "name": f"N{i}"} for i in range(1, 31)]
         data_json = json.dumps(items, indent=2, default=str)
 
         if len(data_json) <= constants.LLM_DATA_PREVIEW_LARGE:
-            fmt.client.chat_completion.return_value = (
+            mock_client.chat_completion.return_value = (
                 '{"format": "text", "response": "ok"}'
             )
             with patch.object(constants, "LIST_FORMAT_TABLE", 0):
                 fmt._generate_intelligent_response(items, "list all", context={})
-            prompt = fmt.client.chat_completion.call_args[1]["messages"][0]["content"]
+            prompt = mock_client.chat_completion.call_args[1]["messages"][0]["content"]
             assert '"id": 30' in prompt, "Item 30 was truncated from single-call prompt"
             assert '"id": 26' in prompt, "Items 26-30 were truncated (old 25-item limit)"
