@@ -13,21 +13,19 @@ import sys
 from .query_parser import QueryParser
 from .api_matcher import APIMatcher
 from .api_client import APIClient
-from .config_loader import get_config, ConfigLoader
+from .config_loader import get_config, get_default_page_size
 from .types import MissingInformation, APIResponse, APIError
 from .workflow import build_api_workflow
 from .utils import setup_logger
 from .schema_validator import SchemaValidator
 from .progress_tracker import ProgressTracker, ProgressUpdate, ProgressStage
 from .schema_splitter import split_grouped_resources
-from .post_filter import apply_client_side_filters
+from .filters import apply_client_side_filters, apply_semantic_filters, validate_parsed
 from .query_execution import apply_count_pagination_params, fetch_all_paginated_results
 from .hint_utils import should_fetch_all_pages_for_count
-from .semantic_filters import apply_semantic_filters
-from .param_validator import validate_parsed
 from .response_envelope import enrich_api_response
 from .follow_up_detection import build_session_metadata
-from .compound_query import split_compound_questions
+from .query_utils import split_compound_questions
 from . import constants
 
 
@@ -144,7 +142,7 @@ class APIOrchestrator:
             except (TypeError, ValueError):
                 return constants.DEFAULT_PAGE_SIZE
             return max(1, min(size, constants.PAGE_SIZE_CAP))
-        return ConfigLoader().get_default_page_size()
+        return get_default_page_size()
 
     def _load_config_from_path(self, config_path: str) -> Dict[str, Any]:
         """

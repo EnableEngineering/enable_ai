@@ -1,5 +1,5 @@
-from enable_ai.query_normalize import strip_quotes_for_matching
-from enable_ai.semantic_filters import inject_semantic_filters
+from enable_ai.query_utils import strip_quotes_for_matching
+from enable_ai.filters import inject_semantic_filters
 
 
 def test_strip_quotes_for_matching_only():

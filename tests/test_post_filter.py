@@ -1,6 +1,6 @@
 """Tests for client-side post-filtering."""
 
-from enable_ai.post_filter import apply_client_side_filters, item_matches_filters
+from enable_ai.filters import apply_client_side_filters, item_matches_filters
 
 
 def test_item_matches_role_filter():

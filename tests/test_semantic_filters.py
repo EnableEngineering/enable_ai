@@ -1,4 +1,4 @@
-from enable_ai.semantic_filters import inject_semantic_filters
+from enable_ai.filters import inject_semantic_filters
 
 HINTS = {
     "inventory-consumables": {

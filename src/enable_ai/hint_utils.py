@@ -1,9 +1,214 @@
 """
 Schema-driven helpers for resource_hints (user scope, aggregates, multi-resource).
+
+This module provides:
+- HintAccessor class: Unified interface for accessing resource hints
+- Module functions: For backward compatibility and multi-resource operations
 """
 
 import re
 from typing import Any, Dict, List, Optional, Set, Tuple
+
+
+# =============================================================================
+# HintAccessor Class - Unified hint access interface
+# =============================================================================
+
+class HintAccessor:
+    """
+    Unified interface for accessing hints for a specific resource.
+
+    Usage:
+        accessor = HintAccessor("service-orders", resource_hints)
+        fields = accessor.embedded_fields
+        role = accessor.endpoint_role
+
+    This class replaces repetitive patterns like:
+        hints = (resource_hints or {}).get(resource) or {}
+        if not isinstance(hints, dict): return []
+        return hints.get("__embedded_fields__") or []
+    """
+
+    def __init__(
+        self,
+        resource: str,
+        resource_hints: Dict[str, Any],
+        schema_resource: Optional[Dict[str, Any]] = None,
+        user_context: Optional[Dict[str, Any]] = None,
+    ):
+        self.resource = resource or ""
+        self.resource_hints = resource_hints or {}
+        self.schema_resource = schema_resource
+        self.user_context = user_context or {}
+        self._hints = self._load_hints()
+
+    def _load_hints(self) -> Dict[str, Any]:
+        """Load hints for this resource."""
+        if not self.resource or not self.resource_hints:
+            return {}
+        hints = self.resource_hints.get(self.resource)
+        return hints if isinstance(hints, dict) else {}
+
+    def _get_list(self, key: str) -> List[str]:
+        """Get a list value from hints."""
+        val = self._hints.get(key) or []
+        return list(val) if isinstance(val, (list, tuple)) else []
+
+    def _get_set(self, key: str) -> Set[str]:
+        """Get a set value from hints."""
+        val = self._hints.get(key) or []
+        return {str(v) for v in val} if isinstance(val, (list, tuple)) else set()
+
+    def _get_dict(self, key: str) -> Dict[str, Any]:
+        """Get a dict value from hints."""
+        val = self._hints.get(key) or {}
+        return dict(val) if isinstance(val, dict) else {}
+
+    def _get_str(self, key: str) -> Optional[str]:
+        """Get a string value from hints."""
+        val = self._hints.get(key)
+        return str(val) if val else None
+
+    def _get_int(self, key: str, cap: Optional[int] = None) -> Optional[int]:
+        """Get an int value from hints with optional cap."""
+        val = self._hints.get(key)
+        if val is None:
+            return None
+        try:
+            result = int(val)
+            return min(result, cap) if cap else result
+        except (TypeError, ValueError):
+            return None
+
+    # =========================================================================
+    # Properties - Simple accessors
+    # =========================================================================
+
+    @property
+    def embedded_fields(self) -> List[str]:
+        """Nested field names from __embedded_fields__."""
+        return self._get_list("__embedded_fields__")
+
+    @property
+    def extra_query_params(self) -> Set[str]:
+        """Params supported by API but missing from OpenAPI."""
+        return self._get_set("__extra_query_params__")
+
+    @property
+    def extra_response_fields(self) -> Set[str]:
+        """Response fields present at runtime but absent from OpenAPI."""
+        return self._get_set("__extra_response_fields__")
+
+    @property
+    def client_side_filter_fields(self) -> Set[str]:
+        """Filters intentionally applied client-side."""
+        fields = set(self.extra_response_fields)
+        declared = self._hints.get("__client_side_filters__") or []
+        if isinstance(declared, (list, tuple)):
+            fields.update(str(f) for f in declared)
+        return fields
+
+    @property
+    def response_count_fields(self) -> List[str]:
+        """Fields to read numeric totals from dashboard responses."""
+        fields = self._hints.get("__response_count_fields__") or []
+        return [str(f) for f in fields] if isinstance(fields, (list, tuple)) else []
+
+    @property
+    def response_summary_fields(self) -> Dict[str, str]:
+        """Map response field names to display labels for dashboard payloads."""
+        fields = self._hints.get("__response_summary_fields__") or {}
+        if isinstance(fields, dict) and fields:
+            return {str(k): str(v) for k, v in fields.items()}
+
+        if self.endpoint_role in ("summary", "dashboard", "metrics"):
+            discovered: Dict[str, str] = {}
+            res_data = self.schema_resource or {}
+            for item in res_data.get("fields") or []:
+                if isinstance(item, dict) and item.get("name"):
+                    name = str(item["name"])
+                    label = item.get("label") or item.get("title") or name.replace("_", " ").title()
+                    discovered[name] = str(label)
+                elif isinstance(item, str):
+                    discovered[item] = item.replace("_", " ").title()
+            if discovered:
+                return discovered
+        return {}
+
+    @property
+    def response_summary_field_synonyms(self) -> Dict[str, str]:
+        """Map query phrases to summary response field names."""
+        syns = self._hints.get("__response_summary_field_synonyms__") or {}
+        return {str(k).lower(): str(v) for k, v in syns.items()} if isinstance(syns, dict) else {}
+
+    @property
+    def endpoint_role(self) -> Optional[str]:
+        """Hint-declared endpoint role: list, summary, settings, etc."""
+        role = self._hints.get("__endpoint_role__")
+        return str(role).lower() if role else None
+
+    @property
+    def related_list_resource(self) -> Optional[str]:
+        """List resource to pivot to after a summary turn."""
+        return self._get_str("__related_list_resource__")
+
+    @property
+    def related_summary_resource(self) -> Optional[str]:
+        """Summary resource for amount-metric queries on a list sibling."""
+        return self._get_str("__related_summary_resource__")
+
+    @property
+    def user_scoped_fields(self) -> List[str]:
+        """User-scoped filter fields for this resource."""
+        role = self.user_context.get("role") or ""
+        by_role = self._hints.get("__user_scoped_fields_by_role__") or {}
+        if isinstance(by_role, dict) and by_role:
+            if role:
+                role_l = str(role).lower()
+                for key, fields in by_role.items():
+                    if str(key).lower() == role_l:
+                        return list(fields) if isinstance(fields, (list, tuple)) else []
+                return []
+        fields = self._hints.get("__user_scoped_fields__") or []
+        return list(fields) if isinstance(fields, (list, tuple)) else []
+
+    @property
+    def count_page_size(self) -> Optional[int]:
+        """Page size for count queries (capped)."""
+        from . import constants
+        return self._get_int("__count_page_size__", cap=constants.PAGE_SIZE_CAP)
+
+    @property
+    def count_default_filters(self) -> Dict[str, Any]:
+        """Default filters to apply for count queries."""
+        return self._get_dict("__count_default_filters__")
+
+    @property
+    def aggregate_resources(self) -> Optional[List[str]]:
+        """Child resource list from __aggregate_resources__ or __aggregate__."""
+        for key in ("__aggregate_resources__", "__aggregate__"):
+            agg = self._hints.get(key)
+            if isinstance(agg, (list, tuple)) and len(agg) >= 2:
+                return list(agg)
+        return None
+
+    @property
+    def is_virtual_aggregate(self) -> bool:
+        """True when this resource defines aggregate children."""
+        return self.aggregate_resources is not None
+
+    @property
+    def resource_synonyms(self) -> List[str]:
+        """Synonym terms for this resource."""
+        syns = self._hints.get("__resource_synonyms__") or []
+        if isinstance(syns, list):
+            return [str(s) for s in syns]
+        return [str(syns)] if syns else []
+
+
+# =============================================================================
+# Static Query Analysis Functions (no resource context needed)
+# =============================================================================
 
 # Imperative phrases where "me" is not a user-scope pronoun
 _IMPERATIVE_ME = re.compile(

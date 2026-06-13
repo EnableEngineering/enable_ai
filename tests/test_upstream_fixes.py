@@ -1,4 +1,4 @@
-from enable_ai.compound_query import split_compound_questions
+from enable_ai.query_utils import split_compound_questions
 from enable_ai.hint_utils import (
     build_summary_response_text,
     expand_query_resources,

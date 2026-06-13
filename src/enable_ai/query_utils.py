@@ -1,9 +1,29 @@
 """
-Split compound user messages into independent sub-questions.
+Query preprocessing utilities for Enable AI.
+
+Combines punctuation cleanup and compound query splitting.
 """
 
 import re
-from typing import List
+from typing import List, Optional
+
+# -----------------------------------------------------------------------------
+# Quote stripping (from query_normalize.py)
+# -----------------------------------------------------------------------------
+
+_QUOTE_CHARS_RE = re.compile(r"['''\"`]")
+
+
+def strip_quotes_for_matching(query: Optional[str]) -> str:
+    """Remove quote characters so resource_hints synonym matching sees bare tokens."""
+    if not query:
+        return query or ""
+    return _QUOTE_CHARS_RE.sub(" ", query.strip())
+
+
+# -----------------------------------------------------------------------------
+# Compound query splitting (from compound_query.py)
+# -----------------------------------------------------------------------------
 
 _QUESTION_SIGNAL = re.compile(
     r"\b(?:how many|how much|what|which|show|list|count|get|give|tell|are there|is there)\b",

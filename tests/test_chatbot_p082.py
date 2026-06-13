@@ -2,7 +2,7 @@ from enable_ai.follow_up_detection import (
     build_count_list_pivot_parsed,
     should_pivot_count_to_list,
 )
-from enable_ai.temporal_filters import apply_temporal_filters, detect_temporal_phrase
+from enable_ai.filters import apply_temporal_filters, detect_temporal_phrase
 
 
 def test_count_to_list_pivot():

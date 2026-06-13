@@ -3,8 +3,7 @@
 import json
 from pathlib import Path
 
-from enable_ai.semantic_filters import apply_semantic_filters
-from enable_ai.param_validator import validate_parsed
+from enable_ai.filters import apply_semantic_filters, validate_parsed
 
 FIXTURES = Path(__file__).parent / "fixtures"
 GOLDEN = Path(__file__).parent / "golden_queries.json"

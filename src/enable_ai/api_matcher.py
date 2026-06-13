@@ -6,7 +6,7 @@ from .query_execution import (
     format_sort_param,
     split_filters_for_endpoint,
 )
-from .semantic_filters import inject_semantic_filters
+from .filters import inject_semantic_filters
 from . import constants
 
 
