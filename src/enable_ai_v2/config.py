@@ -468,6 +468,9 @@ class Config:
     # Rows to retain on COUNT list calls for follow-up drill-down
     count_list_page_size: int = 20
 
+    # Sample rows to show in COUNT query responses (0 = show all)
+    count_sample_size: int = 0
+
     # Progress callback - parent can provide to show progress in UI
     progress_callback: Optional[Callable[[str, float], None]] = None
 

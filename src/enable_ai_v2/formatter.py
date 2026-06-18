@@ -208,7 +208,9 @@ class ResponseFormatter:
                     # Add sample rows for context (only when we have 2+ results)
                     # Skip if page_size=1 was used (efficiency fetch, not real sample)
                     if count > 1 and len(results) > 1:
-                        sample = self._format_sample_rows(results[:5], tool_name)
+                        sample_size = getattr(self.config, "count_sample_size", 0)
+                        sample_items = results[:sample_size] if sample_size > 0 else results
+                        sample = self._format_sample_rows(sample_items, tool_name)
                         if sample:
                             msg = f"{msg}\n\n{sample}"
                     return self._append_duration_note(msg, query, tool_args, count)
@@ -625,7 +627,8 @@ class ResponseFormatter:
             return ""
 
         lines: list[str] = []
-        for i, item in enumerate(items[:5], 1):
+        # No slicing needed - caller passes already-sliced list (or all items if size=0)
+        for i, item in enumerate(items, 1):
             if not isinstance(item, dict):
                 continue
             # Build rich label: name | status | priority | company
