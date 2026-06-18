@@ -154,6 +154,22 @@ class IntentPhrases:
         "highest outstanding",
         "overdue",
     )
+    # AR field names for extraction (configurable by parent)
+    ar_company_fields: tuple[str, ...] = (
+        "company",
+        "customer",
+        "client",
+        "company_name",
+        "customer_name",
+    )
+    ar_amount_fields: tuple[str, ...] = (
+        "outstanding",
+        "balance",
+        "amount",
+        "total",
+        "outstanding_amount",
+        "total_outstanding",
+    )
 
 
 DEFAULT_INTENT_PHRASES = IntentPhrases()
@@ -186,6 +202,8 @@ def resolve_intent_phrases(config: Optional["Config"] = None) -> IntentPhrases:
         flash_report_parent_segments=pick("flash_report_parent_segments"),
         embedded_field_names=pick("embedded_field_names"),
         ar_context_keywords=pick("ar_context_keywords"),
+        ar_company_fields=pick("ar_company_fields"),
+        ar_amount_fields=pick("ar_amount_fields"),
     )
 
 
@@ -222,6 +240,8 @@ def intent_phrases_from_dict(raw: dict[str, Any]) -> IntentPhrases:
         flash_report_parent_segments=as_tuple("flash_report_parent_segments", defaults.flash_report_parent_segments),
         embedded_field_names=as_tuple("embedded_field_names", defaults.embedded_field_names),
         ar_context_keywords=as_tuple("ar_context_keywords", defaults.ar_context_keywords),
+        ar_company_fields=as_tuple("ar_company_fields", defaults.ar_company_fields),
+        ar_amount_fields=as_tuple("ar_amount_fields", defaults.ar_amount_fields),
     )
 
 

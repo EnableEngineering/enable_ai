@@ -327,63 +327,44 @@ class ResponseFormatter:
 
         return None
 
-    @staticmethod
-    def _extract_ar_fields(row: dict) -> tuple[Optional[str], Any]:
+    def _extract_ar_fields(self, row: dict) -> tuple[Optional[str], Any]:
+        """Extract company name and amount from AR data using configurable fields."""
         company = None
         amount = None
+
+        # Get field names from config (no hardcoded fallbacks)
+        company_fields = getattr(self._intent_phrases, "ar_company_fields", ())
+        amount_fields = getattr(self._intent_phrases, "ar_amount_fields", ())
 
         def extract_name(value: Any) -> Optional[str]:
             """Extract display name from nested object or string."""
             if isinstance(value, dict):
-                return (
-                    value.get("name")
-                    or value.get("display_name")
-                    or value.get("company_name")
-                    or value.get("full_name")
-                )
+                return value.get("name") or value.get("display_name")
             if isinstance(value, str) and value and not value.isdigit():
                 return value
             return None
 
-        for key, value in row.items():
-            if value is None:
-                continue
-            key_l = key.lower()
-            if company is None and any(k in key_l for k in ("company", "customer", "client")):
-                company = extract_name(value)
-            if amount is None and any(k in key_l for k in ("outstanding", "balance", "amount", "total")):
-                if isinstance(value, (int, float)):
-                    amount = value
-                elif isinstance(value, str):
+        # Check configured company fields
+        for field in company_fields:
+            val = row.get(field)
+            if val is not None:
+                company = extract_name(val)
+                if company:
+                    break
+
+        # Check configured amount fields
+        for field in amount_fields:
+            val = row.get(field)
+            if val is not None:
+                if isinstance(val, (int, float)):
+                    amount = val
+                    break
+                elif isinstance(val, str):
                     try:
-                        amount = float(value.replace(",", ""))
+                        amount = float(val.replace(",", ""))
+                        break
                     except ValueError:
                         pass
-
-        # Fallback field checks
-        if not company:
-            for field in ("company_name", "top_company", "customer_name", "client_name"):
-                if row.get(field):
-                    company = extract_name(row[field]) or row[field]
-                    if company:
-                        break
-            # Try nested company object
-            if not company and isinstance(row.get("company"), dict):
-                company = extract_name(row["company"])
-
-        if amount is None:
-            for field in ("outstanding_amount", "total_outstanding", "balance", "amount", "total_amount"):
-                val = row.get(field)
-                if val is not None:
-                    if isinstance(val, (int, float)):
-                        amount = val
-                    elif isinstance(val, str):
-                        try:
-                            amount = float(val.replace(",", ""))
-                        except ValueError:
-                            pass
-                    if amount is not None:
-                        break
 
         return company, amount
 
