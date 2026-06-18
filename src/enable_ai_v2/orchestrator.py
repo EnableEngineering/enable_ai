@@ -356,6 +356,9 @@ class Orchestrator:
             # Step 5: Translate status synonyms in tool calls
             tool_calls = self._translate_status_synonyms(tool_calls)
 
+            # Step 5b: Resolve user context placeholders
+            tool_calls = self._resolve_user_placeholders(tool_calls, user_context)
+
             # Step 6: Validate tool calls
             if tracker:
                 tracker.update(ProgressStage.VALIDATING, "Validating parameters...")
@@ -495,6 +498,45 @@ class Orchestrator:
                     lower_val = value.lower()
                     if lower_val in self.config.status_synonyms:
                         new_args[key] = self.config.status_synonyms[lower_val]
+
+            result.append(ToolCall(id=tc.id, name=tc.name, arguments=new_args))
+
+        return result
+
+    def _resolve_user_placeholders(
+        self,
+        tool_calls: list[ToolCall],
+        user_context: Optional[UserContext],
+    ) -> list[ToolCall]:
+        """
+        Resolve LLM placeholder values with actual user context.
+
+        Placeholders:
+        - __current_user_id__ → user_context.user_id
+        - __current_company_id__ → user_context.company_id
+        - __current_username__ → user_context.username
+        """
+        if not user_context:
+            return tool_calls
+
+        placeholders = {
+            "__current_user_id__": user_context.user_id,
+            "__current_company_id__": user_context.company_id,
+            "__current_username__": user_context.username,
+        }
+
+        result = []
+        for tc in tool_calls:
+            new_args = dict(tc.arguments)
+
+            for key, value in tc.arguments.items():
+                if isinstance(value, str) and value in placeholders:
+                    resolved = placeholders[value]
+                    if resolved is not None:
+                        new_args[key] = resolved
+                    else:
+                        # Remove the arg if placeholder can't be resolved
+                        del new_args[key]
 
             result.append(ToolCall(id=tc.id, name=tc.name, arguments=new_args))
 
