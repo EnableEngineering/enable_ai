@@ -640,7 +640,12 @@ class Orchestrator:
                     break
 
             new_args = dict(tc.arguments)
-            if field_name not in new_args:
+
+            # Skip if ANY status-related field already set (avoid conflict)
+            has_status = any(
+                k == field_name or k.startswith("status") for k in new_args
+            )
+            if not has_status:
                 new_args[field_name] = matched_status
 
             result.append(ToolCall(id=tc.id, name=tc.name, arguments=new_args))

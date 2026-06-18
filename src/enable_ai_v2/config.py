@@ -200,6 +200,11 @@ class IntentPhrases:
     # Report type param name
     report_type_param: str = "report_type"
 
+    # Per-entity aggregation keywords (e.g., "per technician", "by customer")
+    # Maps keyword phrase → (entity_type, filter_field)
+    # e.g., {"per technician": ("technician", "assigned_to"), "by customer": ("customer", "company")}
+    aggregate_per_entity_map: dict[str, tuple[str, str]] = field(default_factory=dict)
+
 
 DEFAULT_INTENT_PHRASES = IntentPhrases()
 
@@ -248,6 +253,7 @@ def resolve_intent_phrases(config: Optional["Config"] = None) -> IntentPhrases:
         company_search_param=pick("company_search_param") or defaults.company_search_param,
         report_type_injection_map=pick_dict("report_type_injection_map"),
         report_type_param=pick("report_type_param") or defaults.report_type_param,
+        aggregate_per_entity_map=pick_dict("aggregate_per_entity_map"),
     )
 
 
@@ -301,6 +307,7 @@ def intent_phrases_from_dict(raw: dict[str, Any]) -> IntentPhrases:
         company_search_param=raw.get("company_search_param") or defaults.company_search_param,
         report_type_injection_map=as_dict("report_type_injection_map", defaults.report_type_injection_map),
         report_type_param=raw.get("report_type_param") or defaults.report_type_param,
+        aggregate_per_entity_map=as_dict("aggregate_per_entity_map", defaults.aggregate_per_entity_map),
     )
 
 

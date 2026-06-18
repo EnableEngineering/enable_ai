@@ -175,8 +175,11 @@ def intent_prompt_hint(intent: QueryIntent) -> str:
             "format the single row, not the total count."
         ),
         QueryIntent.AGGREGATE: (
-            "Detected intent: AGGREGATE. Call tools for each resource mentioned; "
-            "for compound queries with 'and', use one list tool per resource before summarizing."
+            "Detected intent: AGGREGATE. "
+            "For 'per technician'/'by technician'/'each technician' queries: "
+            "call service_orders list (NOT users list) to get work distribution. "
+            "For compound queries with 'and': use one list tool per resource. "
+            "Do NOT list users/technicians unless specifically asked for technician details."
         ),
         QueryIntent.LIST: (
             "Detected intent: LIST. Return matching rows; use filters from the query."
