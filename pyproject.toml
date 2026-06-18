@@ -4,26 +4,28 @@ build-backend = "poetry.core.masonry.api"
 
 [tool.poetry]
 name = "enable-ai"
-version = "0.3.89"
-description = "AI-powered natural language interface for REST APIs with OpenAPI support and real-time streaming"
+version = "1.0.10"
+description = "AI-powered natural language to REST API translation. v2: Claude native tool calling, zero hardcoding, works with any OpenAPI spec."
 authors = ["Enable Engineering"]
 license = "MIT"
 readme = "README.md"
 homepage = "https://github.com/EnableEngineering/enable_ai"
 repository = "https://github.com/EnableEngineering/enable_ai"
-keywords = ["nlp", "api", "natural-language", "ai", "mcp", "llm", "rest-api", "langgraph"]
+keywords = ["nlp", "api", "natural-language", "ai", "llm", "rest-api", "openai", "tool-calling"]
+packages = [
+    { include = "enable_ai_v2", from = "src" },
+]
 
 [tool.poetry.dependencies]
-python = "^3.8"
-requests = "^2.25.0"
+python = ">=3.9.0,<4.0"
 openai = "^1.0.0"
-langgraph = "^0.2.0"
+httpx = "^0.27.0"
+pyyaml = "^6.0"
 python-dotenv = "^0.19.0"
-langgraph-checkpoint = "^1.0.0"
+anthropic = { version = "^0.34.0", optional = true }
 
 [tool.poetry.extras]
-# MCP server support (requires manual SDK installation)
-mcp = []
+anthropic = ["anthropic"]
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^7.0.0"
@@ -35,13 +37,6 @@ mypy = "^1.0.0"
 # Database and RAG dependencies removed - API-only focus
 # Future: May add back as optional extras
 
-[tool.poetry.scripts]
-# MCP server (optional - requires manual mcp SDK installation)
-# enable-ai-mcp = "enable_ai.mcp_server:main"
-enable-schema = "enable_ai.schema_generator.cli:main"
-
-[build]
-source = "src"
 
 [tool.pyright]
 # Resolve 'enable_ai' from src/ when project root is the workspace (IDE/tests)

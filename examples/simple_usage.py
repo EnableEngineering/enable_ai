@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Enable AI - Basic Usage Example
+Enable AI v2 - Basic Usage Example
 
 Demonstrates:
-1. Loading API schema
-2. Processing natural language queries
-3. Smart response formatting (auto, table, grouped, etc.)
+1. Creating Config with OpenAPI spec
+2. Processing natural language queries with Claude's native tool calling
+3. Using resource hints for better accuracy
 """
 
 import os
@@ -15,175 +15,148 @@ from pathlib import Path
 # Add parent directory to path for imports when running locally
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
-from enable_ai import APIOrchestrator, ResponseFormatter
+from enable_ai_v2 import (
+    Orchestrator,
+    Config,
+    JWTAuth,
+    ResourceHint,
+    UserContext,
+)
 
 
 def main():
-    print("╔═══════════════════════════════════════════════════════════╗")
-    print("║         Enable AI - Basic Usage Example                  ║")
-    print("╚═══════════════════════════════════════════════════════════╝")
+    print("Enable AI v2 - Basic Usage Example")
+    print("=" * 40)
     print()
-    
-    # Check for OpenAI API key
-    if not os.getenv("OPENAI_API_KEY"):
-        print("⚠️  Warning: OPENAI_API_KEY not set in environment")
-        print("   Set it with: export OPENAI_API_KEY='your-key'")
-        print()
+
+    # Check for Anthropic API key
+    if not os.getenv("ANTHROPIC_API_KEY"):
+        print("Warning: ANTHROPIC_API_KEY not set")
+        print("Set it with: export ANTHROPIC_API_KEY='your-key'")
         return
-    
-    # Initialize components
-    print("📦 Initializing Enable AI components...")
-    orchestrator = APIOrchestrator()
-    formatter = ResponseFormatter()
-    print("✓ Initialized")
+
+    # Sample OpenAPI spec (inline for demo)
+    sample_spec = {
+        "openapi": "3.0.0",
+        "info": {"title": "Demo API", "version": "1.0.0"},
+        "paths": {
+            "/users": {
+                "get": {
+                    "operationId": "list_users",
+                    "summary": "List all users",
+                    "parameters": [
+                        {
+                            "name": "status",
+                            "in": "query",
+                            "schema": {"type": "string", "enum": ["active", "inactive"]},
+                        },
+                    ],
+                    "responses": {"200": {"description": "OK"}},
+                },
+            },
+            "/users/{id}": {
+                "get": {
+                    "operationId": "get_user",
+                    "summary": "Get a user by ID",
+                    "parameters": [
+                        {
+                            "name": "id",
+                            "in": "path",
+                            "required": True,
+                            "schema": {"type": "integer"},
+                        },
+                    ],
+                    "responses": {"200": {"description": "OK"}},
+                },
+            },
+            "/orders": {
+                "get": {
+                    "operationId": "list_orders",
+                    "summary": "List orders",
+                    "parameters": [
+                        {
+                            "name": "status",
+                            "in": "query",
+                            "schema": {"type": "string", "enum": ["pending", "completed", "cancelled"]},
+                        },
+                    ],
+                    "responses": {"200": {"description": "OK"}},
+                },
+            },
+        },
+    }
+
+    # Config - parent module provides everything
+    config = Config(
+        openapi_schema=sample_spec,
+        base_url="https://api.example.com",  # Replace with real API
+
+        # Resource hints improve accuracy
+        resource_hints={
+            "orders": ResourceHint(
+                status_field="status",
+                status_values=["pending", "completed", "cancelled"],
+            ),
+            "users": ResourceHint(
+                status_field="status",
+                status_values=["active", "inactive"],
+            ),
+        },
+
+        # Status synonyms map natural language to actual values
+        status_synonyms={
+            "open": "pending",
+            "done": "completed",
+            "closed": "completed",
+        },
+
+        # Enable tracing for debugging
+        include_trace=True,
+    )
+
+    # For real API, use actual auth:
+    # auth = JWTAuth(token="your-jwt-token")
+
+    print("Initializing...")
+    ai = Orchestrator(config=config)
+    print("Ready")
     print()
-    
-    # Example 1: Basic query processing
-    print("=" * 60)
-    print("Example 1: Basic Query Processing")
-    print("=" * 60)
-    
-    query = "Get all users"
-    print(f"Query: {query}")
-    print()
-    
-    try:
-        result = orchestrator.process(query)
-        print("✓ Query processed successfully")
-        print(f"Summary: {result.get('summary', 'No summary')}")
-        print()
-    except Exception as e:
-        print(f"✗ Error: {e}")
-        print()
-    
-    # Example 2: Smart formatting - Auto format
-    print("=" * 60)
-    print("Example 2: Smart Formatting (Auto)")
-    print("=" * 60)
-    
-    # Sample inventory data (low stock items)
-    sample_data = [
-        {
-            "name": "STATIONARY MACHINE -8000 AMP",
-            "type": "Equipment",
-            "serial": "98568",
-            "quantity": 1,
-            "location": "Main Branch - Pune"
-        },
-        {
-            "name": "STATIONARY MACHINE -3000 AMP",
-            "type": "Equipment",
-            "serial": "98555",
-            "quantity": 1,
-            "location": "Main Branch - Pune"
-        },
-        {
-            "name": "MAGNAFLUX SKL-SP1",
-            "type": "Consumable",
-            "quantity_ml": 1.0,
-            "unit_cost": 1.60,
-            "expiry": "2028-05-30",
-            "location": "Main Branch - Pune"
-        },
-        {
-            "name": "MAGNAFLUX MG-2410",
-            "type": "Consumable",
-            "quantity_ml": 2.0,
-            "unit_cost": 1.80,
-            "expiry": "2028-09-30",
-            "location": "Main Branch - Pune"
-        }
+
+    # Example queries
+    queries = [
+        "Show me all active users",
+        "Get user 12345",
+        "What pending orders do we have?",
     ]
-    
-    query = "Show items that are low in stock grouped by type"
-    print(f"Query: {query}")
-    print()
-    
-    try:
-        result = formatter.format_response(
-            data=sample_data,
-            query=query,
-            format_type="auto"  # LLM chooses best format
-        )
-        
-        print(f"✓ LLM chose format: {result['format']}")
+
+    for query in queries:
+        print("-" * 40)
+        print(f"Query: {query}")
+
+        try:
+            # Optionally provide user context
+            user_ctx = UserContext(
+                user_id=1,
+                role="Admin",
+                is_admin=True,
+            )
+
+            result = ai.process(query, user_context=user_ctx)
+
+            print(f"Response: {result.message}")
+            print(f"Success: {result.success}")
+
+            if result.trace:
+                print(f"Tool calls: {[tc.name for tc in result.trace.tool_calls]}")
+                print(f"Response time: {result.trace.response_time_ms}ms")
+
+        except Exception as e:
+            print(f"Error: {e}")
+
         print()
-        print("Formatted Output:")
-        print("-" * 60)
-        print(result['formatted'])
-        print()
-    except Exception as e:
-        print(f"✗ Error: {e}")
-        print()
-    
-    # Example 3: Force table format
-    print("=" * 60)
-    print("Example 3: Force Table Format")
-    print("=" * 60)
-    
-    try:
-        result = formatter.format_response(
-            data=sample_data,
-            query=query,
-            format_type="table"  # Force table format
-        )
-        
-        print("Formatted as Table:")
-        print("-" * 60)
-        print(result['formatted'])
-        print()
-    except Exception as e:
-        print(f"✗ Error: {e}")
-        print()
-    
-    # Example 4: Concise summary
-    print("=" * 60)
-    print("Example 4: Concise Summary")
-    print("=" * 60)
-    
-    try:
-        result = formatter.format_response(
-            data=sample_data,
-            query=query,
-            format_type="concise"  # Brief summary
-        )
-        
-        print("Concise Summary:")
-        print("-" * 60)
-        print(result['formatted'])
-        print()
-    except Exception as e:
-        print(f"✗ Error: {e}")
-        print()
-    
-    # Example 5: Chart-ready format
-    print("=" * 60)
-    print("Example 5: Chart-Ready JSON")
-    print("=" * 60)
-    
-    try:
-        result = formatter.format_response(
-            data=sample_data,
-            query=query,
-            format_type="chart"  # Chart data
-        )
-        
-        print("Chart-Ready JSON:")
-        print("-" * 60)
-        print(result['formatted'])
-        print()
-    except Exception as e:
-        print(f"✗ Error: {e}")
-        print()
-    
-    print("=" * 60)
-    print("✅ All examples completed!")
-    print()
-    print("Next Steps:")
-    print("  1. Try with your own API schema in config.json")
-    print("  2. Test different queries")
-    print("  3. Try streaming_backend.py for real-time progress")
-    print("=" * 60)
+
+    ai.close()
+    print("Done!")
 
 
 if __name__ == "__main__":
