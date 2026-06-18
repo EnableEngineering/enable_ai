@@ -844,6 +844,33 @@ class TestDateRange:
         assert "updated_at__gte" in updated[0].arguments
         assert updated[0].arguments["status"] == "open"
 
+    def test_last_month(self):
+        from enable_ai_v2.date_range import extract_date_range
+        from datetime import datetime
+
+        ref = datetime(2026, 6, 14)
+        filters = extract_date_range("SOs from last month", reference=ref)
+        assert filters["created_at__gte"] == "2026-05-01"
+        assert filters["created_at__lte"] == "2026-05-31"
+
+    def test_next_n_days(self):
+        from enable_ai_v2.date_range import extract_date_range
+        from datetime import datetime
+
+        ref = datetime(2026, 6, 14)
+        filters = extract_date_range("invoices due next 7 days", reference=ref)
+        assert filters["due_date__gte"] == "2026-06-14"
+        assert filters["due_date__lte"] == "2026-06-21"
+
+    def test_greater_than_n_days(self):
+        from enable_ai_v2.date_range import extract_date_range
+        from datetime import datetime
+
+        ref = datetime(2026, 6, 14)
+        filters = extract_date_range("InProgress > 7 days", reference=ref)
+        assert "created_at__lte" in filters
+        assert filters["created_at__lte"] == "2026-06-07"
+
 
 class TestReadOnlyMutationGuard:
     def test_partial_update_rejected_on_read_query(self):
@@ -1204,6 +1231,26 @@ class Test130Features:
             tool_args={"page_size": 1},
         )
         assert msg == "You have 13 service orders."
+
+    def test_count_with_sample_rows(self):
+        """Count query with multiple results shows sample rows."""
+        formatter = ResponseFormatter()
+        data = {
+            "count": 5,
+            "results": [
+                {"id": 1, "display_name": "SO-173", "status": "InProgress", "priority": "High"},
+                {"id": 2, "display_name": "SO-168", "status": "Scheduled"},
+                {"id": 3, "display_name": "SO-165", "status": "New"},
+            ],
+        }
+        msg = formatter.format_success_simple(
+            data,
+            "service_orders_list",
+            query="how many open service orders",
+        )
+        assert "You have 5 service orders." in msg
+        assert "SO-173" in msg
+        assert "InProgress" in msg
 
     def test_technician_availability_synthesis(self):
         from enable_ai_v2.aggregate import format_aggregate_response

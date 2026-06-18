@@ -204,6 +204,12 @@ class ResponseFormatter:
                 if use_count:
                     label = self._resource_label(tool_name)
                     msg = f"You have {count} {self._count_noun(label, count)}."
+                    # Add sample rows for context (only when we have 2+ results)
+                    # Skip if page_size=1 was used (efficiency fetch, not real sample)
+                    if count > 1 and len(results) > 1:
+                        sample = self._format_sample_rows(results[:5], tool_name)
+                        if sample:
+                            msg = f"{msg}\n\n{sample}"
                     return self._append_duration_note(msg, query, tool_args, count)
                 if len(results) == 1:
                     item_msg = self._format_result_item(results[0], query=query, tool_name=tool_name)
@@ -596,6 +602,55 @@ class ResponseFormatter:
             lines.append(f"  ... and {remaining} more")
 
         return "\n".join(lines)
+
+    def _format_sample_rows(
+        self,
+        items: list,
+        tool_name: str = "",
+    ) -> str:
+        """Format sample rows for COUNT queries (show first few with details)."""
+        if not items:
+            return ""
+
+        lines: list[str] = []
+        for i, item in enumerate(items[:5], 1):
+            if not isinstance(item, dict):
+                continue
+            # Build rich label: name | status | priority | company
+            parts: list[str] = []
+
+            # Primary label
+            label = self._item_display_label(item, tool_name)
+            parts.append(label)
+
+            # Status if available
+            for sf in _STATUS_FIELDS:
+                if item.get(sf):
+                    val = item[sf]
+                    if isinstance(val, dict):
+                        val = val.get("name") or val.get("display_name") or str(val)
+                    parts.append(str(val))
+                    break
+
+            # Priority if available
+            if item.get("priority"):
+                prio = item["priority"]
+                if isinstance(prio, dict):
+                    prio = prio.get("name") or prio.get("display_name") or str(prio)
+                parts.append(f"{prio} priority")
+
+            # Company if available
+            for cf in ("company", "customer", "company_name", "customer_name"):
+                if item.get(cf):
+                    val = item[cf]
+                    if isinstance(val, dict):
+                        val = val.get("name") or val.get("display_name") or str(val)
+                    parts.append(str(val))
+                    break
+
+            lines.append(f"{i}. {' | '.join(parts)}")
+
+        return "\n".join(lines) if lines else ""
 
     def _humanize_key(self, key: str) -> str:
         """Convert snake_case to Title Case."""

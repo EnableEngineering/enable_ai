@@ -32,14 +32,16 @@ def extract_date_range(
         return {}
 
     start, end = _resolve_range(q, today)
-    if start is None or end is None:
+    if start is None and end is None:
         return {}
 
     field = _date_field_prefix(query)
-    return {
-        f"{field}__gte": start.isoformat(),
-        f"{field}__lte": end.isoformat(),
-    }
+    result: dict[str, str] = {}
+    if start is not None:
+        result[f"{field}__gte"] = start.isoformat()
+    if end is not None:
+        result[f"{field}__lte"] = end.isoformat()
+    return result
 
 
 def date_range_prompt_hint(query: str) -> str:
@@ -60,16 +62,23 @@ def _has_temporal_phrase(q: str) -> bool:
         r"\bthis month\b",
         r"\bthis week\b",
         r"\blast week\b",
+        r"\blast month\b",
         r"\bthis year\b",
         r"\btoday\b",
         r"\byesterday\b",
         r"\bpast (\d+) days?\b",
+        r"\bnext (\d+) days?\b",
+        r"\bdue (?:in )?next\b",
+        r">\s*(\d+)\s*days?\b",
     )
     return any(re.search(p, q) for p in patterns)
 
 
 def _date_field_prefix(query: str) -> str:
     q = query.lower()
+    # Due date for invoice/payment queries
+    if "due" in q or "overdue" in q or "payment" in q:
+        return "due_date"
     if any(w in q for w in COMPLETION_WORDS):
         return "updated_at"
     if any(w in q for w in DATE_FIELD_UPDATED) and not any(w in q for w in DATE_FIELD_CREATED):
@@ -88,6 +97,13 @@ def _resolve_range(q: str, today: date) -> tuple[Optional[date], Optional[date]]
     if "this month" in q:
         return today.replace(day=1), today
 
+    if "last month" in q:
+        # First day of last month to last day of last month
+        first_of_this = today.replace(day=1)
+        last_of_prev = first_of_this - timedelta(days=1)
+        first_of_prev = last_of_prev.replace(day=1)
+        return first_of_prev, last_of_prev
+
     if "this week" in q:
         start = today - timedelta(days=today.weekday())
         return start, today
@@ -100,11 +116,27 @@ def _resolve_range(q: str, today: date) -> tuple[Optional[date], Optional[date]]
     if "this year" in q:
         return today.replace(month=1, day=1), today
 
+    # "past N days" - looking backward
     match = re.search(r"\bpast (\d+) days?\b", q)
     if match:
         days = int(match.group(1))
         start = today - timedelta(days=max(days - 1, 0))
         return start, today
+
+    # "next N days" - looking forward (for due dates)
+    match = re.search(r"\bnext (\d+) days?\b", q)
+    if match:
+        days = int(match.group(1))
+        end = today + timedelta(days=days)
+        return today, end
+
+    # "> N days" - items older than N days (InProgress > 7 days)
+    match = re.search(r">\s*(\d+)\s*days?\b", q)
+    if match:
+        days = int(match.group(1))
+        cutoff = today - timedelta(days=days)
+        # Return as range ending at cutoff (older than N days)
+        return None, cutoff
 
     return None, None
 
