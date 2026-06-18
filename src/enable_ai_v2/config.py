@@ -59,6 +59,14 @@ class IntentPhrases:
         "per customer",
         " and ",
     )
+    # Patterns that should NOT trigger aggregate even if aggregate_keywords match
+    aggregate_exclude_patterns: tuple[str, ...] = (
+        "most recent",
+        "most recently",
+        "most recent service order",
+        "most recent report",
+        "most recent invoice",
+    )
     compound_resource_phrases: tuple[str, ...] = (
         "service order",
         "service orders",
@@ -155,6 +163,7 @@ def resolve_intent_phrases(config: Optional["Config"] = None) -> IntentPhrases:
         multi_step_keywords=pick("multi_step_keywords"),
         single_detail_keywords=pick("single_detail_keywords"),
         aggregate_keywords=pick("aggregate_keywords"),
+        aggregate_exclude_patterns=pick("aggregate_exclude_patterns"),
         compound_resource_phrases=pick("compound_resource_phrases"),
         compound_resource_segments=pick("compound_resource_segments") or defaults.compound_resource_segments,
         availability_phrases=pick("availability_phrases"),
@@ -188,6 +197,7 @@ def intent_phrases_from_dict(raw: dict[str, Any]) -> IntentPhrases:
         multi_step_keywords=as_tuple("multi_step_keywords", defaults.multi_step_keywords),
         single_detail_keywords=as_tuple("single_detail_keywords", defaults.single_detail_keywords),
         aggregate_keywords=as_tuple("aggregate_keywords", defaults.aggregate_keywords),
+        aggregate_exclude_patterns=as_tuple("aggregate_exclude_patterns", defaults.aggregate_exclude_patterns),
         compound_resource_phrases=as_tuple("compound_resource_phrases", defaults.compound_resource_phrases),
         compound_resource_segments=segments,
         availability_phrases=as_tuple("availability_phrases", defaults.availability_phrases),

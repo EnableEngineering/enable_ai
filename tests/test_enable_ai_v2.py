@@ -635,6 +635,14 @@ class TestQueryIntent:
         assert classify_query_intent("observations for my latest report") == QueryIntent.MULTI_STEP
         assert classify_query_intent("flash report for latest SO") == QueryIntent.MULTI_STEP
 
+    def test_most_recent_not_aggregate(self):
+        """'most recent' should trigger SINGLE_DETAIL, not AGGREGATE."""
+        # "most" alone triggers aggregate, but "most recent" is excluded
+        assert classify_query_intent("flash report for my most recent service order") == QueryIntent.MULTI_STEP
+        assert classify_query_intent("show most recent report") != QueryIntent.AGGREGATE
+        # But "who has most" should still be aggregate
+        assert classify_query_intent("who has the most service orders") == QueryIntent.AGGREGATE
+
     def test_needs_follow_up_when_embedded_missing(self):
         tc = ToolCall(id="1", name="service_orders_list", arguments={"page_size": 1})
         results = [{"data": {"count": 1, "results": [{"id": 42, "name": "SO-1"}]}}]

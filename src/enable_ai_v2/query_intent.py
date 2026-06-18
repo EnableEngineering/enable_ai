@@ -115,6 +115,12 @@ def needs_compound_follow_up(
     return len(segments) < 2
 
 
+def _is_aggregate_excluded(q: str, p: IntentPhrases) -> bool:
+    """Check if query matches aggregate exclude patterns (e.g., 'most recent')."""
+    exclude = getattr(p, "aggregate_exclude_patterns", ())
+    return any(pat in q for pat in exclude)
+
+
 def classify_query_intent(
     query: str,
     phrases: Optional[IntentPhrases] = None,
@@ -129,10 +135,13 @@ def classify_query_intent(
     if any(kw in q for kw in p.multi_step_keywords):
         return QueryIntent.MULTI_STEP
 
-    if is_compound_query(query, p):
+    # Check aggregate exclusions before aggregate keywords
+    aggregate_excluded = _is_aggregate_excluded(q, p)
+
+    if is_compound_query(query, p) and not aggregate_excluded:
         return QueryIntent.AGGREGATE
 
-    if any(kw in q for kw in p.aggregate_keywords):
+    if not aggregate_excluded and any(kw in q for kw in p.aggregate_keywords):
         return QueryIntent.AGGREGATE
 
     if is_technician_availability_query(query, p):
