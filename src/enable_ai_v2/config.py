@@ -134,6 +134,11 @@ class IntentPhrases:
         "flash-report",
         "flash reports",
     )
+    # Parent resources that trigger flash report follow-up (configurable)
+    flash_report_parent_segments: tuple[str, ...] = (
+        "service_order",
+        "service-order",
+    )
     embedded_field_names: tuple[str, ...] = (
         "observations",
         "notes",
@@ -170,6 +175,7 @@ def resolve_intent_phrases(config: Optional["Config"] = None) -> IntentPhrases:
         scheduling_phrases=pick("scheduling_phrases"),
         service_order_keywords=pick("service_order_keywords"),
         flash_report_phrases=pick("flash_report_phrases"),
+        flash_report_parent_segments=pick("flash_report_parent_segments"),
         embedded_field_names=pick("embedded_field_names"),
     )
 
@@ -204,6 +210,7 @@ def intent_phrases_from_dict(raw: dict[str, Any]) -> IntentPhrases:
         scheduling_phrases=as_tuple("scheduling_phrases", defaults.scheduling_phrases),
         service_order_keywords=as_tuple("service_order_keywords", defaults.service_order_keywords),
         flash_report_phrases=as_tuple("flash_report_phrases", defaults.flash_report_phrases),
+        flash_report_parent_segments=as_tuple("flash_report_parent_segments", defaults.flash_report_parent_segments),
         embedded_field_names=as_tuple("embedded_field_names", defaults.embedded_field_names),
     )
 

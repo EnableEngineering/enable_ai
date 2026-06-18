@@ -63,13 +63,15 @@ def build_scoped_flash_report_list(
     """
     After latest SO list, scope flash-reports list to that service order (Q07).
     """
-    if not query_wants_flash_report(query, phrases):
+    p = phrases or DEFAULT_INTENT_PHRASES
+    if not query_wants_flash_report(query, p):
         return None
     if "list" not in prior_tool_name.lower():
         return None
     prior_segment = _tool_resource_segment(prior_tool_name)
-    # Handle nested paths like service_orders_service_orders
-    if not ("service_order" in prior_segment or "service-order" in prior_segment):
+    # Check against configurable parent segments
+    parent_segments = getattr(p, "flash_report_parent_segments", ("service_order", "service-order"))
+    if not any(seg in prior_segment for seg in parent_segments):
         return None
     if "error" in prior_result:
         return None
