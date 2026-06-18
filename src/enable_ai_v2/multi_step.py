@@ -68,7 +68,8 @@ def build_scoped_flash_report_list(
     if "list" not in prior_tool_name.lower():
         return None
     prior_segment = _tool_resource_segment(prior_tool_name)
-    if prior_segment not in ("service_orders", "service_order"):
+    # Handle nested paths like service_orders_service_orders
+    if not ("service_order" in prior_segment or "service-order" in prior_segment):
         return None
     if "error" in prior_result:
         return None
