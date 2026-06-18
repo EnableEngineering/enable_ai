@@ -362,6 +362,15 @@ class Orchestrator:
             # Step 5c: Inject context filters from query phrases
             tool_calls = self._inject_context_filters(tool_calls, query, user_context)
 
+            # Step 5d: Inject status filter from keywords
+            tool_calls = self._inject_status_filter(tool_calls, query, phrases)
+
+            # Step 5e: Inject equipment in_use filter
+            tool_calls = self._inject_equipment_filter(tool_calls, query, phrases)
+
+            # Step 5f: Inject report type filter
+            tool_calls = self._inject_report_type_filter(tool_calls, query, phrases)
+
             # Step 6: Validate tool calls
             if tracker:
                 tracker.update(ProgressStage.VALIDATING, "Validating parameters...")
@@ -580,6 +589,145 @@ class Orchestrator:
             for key, value in injections.items():
                 if key not in new_args:
                     new_args[key] = value
+
+            result.append(ToolCall(id=tc.id, name=tc.name, arguments=new_args))
+
+        return result
+
+    def _inject_status_filter(
+        self,
+        tool_calls: list[ToolCall],
+        query: str,
+        phrases: Any,
+    ) -> list[ToolCall]:
+        """
+        Inject status filter based on keywords in query.
+
+        Uses phrases.status_injection_map and phrases.status_field_map
+        configured by parent.
+        """
+        status_map = getattr(phrases, "status_injection_map", {})
+        field_map = getattr(phrases, "status_field_map", {})
+
+        if not status_map:
+            return tool_calls
+
+        q = query.lower()
+        matched_status: Optional[str] = None
+
+        # Find first matching keyword
+        for keyword, status_value in status_map.items():
+            if keyword.lower() in q:
+                matched_status = status_value
+                break
+
+        if not matched_status:
+            return tool_calls
+
+        result = []
+        for tc in tool_calls:
+            # Only inject into list tools
+            if "list" not in tc.name.lower():
+                result.append(tc)
+                continue
+
+            # Determine field name from resource segment
+            tc_lower = tc.name.lower()
+            field_name = "status"  # default
+            for segment, fname in field_map.items():
+                if segment in tc_lower:
+                    field_name = fname
+                    break
+
+            new_args = dict(tc.arguments)
+            if field_name not in new_args:
+                new_args[field_name] = matched_status
+
+            result.append(ToolCall(id=tc.id, name=tc.name, arguments=new_args))
+
+        return result
+
+    def _inject_equipment_filter(
+        self,
+        tool_calls: list[ToolCall],
+        query: str,
+        phrases: Any,
+    ) -> list[ToolCall]:
+        """
+        Inject equipment in_use filter when query mentions equipment usage.
+
+        Uses phrases.equipment_in_use_keywords and phrases.equipment_in_use_param
+        configured by parent.
+        """
+        keywords = getattr(phrases, "equipment_in_use_keywords", ())
+        param = getattr(phrases, "equipment_in_use_param", "in_use")
+
+        if not keywords:
+            return tool_calls
+
+        q = query.lower()
+        should_inject = any(kw.lower() in q for kw in keywords)
+
+        if not should_inject:
+            return tool_calls
+
+        result = []
+        for tc in tool_calls:
+            # Only inject into equipment list tools
+            if "equipment" not in tc.name.lower() or "list" not in tc.name.lower():
+                result.append(tc)
+                continue
+
+            new_args = dict(tc.arguments)
+            if param not in new_args:
+                new_args[param] = True
+
+            result.append(ToolCall(id=tc.id, name=tc.name, arguments=new_args))
+
+        return result
+
+    def _inject_report_type_filter(
+        self,
+        tool_calls: list[ToolCall],
+        query: str,
+        phrases: Any,
+    ) -> list[ToolCall]:
+        """
+        Inject report_type filter based on keywords in query.
+
+        Uses phrases.report_type_injection_map and phrases.report_type_param
+        configured by parent.
+        """
+        type_map = getattr(phrases, "report_type_injection_map", {})
+        param = getattr(phrases, "report_type_param", "report_type")
+
+        if not type_map:
+            return tool_calls
+
+        q = query.lower()
+        matched_type: Optional[str] = None
+
+        for keyword, type_value in type_map.items():
+            if keyword.lower() in q:
+                matched_type = type_value
+                break
+
+        if not matched_type:
+            return tool_calls
+
+        result = []
+        for tc in tool_calls:
+            # Only inject into report/flash list tools
+            if "list" not in tc.name.lower():
+                result.append(tc)
+                continue
+            if "report" not in tc.name.lower() and "flash" not in tc.name.lower():
+                result.append(tc)
+                continue
+
+            new_args = dict(tc.arguments)
+            if param not in new_args:
+                new_args[param] = matched_type
 
             result.append(ToolCall(id=tc.id, name=tc.name, arguments=new_args))
 

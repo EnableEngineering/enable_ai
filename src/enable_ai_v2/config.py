@@ -171,6 +171,35 @@ class IntentPhrases:
         "total_outstanding",
     )
 
+    # === FILTER INJECTION CONFIG (parent must provide) ===
+
+    # Status injection: keyword → status value to inject
+    # e.g., {"open": "New", "pending": "Pending", "closed": "Completed"}
+    status_injection_map: dict[str, str] = field(default_factory=dict)
+
+    # Status field name per resource segment
+    # e.g., {"service_order": "status", "invoice": "status"}
+    status_field_map: dict[str, str] = field(default_factory=dict)
+
+    # Equipment in-use keywords (triggers in_use=true filter)
+    equipment_in_use_keywords: tuple[str, ...] = ()
+
+    # Equipment filter param name
+    equipment_in_use_param: str = "in_use"
+
+    # Company search keywords (triggers company search filter)
+    company_search_keywords: tuple[str, ...] = ()
+
+    # Company search param name
+    company_search_param: str = "company"
+
+    # Report type injection: keyword → report_type value
+    # e.g., {"inspection": "inspection", "maintenance": "maintenance"}
+    report_type_injection_map: dict[str, str] = field(default_factory=dict)
+
+    # Report type param name
+    report_type_param: str = "report_type"
+
 
 DEFAULT_INTENT_PHRASES = IntentPhrases()
 
@@ -184,6 +213,12 @@ def resolve_intent_phrases(config: Optional["Config"] = None) -> IntentPhrases:
 
     def pick(name: str):
         value = getattr(parent, name)
+        if value:
+            return value
+        return getattr(defaults, name)
+
+    def pick_dict(name: str):
+        value = getattr(parent, name, None)
         if value:
             return value
         return getattr(defaults, name)
@@ -204,6 +239,15 @@ def resolve_intent_phrases(config: Optional["Config"] = None) -> IntentPhrases:
         ar_context_keywords=pick("ar_context_keywords"),
         ar_company_fields=pick("ar_company_fields"),
         ar_amount_fields=pick("ar_amount_fields"),
+        # Filter injection config
+        status_injection_map=pick_dict("status_injection_map"),
+        status_field_map=pick_dict("status_field_map"),
+        equipment_in_use_keywords=pick("equipment_in_use_keywords"),
+        equipment_in_use_param=pick("equipment_in_use_param") or defaults.equipment_in_use_param,
+        company_search_keywords=pick("company_search_keywords"),
+        company_search_param=pick("company_search_param") or defaults.company_search_param,
+        report_type_injection_map=pick_dict("report_type_injection_map"),
+        report_type_param=pick("report_type_param") or defaults.report_type_param,
     )
 
 
@@ -226,6 +270,12 @@ def intent_phrases_from_dict(raw: dict[str, Any]) -> IntentPhrases:
             return fallback
         return tuple(val)
 
+    def as_dict(key: str, fallback: dict) -> dict:
+        val = raw.get(key)
+        if not val:
+            return fallback
+        return dict(val)
+
     return IntentPhrases(
         multi_step_keywords=as_tuple("multi_step_keywords", defaults.multi_step_keywords),
         single_detail_keywords=as_tuple("single_detail_keywords", defaults.single_detail_keywords),
@@ -242,6 +292,15 @@ def intent_phrases_from_dict(raw: dict[str, Any]) -> IntentPhrases:
         ar_context_keywords=as_tuple("ar_context_keywords", defaults.ar_context_keywords),
         ar_company_fields=as_tuple("ar_company_fields", defaults.ar_company_fields),
         ar_amount_fields=as_tuple("ar_amount_fields", defaults.ar_amount_fields),
+        # Filter injection config
+        status_injection_map=as_dict("status_injection_map", defaults.status_injection_map),
+        status_field_map=as_dict("status_field_map", defaults.status_field_map),
+        equipment_in_use_keywords=as_tuple("equipment_in_use_keywords", defaults.equipment_in_use_keywords),
+        equipment_in_use_param=raw.get("equipment_in_use_param") or defaults.equipment_in_use_param,
+        company_search_keywords=as_tuple("company_search_keywords", defaults.company_search_keywords),
+        company_search_param=raw.get("company_search_param") or defaults.company_search_param,
+        report_type_injection_map=as_dict("report_type_injection_map", defaults.report_type_injection_map),
+        report_type_param=raw.get("report_type_param") or defaults.report_type_param,
     )
 
 
