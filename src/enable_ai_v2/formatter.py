@@ -177,7 +177,8 @@ class ResponseFormatter:
             rows, _ = self._unwrap_list_data(data)
             if rows and isinstance(rows[0], dict):
                 return self._format_result_item(rows[0], query=query, tool_name=tool_name)
-            return "No AR dashboard data found for that question."
+            # Don't return AR-specific message for simple list queries
+            # Let it fall through to standard list/count handling
 
         if is_technician_availability_query(query, self._intent_phrases) and self._is_user_or_technician_tool(tool_name):
             rows, _ = self._unwrap_list_data(data)
@@ -266,7 +267,10 @@ class ResponseFormatter:
             return True
         if "receivable" in name or "accounts_receivable" in name:
             return True
-        return any(w in q for w in ("outstanding", "ar dashboard", "accounts receivable", "highest outstanding"))
+        ar_keywords = getattr(self._intent_phrases, "ar_context_keywords", (
+            "outstanding", "ar dashboard", "accounts receivable", "highest outstanding", "overdue"
+        ))
+        return any(w in q for w in ar_keywords)
 
     @staticmethod
     def _is_user_or_technician_tool(tool_name: str) -> bool:
@@ -327,33 +331,60 @@ class ResponseFormatter:
     def _extract_ar_fields(row: dict) -> tuple[Optional[str], Any]:
         company = None
         amount = None
+
+        def extract_name(value: Any) -> Optional[str]:
+            """Extract display name from nested object or string."""
+            if isinstance(value, dict):
+                return (
+                    value.get("name")
+                    or value.get("display_name")
+                    or value.get("company_name")
+                    or value.get("full_name")
+                )
+            if isinstance(value, str) and value and not value.isdigit():
+                return value
+            return None
+
         for key, value in row.items():
             if value is None:
                 continue
             key_l = key.lower()
             if company is None and any(k in key_l for k in ("company", "customer", "client")):
-                if isinstance(value, dict):
-                    company = value.get("name") or value.get("display_name") or str(value)
-                else:
-                    company = str(value)
+                company = extract_name(value)
             if amount is None and any(k in key_l for k in ("outstanding", "balance", "amount", "total")):
-                if isinstance(value, (int, float, str)):
+                if isinstance(value, (int, float)):
                     amount = value
-        company = (
-            company
-            or row.get("company_name")
-            or row.get("top_company")
-            or row.get("display_name")
-            or row.get("name")
-        )
-        amount = (
-            amount
-            if amount is not None
-            else row.get("outstanding_amount")
-            or row.get("total_outstanding")
-            or row.get("balance")
-            or row.get("amount")
-        )
+                elif isinstance(value, str):
+                    try:
+                        amount = float(value.replace(",", ""))
+                    except ValueError:
+                        pass
+
+        # Fallback field checks
+        if not company:
+            for field in ("company_name", "top_company", "customer_name", "client_name"):
+                if row.get(field):
+                    company = extract_name(row[field]) or row[field]
+                    if company:
+                        break
+            # Try nested company object
+            if not company and isinstance(row.get("company"), dict):
+                company = extract_name(row["company"])
+
+        if amount is None:
+            for field in ("outstanding_amount", "total_outstanding", "balance", "amount", "total_amount"):
+                val = row.get(field)
+                if val is not None:
+                    if isinstance(val, (int, float)):
+                        amount = val
+                    elif isinstance(val, str):
+                        try:
+                            amount = float(val.replace(",", ""))
+                        except ValueError:
+                            pass
+                    if amount is not None:
+                        break
+
         return company, amount
 
     @staticmethod

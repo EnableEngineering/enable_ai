@@ -359,6 +359,9 @@ class Orchestrator:
             # Step 5b: Resolve user context placeholders
             tool_calls = self._resolve_user_placeholders(tool_calls, user_context)
 
+            # Step 5c: Inject context filters from query phrases
+            tool_calls = self._inject_context_filters(tool_calls, query, user_context)
+
             # Step 6: Validate tool calls
             if tracker:
                 tracker.update(ProgressStage.VALIDATING, "Validating parameters...")
@@ -537,6 +540,46 @@ class Orchestrator:
                     else:
                         # Remove the arg if placeholder can't be resolved
                         del new_args[key]
+
+            result.append(ToolCall(id=tc.id, name=tc.name, arguments=new_args))
+
+        return result
+
+    def _inject_context_filters(
+        self,
+        tool_calls: list[ToolCall],
+        query: str,
+        user_context: Optional[UserContext],
+    ) -> list[ToolCall]:
+        """
+        Inject filters based on context phrases in query.
+
+        Detects phrases like "my company", "my team" and adds appropriate filters.
+        """
+        if not user_context:
+            return tool_calls
+
+        q = query.lower()
+        injections: dict[str, Any] = {}
+
+        # "my company" → company filter
+        if "my company" in q and user_context.company_id:
+            injections["company"] = user_context.company_id
+
+        if not injections:
+            return tool_calls
+
+        result = []
+        for tc in tool_calls:
+            # Only inject into list tools
+            if "list" not in tc.name.lower():
+                result.append(tc)
+                continue
+
+            new_args = dict(tc.arguments)
+            for key, value in injections.items():
+                if key not in new_args:
+                    new_args[key] = value
 
             result.append(ToolCall(id=tc.id, name=tc.name, arguments=new_args))
 

@@ -402,6 +402,13 @@ def score_tool_for_query(
         if any(m in name for m in TRANSITION_TOOL_MARKERS):
             score -= 50
 
+    # Aggregate queries — "each technician", "per technician" want data, not users list
+    if any(p in q_lower for p in ("each technician", "per technician", "by technician")):
+        if "user" in segment or "technician" in segment:
+            score -= 15  # Penalize users/technicians list
+        if "service_order" in segment and "list" in name:
+            score += 10  # Prefer service orders for aggregation
+
     # Action word → HTTP verb hints in tool names
     if any(w in query_lower for w in READ_ACTION_WORDS):
         if any(v in name for v in ("list", "get", "retrieve", "search")):

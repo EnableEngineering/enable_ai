@@ -146,6 +146,14 @@ class IntentPhrases:
         "consumables",
         "equipment",
     )
+    # AR/Accounts Receivable context keywords (for dashboard formatting)
+    ar_context_keywords: tuple[str, ...] = (
+        "outstanding",
+        "ar dashboard",
+        "accounts receivable",
+        "highest outstanding",
+        "overdue",
+    )
 
 
 DEFAULT_INTENT_PHRASES = IntentPhrases()
@@ -177,6 +185,7 @@ def resolve_intent_phrases(config: Optional["Config"] = None) -> IntentPhrases:
         flash_report_phrases=pick("flash_report_phrases"),
         flash_report_parent_segments=pick("flash_report_parent_segments"),
         embedded_field_names=pick("embedded_field_names"),
+        ar_context_keywords=pick("ar_context_keywords"),
     )
 
 
@@ -212,6 +221,7 @@ def intent_phrases_from_dict(raw: dict[str, Any]) -> IntentPhrases:
         flash_report_phrases=as_tuple("flash_report_phrases", defaults.flash_report_phrases),
         flash_report_parent_segments=as_tuple("flash_report_parent_segments", defaults.flash_report_parent_segments),
         embedded_field_names=as_tuple("embedded_field_names", defaults.embedded_field_names),
+        ar_context_keywords=as_tuple("ar_context_keywords", defaults.ar_context_keywords),
     )
 
 
