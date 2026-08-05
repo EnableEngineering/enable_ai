@@ -96,7 +96,7 @@ from .date_range import (
     has_duration_phrase,
 )
 
-__version__ = "1.3.3"
+__version__ = "1.4.0"
 
 __all__ = [
     # Main entry point
