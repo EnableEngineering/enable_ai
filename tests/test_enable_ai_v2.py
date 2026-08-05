@@ -1502,3 +1502,348 @@ class TestValidatorBusinessCode:
         result = validator.validate(tc, "show SO-169")
         assert result.needs_clarification
         assert "business reference code" in (result.clarification_question or "").lower()
+
+
+class TestExactCodeNarrowing:
+    """A business code like SO-159 should not surface its sub-order SO-159-A too."""
+
+    def test_narrows_to_exact_match(self):
+        from enable_ai_v2.tool_filter import narrow_list_result_to_exact_code
+
+        result = {
+            "data": {
+                "count": 2,
+                "results": [
+                    {"id": 159, "name": "SO-159", "status": "InProgress"},
+                    {"id": 160, "name": "SO-159-A", "status": "New"},
+                ],
+            }
+        }
+        narrowed = narrow_list_result_to_exact_code(result, "What is status of SO-159?")
+        assert narrowed["data"]["count"] == 1
+        assert narrowed["data"]["results"] == [{"id": 159, "name": "SO-159", "status": "InProgress"}]
+
+    def test_leaves_result_alone_without_a_code_in_the_query(self):
+        from enable_ai_v2.tool_filter import narrow_list_result_to_exact_code
+
+        result = {
+            "data": {
+                "count": 2,
+                "results": [
+                    {"id": 159, "name": "SO-159"},
+                    {"id": 160, "name": "SO-159-A"},
+                ],
+            }
+        }
+        narrowed = narrow_list_result_to_exact_code(result, "show me service orders")
+        assert narrowed["data"]["count"] == 2
+
+    def test_leaves_single_row_results_alone(self):
+        from enable_ai_v2.tool_filter import narrow_list_result_to_exact_code
+
+        result = {"data": {"count": 1, "results": [{"id": 159, "name": "SO-159"}]}}
+        narrowed = narrow_list_result_to_exact_code(result, "status of SO-159")
+        assert narrowed == result
+
+
+class TestAggregatePageSize:
+    """AGGREGATE-intent queries need enough rows to rank/group, not a drill-down page."""
+
+    def test_aggregate_gets_large_page_size(self):
+        from enable_ai_v2.tool_args import enforce_count_tool_args
+
+        tc = ToolCall(id="1", name="service_orders_list", arguments={"page_size": 1})
+        updated = enforce_count_tool_args(
+            [tc], QueryIntent.AGGREGATE, retain_page_size=20, aggregate_page_size=100
+        )
+        assert updated[0].arguments["page_size"] == 100
+
+    def test_count_still_uses_retain_page_size(self):
+        from enable_ai_v2.tool_args import enforce_count_tool_args
+
+        tc = ToolCall(id="1", name="service_orders_list", arguments={"page_size": 1})
+        updated = enforce_count_tool_args(
+            [tc], QueryIntent.COUNT, retain_page_size=20, aggregate_page_size=100
+        )
+        assert updated[0].arguments["page_size"] == 20
+
+    def test_list_intent_untouched(self):
+        from enable_ai_v2.tool_args import enforce_count_tool_args
+
+        tc = ToolCall(id="1", name="service_orders_list", arguments={"page_size": 1})
+        updated = enforce_count_tool_args([tc], QueryIntent.LIST)
+        assert updated[0].arguments["page_size"] == 1
+
+
+class TestContextFilterInjection:
+    """my company / self-scope / implicit company scoping (parent-configured, no hardcoding)."""
+
+    def _orch(self):
+        from enable_ai_v2 import Orchestrator
+
+        spec = {
+            "openapi": "3.0.0",
+            "paths": {
+                "/service-orders/": {
+                    "get": {
+                        "operationId": "service_orders_list",
+                        "summary": "List service orders",
+                        "parameters": [],
+                        "responses": {"200": {"description": "OK"}},
+                    },
+                },
+            },
+        }
+        config = Config(openapi_schema=spec, base_url="http://test", cache_enabled=False)
+        return Orchestrator(config=config, api_key="fake")
+
+    def test_my_company_injects_company_filter(self):
+        from enable_ai_v2 import UserContext
+
+        orch = self._orch()
+        ctx = UserContext(user_id=1, role="Accountant", company_id=42, is_admin=False)
+        tc = ToolCall(id="1", name="service_orders_list", arguments={})
+        result = orch._inject_context_filters([tc], "show me all SOs for my company", ctx)
+        assert result[0].arguments.get("company") == 42
+
+    def test_self_scope_keyword_injects_configured_param(self):
+        from enable_ai_v2 import UserContext
+        from enable_ai_v2.config import IntentPhrases
+
+        orch = self._orch()
+        ctx = UserContext(user_id=7, role="Technician", is_admin=False)
+        phrases = IntentPhrases(
+            self_scope_keywords=("my jobs", "assigned to me"),
+            self_scope_param_map={"service_order": "technician"},
+        )
+        tc = ToolCall(id="1", name="service_orders_list", arguments={})
+        result = orch._inject_context_filters([tc], "show me my jobs", ctx, phrases)
+        assert result[0].arguments.get("technician") == 7
+
+    def test_implicit_company_scope_applies_without_my_phrase(self):
+        from enable_ai_v2 import UserContext
+        from enable_ai_v2.config import IntentPhrases
+
+        orch = self._orch()
+        ctx = UserContext(user_id=1, role="Customer", company_id=42, is_admin=False)
+        phrases = IntentPhrases(implicit_company_scope_map={"service_order": "company"})
+        tc = ToolCall(id="1", name="service_orders_list", arguments={})
+        result = orch._inject_context_filters([tc], "show me all service orders", ctx, phrases)
+        assert result[0].arguments.get("company") == 42
+
+    def test_implicit_company_scope_does_not_apply_to_admin(self):
+        from enable_ai_v2 import UserContext
+        from enable_ai_v2.config import IntentPhrases
+
+        orch = self._orch()
+        ctx = UserContext(user_id=1, role="Admin", company_id=42, is_admin=True)
+        phrases = IntentPhrases(implicit_company_scope_map={"service_order": "company"})
+        tc = ToolCall(id="1", name="service_orders_list", arguments={})
+        result = orch._inject_context_filters([tc], "show me all service orders", ctx, phrases)
+        assert "company" not in result[0].arguments
+
+    def test_explicit_filter_is_not_overridden(self):
+        from enable_ai_v2 import UserContext
+        from enable_ai_v2.config import IntentPhrases
+
+        orch = self._orch()
+        ctx = UserContext(user_id=1, role="Customer", company_id=42, is_admin=False)
+        phrases = IntentPhrases(implicit_company_scope_map={"service_order": "company"})
+        tc = ToolCall(id="1", name="service_orders_list", arguments={"company": 99})
+        result = orch._inject_context_filters([tc], "show me all service orders", ctx, phrases)
+        assert result[0].arguments["company"] == 99
+
+
+class TestCacheSafety:
+    """Cache must not leak one user's resolved placeholders into another user's hit,
+    and must not freeze a relative date range ("this week") at write time."""
+
+    AGENT_SPEC = {
+        "openapi": "3.0.0",
+        "paths": {
+            "/invoices/": {
+                "get": {
+                    "operationId": "invoices_list",
+                    "summary": "List invoices",
+                    "parameters": [],
+                    "responses": {"200": {"description": "OK"}},
+                },
+            },
+        },
+    }
+
+    def test_cache_stores_raw_tool_calls_not_resolved_placeholders(self):
+        from enable_ai_v2 import Orchestrator, UserContext
+
+        config = Config(
+            openapi_schema=self.AGENT_SPEC, base_url="http://test", cache_enabled=True,
+            include_trace=True,
+        )
+        orch = Orchestrator(config=config, api_key="fake")
+
+        raw_call = [
+            ToolCall(id="1", name="invoices_list", arguments={"company": "__current_company_id__"})
+        ]
+        orch._llm.process_query = MagicMock(return_value=(raw_call, "reasoning", "tool_use"))
+        orch._api.execute = MagicMock(
+            return_value=({"data": {"count": 1, "results": [{"id": 1}]}}, MagicMock(success=True))
+        )
+
+        ctx_a = UserContext(user_id=1, company_id=100, is_admin=False)
+        response_a = orch.process("show me all invoices for my company", user_context=ctx_a)
+        assert response_a.trace.confidence is not None
+
+        cached = orch._cache.get("show me all invoices for my company")
+        assert cached is not None
+        # The cached tool call must still carry the placeholder, not user A's
+        # resolved company id -- otherwise user B's hit would reuse it.
+        assert cached.tool_calls[0].arguments.get("company") == "__current_company_id__"
+
+    def test_cache_hit_resolves_placeholder_for_the_new_user_not_the_original(self):
+        from enable_ai_v2 import Orchestrator, UserContext
+
+        config = Config(
+            openapi_schema=self.AGENT_SPEC, base_url="http://test", cache_enabled=True,
+            include_trace=True,
+        )
+        orch = Orchestrator(config=config, api_key="fake")
+
+        raw_call = [
+            ToolCall(id="1", name="invoices_list", arguments={"company": "__current_company_id__"})
+        ]
+        orch._llm.process_query = MagicMock(return_value=(raw_call, "reasoning", "tool_use"))
+
+        captured_args = []
+
+        def mock_execute(tc, endpoint):
+            captured_args.append(dict(tc.arguments))
+            return {"data": {"count": 1, "results": [{"id": 1}]}}, MagicMock(success=True)
+
+        orch._api.execute = mock_execute
+
+        ctx_a = UserContext(user_id=1, company_id=100, is_admin=False)
+        orch.process("show me all invoices for my company", user_context=ctx_a)
+
+        ctx_b = UserContext(user_id=2, company_id=200, is_admin=False)
+        orch.process("show me all invoices for my company", user_context=ctx_b)
+
+        assert captured_args[0]["company"] == 100
+        # Second call must be a cache hit resolved for user B, not user A's company.
+        assert captured_args[1]["company"] == 200
+
+
+class TestReferentialFollowUp:
+    def test_referential_query_resolved_without_llm_call(self):
+        from enable_ai_v2 import Orchestrator
+
+        spec = {
+            "openapi": "3.0.0",
+            "paths": {
+                "/service-orders/": {
+                    "get": {
+                        "operationId": "service_orders_list",
+                        "summary": "List service orders",
+                        "parameters": [],
+                        "responses": {"200": {"description": "OK"}},
+                    },
+                },
+                "/service-orders/{id}/": {
+                    "get": {
+                        "operationId": "service_orders_retrieve",
+                        "summary": "Get service order",
+                        "parameters": [
+                            {"name": "id", "in": "path", "required": True, "schema": {"type": "integer"}},
+                        ],
+                        "responses": {"200": {"description": "OK"}},
+                    },
+                },
+            },
+        }
+        config = Config(openapi_schema=spec, base_url="http://test", cache_enabled=False)
+        orch = Orchestrator(config=config, api_key="fake")
+
+        orch._llm.process_query = MagicMock(
+            side_effect=AssertionError("LLM should not be called for a referential follow-up")
+        )
+        orch._api.execute = MagicMock(
+            return_value=(
+                {"data": {"count": 2, "results": [{"id": 42, "name": "SO-42"}, {"id": 43, "name": "SO-43"}]}},
+                MagicMock(success=True),
+            )
+        )
+
+        prior_list_cache = [{"id": 42, "name": "SO-42"}, {"id": 43, "name": "SO-43"}]
+        response = orch.process("show me the first 2 of those", prior_list_cache=prior_list_cache)
+
+        assert response.success
+        orch._api.execute.assert_called()
+
+
+class TestClarificationFlow:
+    def test_needs_clarification_short_circuits_with_needs_input(self):
+        from enable_ai_v2 import Orchestrator
+
+        spec = {
+            "openapi": "3.0.0",
+            "paths": {
+                "/service-orders/{id}/": {
+                    "get": {
+                        "operationId": "service_orders_retrieve",
+                        "summary": "Get service order",
+                        "parameters": [
+                            {"name": "id", "in": "path", "required": True, "schema": {"type": "integer"}},
+                        ],
+                        "responses": {"200": {"description": "OK"}},
+                    },
+                },
+            },
+        }
+        config = Config(openapi_schema=spec, base_url="http://test", cache_enabled=False)
+        orch = Orchestrator(config=config, api_key="fake")
+
+        tc = [ToolCall(id="1", name="service_orders_retrieve", arguments={"id": 169})]
+        orch._llm.process_query = MagicMock(return_value=(tc, "reasoning", "tool_use"))
+        orch._api.execute = MagicMock(
+            side_effect=AssertionError("Should not execute before clarification is resolved")
+        )
+
+        response = orch.process("show SO-169")
+
+        assert response.needs_input is True
+        assert "business reference code" in response.message.lower()
+        orch._api.execute.assert_not_called()
+
+
+class TestListCacheOnResponse:
+    def test_successful_list_query_populates_response_list_cache(self):
+        from enable_ai_v2 import Orchestrator
+
+        spec = {
+            "openapi": "3.0.0",
+            "paths": {
+                "/service-orders/": {
+                    "get": {
+                        "operationId": "service_orders_list",
+                        "summary": "List service orders",
+                        "parameters": [],
+                        "responses": {"200": {"description": "OK"}},
+                    },
+                },
+            },
+        }
+        config = Config(openapi_schema=spec, base_url="http://test", cache_enabled=False)
+        orch = Orchestrator(config=config, api_key="fake")
+
+        tc = [ToolCall(id="1", name="service_orders_list", arguments={})]
+        orch._llm.process_query = MagicMock(return_value=(tc, "reasoning", "tool_use"))
+        orch._api.execute = MagicMock(
+            return_value=(
+                {"data": {"count": 2, "results": [{"id": 1, "name": "SO-1"}, {"id": 2, "name": "SO-2"}]}},
+                MagicMock(success=True),
+            )
+        )
+
+        response = orch.process("show me all service orders")
+
+        assert len(response.list_cache) == 2
+        assert response.list_cache[0]["id"] == 1

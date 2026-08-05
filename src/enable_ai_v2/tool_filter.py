@@ -172,6 +172,58 @@ def extract_business_codes(
     return codes
 
 
+def narrow_list_result_to_exact_code(
+    result: dict,
+    query: str,
+    id_code_patterns: Optional[list[str]] = None,
+) -> dict:
+    """
+    Narrow an ambiguous LIST result down to a single exact business-code match.
+
+    Some backends deliberately match a business code as a prefix (e.g.
+    searching "SO-159" also returns sub-order "SO-159-A"), which is useful for
+    a human search box but wrong when the user asked about exactly one code
+    ("what is the status of SO-159?"). If the query names exactly one code and
+    exactly one row's name/display_name matches it exactly, return a result
+    narrowed to just that row so downstream formatting treats it as a single
+    record instead of an ambiguous list.
+    """
+    if "error" in result:
+        return result
+    data = result.get("data")
+    if not isinstance(data, dict):
+        return result
+    rows = data.get("results")
+    if not isinstance(rows, list) or len(rows) < 2:
+        return result
+
+    codes = extract_business_codes(query, id_code_patterns)
+    # extract_business_codes emits both "so-159" and "so159" for the same
+    # reference — normalize before checking that the query names exactly one.
+    normalized_codes = {c.replace("-", "") for c in codes}
+    if len(normalized_codes) != 1:
+        return result
+    target = next(iter(normalized_codes))
+
+    def _matches(row: dict) -> bool:
+        for field in ("name", "display_name"):
+            val = row.get(field)
+            if isinstance(val, str) and val.lower().replace("-", "") == target:
+                return True
+        return False
+
+    exact = [r for r in rows if isinstance(r, dict) and _matches(r)]
+    if len(exact) != 1:
+        return result
+
+    narrowed_data = dict(data)
+    narrowed_data["results"] = exact
+    narrowed_data["count"] = 1
+    narrowed = dict(result)
+    narrowed["data"] = narrowed_data
+    return narrowed
+
+
 def has_business_code(text: str, patterns: Optional[list[str]] = None) -> bool:
     """True when text contains a prefixed business reference code."""
     return bool(extract_business_codes(text, patterns))

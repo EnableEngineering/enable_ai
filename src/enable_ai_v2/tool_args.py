@@ -4,7 +4,7 @@ Normalize and enforce tool call arguments before validation/execution.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Optional
 
 from .query_intent import QueryIntent
 from .types import ToolCall
@@ -37,12 +37,19 @@ def enforce_count_tool_args(
     intent: QueryIntent,
     *,
     retain_page_size: int = 20,
+    aggregate_page_size: Optional[int] = 100,
 ) -> list[ToolCall]:
     """
     For COUNT intent: never use page_size=1; keep a capped page for follow-up drill-down.
+
+    For AGGREGATE intent: same page_size=1 guard, but with a larger page so
+    grouping/ranking (e.g. "which technician has the most service orders") has
+    enough rows to work with instead of silently aggregating a single row.
     """
-    if intent != QueryIntent.COUNT:
+    if intent not in (QueryIntent.COUNT, QueryIntent.AGGREGATE):
         return tool_calls
+
+    page_size = aggregate_page_size if intent == QueryIntent.AGGREGATE else retain_page_size
 
     updated: list[ToolCall] = []
     for tc in tool_calls:
@@ -60,8 +67,8 @@ def enforce_count_tool_args(
                 except (TypeError, ValueError):
                     pass
 
-        if retain_page_size > 0:
-            args["page_size"] = retain_page_size
+        if page_size and page_size > 0:
+            args["page_size"] = page_size
 
         updated.append(ToolCall(id=tc.id, name=tc.name, arguments=args))
     return updated

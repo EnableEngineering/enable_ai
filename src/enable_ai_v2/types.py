@@ -69,6 +69,8 @@ class QueryTrace:
     response_time_ms: int = 0
     # Number of multi-step rounds executed
     follow_up_rounds: int = 0
+    # Rows from last list response(s) for multi-turn drill-down
+    list_cache: list[dict] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         """Convert to dict for logging."""
@@ -117,6 +119,9 @@ class Response:
 
     # Suggested follow-up questions (for chat UI)
     suggestions: list[str] = field(default_factory=list)
+
+    # Structured list rows for parent multi-turn drill-down (count/list follow-ups)
+    list_cache: list[dict] = field(default_factory=list)
 
     # Full trace for debugging (optional)
     trace: Optional[QueryTrace] = None

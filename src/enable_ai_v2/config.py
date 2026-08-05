@@ -205,6 +205,19 @@ class IntentPhrases:
     # e.g., {"per technician": ("technician", "assigned_to"), "by customer": ("customer", "company")}
     aggregate_per_entity_map: dict[str, tuple[str, str]] = field(default_factory=dict)
 
+    # Self-scoping keywords meaning "assigned to / owned by the current user"
+    # e.g., ("my jobs", "assigned to me", "mine")
+    self_scope_keywords: tuple[str, ...] = ()
+
+    # Self-scope filter param name per resource segment (checked as substring)
+    # e.g., {"service_order": "technician", "session": "trainer"}
+    self_scope_param_map: dict[str, str] = field(default_factory=dict)
+
+    # Resource segments (substring match) where a non-admin user's own company_id
+    # should always be injected, even without an explicit "my company" phrase
+    # (e.g. a customer's plain "show me all invoices"). Maps segment -> param name.
+    implicit_company_scope_map: dict[str, str] = field(default_factory=dict)
+
 
 DEFAULT_INTENT_PHRASES = IntentPhrases()
 
@@ -254,6 +267,9 @@ def resolve_intent_phrases(config: Optional["Config"] = None) -> IntentPhrases:
         report_type_injection_map=pick_dict("report_type_injection_map"),
         report_type_param=pick("report_type_param") or defaults.report_type_param,
         aggregate_per_entity_map=pick_dict("aggregate_per_entity_map"),
+        self_scope_keywords=pick("self_scope_keywords"),
+        self_scope_param_map=pick_dict("self_scope_param_map"),
+        implicit_company_scope_map=pick_dict("implicit_company_scope_map"),
     )
 
 
@@ -308,6 +324,11 @@ def intent_phrases_from_dict(raw: dict[str, Any]) -> IntentPhrases:
         report_type_injection_map=as_dict("report_type_injection_map", defaults.report_type_injection_map),
         report_type_param=raw.get("report_type_param") or defaults.report_type_param,
         aggregate_per_entity_map=as_dict("aggregate_per_entity_map", defaults.aggregate_per_entity_map),
+        self_scope_keywords=as_tuple("self_scope_keywords", defaults.self_scope_keywords),
+        self_scope_param_map=as_dict("self_scope_param_map", defaults.self_scope_param_map),
+        implicit_company_scope_map=as_dict(
+            "implicit_company_scope_map", defaults.implicit_company_scope_map
+        ),
     )
 
 
@@ -467,6 +488,11 @@ class Config:
 
     # Rows to retain on COUNT list calls for follow-up drill-down
     count_list_page_size: int = 20
+
+    # Rows to fetch on AGGREGATE list calls (grouping/ranking needs to see most/
+    # all rows, not just a drill-down page) — e.g. "which technician has the
+    # most service orders"
+    aggregate_list_page_size: int = 100
 
     # Sample rows to show in COUNT query responses (0 = show all)
     count_sample_size: int = 0
